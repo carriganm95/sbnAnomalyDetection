@@ -7,8 +7,6 @@ reconstructs it.  Reconstruction error serves as an anomaly score.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 
@@ -32,7 +30,7 @@ class PMTAutoencoder(nn.Module):
         self,
         input_dim: int = 128,
         latent_dim: int = 16,
-        hidden_dims: Tuple[int, ...] = (64, 32),
+        hidden_dims: tuple[int, ...] = (64, 32),
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -57,7 +55,7 @@ class PMTAutoencoder(nn.Module):
         dec_layers.append(nn.Linear(prev, input_dim))
         self.decoder = nn.Sequential(*dec_layers)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (reconstruction, latent) tuple."""
         z = self.encoder(x)
         x_hat = self.decoder(z)

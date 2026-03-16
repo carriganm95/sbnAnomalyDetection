@@ -6,15 +6,13 @@ labels are available, and for computing summary statistics on raw scores.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import numpy as np
 
 
 def compute_roc_auc(
     scores: np.ndarray,
     labels: np.ndarray,
-) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     """Compute ROC AUC and the full ROC curve.
 
     Parameters

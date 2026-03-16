@@ -7,8 +7,6 @@ score during inference.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 
@@ -33,7 +31,7 @@ class TPCAutoencoder(nn.Module):
         self,
         input_dim: int = 256,
         latent_dim: int = 32,
-        hidden_dims: Tuple[int, ...] = (128, 64),
+        hidden_dims: tuple[int, ...] = (128, 64),
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -58,7 +56,7 @@ class TPCAutoencoder(nn.Module):
         dec_layers.append(nn.Linear(prev, input_dim))
         self.decoder = nn.Sequential(*dec_layers)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (reconstruction, latent) tuple."""
         z = self.encoder(x)
         x_hat = self.decoder(z)

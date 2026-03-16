@@ -150,8 +150,6 @@ class AnomalyScorer:
         import awkward as ak
 
         for batch in streamer.stream():
-            import numpy as np
-
             features = ak.to_numpy(ak.flatten(batch[feature_branch], axis=None))
             # Reshape assuming flat features per event.
             n_events = len(batch)

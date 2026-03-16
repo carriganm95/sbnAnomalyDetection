@@ -12,7 +12,7 @@ This module implements approach (1) by default.  Late fusion is available via
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -51,7 +51,7 @@ class FusionAutoencoder(nn.Module):
         tpc_input_dim: int = 256,
         pmt_input_dim: int = 128,
         latent_dim: int = 32,
-        hidden_dims: Tuple[int, ...] = (192, 96),
+        hidden_dims: tuple[int, ...] = (192, 96),
         dropout: float = 0.1,
         mode: str = "joint",
         tpc_encoder: Optional[TPCAutoencoder] = None,
@@ -103,7 +103,7 @@ class FusionAutoencoder(nn.Module):
         self,
         x_tpc: torch.Tensor,
         x_pmt: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return (reconstruction, latent, combined_input) tuple.
 
         The reconstruction is in the concatenated feature space; callers can

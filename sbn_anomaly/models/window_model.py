@@ -7,8 +7,6 @@ decoder uses transposed convolutions to reconstruct the original window.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 
@@ -76,7 +74,7 @@ class WindowAutoencoder(nn.Module):
             nn.ConvTranspose1d(f1, n_channels, kernel_size=4, stride=2, padding=1),
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode and decode a batch of windows.
 
         Parameters

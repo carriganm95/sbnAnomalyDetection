@@ -7,7 +7,7 @@ fixed-length feature vectors.  For production use, subclass and override
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import torch
@@ -41,7 +41,7 @@ class TPCDataset(Dataset):
     def __len__(self) -> int:
         return len(self.features)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         x = self.features[idx]
         if self.labels is not None:
             return x, self.labels[idx]
@@ -70,7 +70,7 @@ class PMTDataset(Dataset):
     def __len__(self) -> int:
         return len(self.features)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         x = self.features[idx]
         if self.labels is not None:
             return x, self.labels[idx]
@@ -110,7 +110,7 @@ class FusionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.tpc)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         x_tpc = self.tpc[idx]
         x_pmt = self.pmt[idx]
         if self.labels is not None:
@@ -154,7 +154,7 @@ class WindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self._starts)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         start = self._starts[idx]
         window = self.signal[start : start + self.window_size]
         if self.labels is not None:
