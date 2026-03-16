@@ -1,0 +1,49 @@
+# ============================================================
+# Fusion Autoencoder Training Configuration
+# ============================================================
+# Requires pre-trained TPC and PMT checkpoints under checkpoint_dir/.
+
+device: cuda
+
+data:
+  root_files:
+    - "/data/sbn/root/*.root"
+  tree_name: events
+
+  tpc_branches:
+    - tpc_total_charge
+    - tpc_n_hits
+    - tpc_rms_charge
+    - tpc_induction_charge_u
+    - tpc_induction_charge_v
+    - tpc_collection_charge
+
+  pmt_branches:
+    - pmt_total_pe
+    - pmt_n_flashes
+    - pmt_peak_amplitude
+    - pmt_flash_time_mean
+    - pmt_flash_time_rms
+
+  batch_size: 512
+  step_size: 1000
+  max_events: null
+  val_fraction: 0.10
+
+model:
+  # Upstream model dimensions (must match tpc_train / pmt_train)
+  tpc_hidden_dims: [256, 128, 64]
+  tpc_latent_dim: 32
+  pmt_hidden_dims: [128, 64]
+  pmt_latent_dim: 32
+
+  # Fusion head
+  fusion_hidden_dims: [128, 64]
+  fusion_latent_dim: 64
+
+training:
+  epochs: 50
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  checkpoint_dir: checkpoints/
+  log_file: logs/fusion_train.log

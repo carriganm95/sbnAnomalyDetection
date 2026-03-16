@@ -1,0 +1,35 @@
+# ============================================================
+# TPC Autoencoder Training Configuration
+# ============================================================
+
+device: cuda  # set to "cpu" if no GPU is available
+
+data:
+  root_files:
+    - "/data/sbn/root/*.root"   # glob pattern or list of paths
+  tree_name: events
+
+  # Scalar-per-event TPC branches to read
+  tpc_branches:
+    - tpc_total_charge
+    - tpc_n_hits
+    - tpc_rms_charge
+    - tpc_induction_charge_u
+    - tpc_induction_charge_v
+    - tpc_collection_charge
+
+  batch_size: 512
+  step_size: 1000      # uproot.iterate step size (entries per read)
+  max_events: null     # null = read all events
+  val_fraction: 0.10   # fraction of data held out for validation
+
+model:
+  hidden_dims: [256, 128, 64]
+  latent_dim: 32
+
+training:
+  epochs: 50
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  checkpoint_dir: checkpoints/
+  log_file: logs/tpc_train.log
