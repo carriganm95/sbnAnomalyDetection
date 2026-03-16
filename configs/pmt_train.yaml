@@ -1,0 +1,34 @@
+# ============================================================
+# PMT Autoencoder Training Configuration
+# ============================================================
+
+device: cuda  # set to "cpu" if no GPU is available
+
+data:
+  root_files:
+    - "/data/sbn/root/*.root"
+  tree_name: events
+
+  # Scalar-per-event PMT branches to read
+  pmt_branches:
+    - pmt_total_pe
+    - pmt_n_flashes
+    - pmt_peak_amplitude
+    - pmt_flash_time_mean
+    - pmt_flash_time_rms
+
+  batch_size: 512
+  step_size: 1000
+  max_events: null
+  val_fraction: 0.10
+
+model:
+  hidden_dims: [128, 64]
+  latent_dim: 32
+
+training:
+  epochs: 50
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  checkpoint_dir: checkpoints/
+  log_file: logs/pmt_train.log

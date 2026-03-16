@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sbn-anomaly-detection"
+version = "0.1.0"
+description = "Anomaly detection pipeline for the Short-Baseline Neutrino (SBN) programme at Fermilab"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "SBN Collaboration" }
+]
+keywords = ["neutrino", "anomaly-detection", "machine-learning", "hep"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "torch>=2.1",
+    "uproot>=5.1",
+    "awkward>=2.5",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "tensorboard>=2.14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "mypy>=1.5",
+]
+
+[project.scripts]
+sbn-train-tpc     = "sbn_anomaly_detection.train.train_tpc:main"
+sbn-train-pmt     = "sbn_anomaly_detection.train.train_pmt:main"
+sbn-train-fusion  = "sbn_anomaly_detection.train.train_fusion:main"
+sbn-train-window  = "sbn_anomaly_detection.train.train_window:main"
+sbn-score-events  = "sbn_anomaly_detection.infer.score_events:main"
+sbn-score-windows = "sbn_anomaly_detection.infer.score_windows:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true

@@ -1,0 +1,22 @@
+# Core ML / tensor framework
+torch>=2.1
+
+# HEP data I/O
+uproot>=5.1
+awkward>=2.5
+
+# Numerics & data handling
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+
+# Config & utilities
+pyyaml>=6.0
+tqdm>=4.66
+tensorboard>=2.14
+
+# Development extras
+pytest>=7.4
+pytest-cov>=4.1
+ruff>=0.1
+mypy>=1.5
