@@ -3,12 +3,14 @@
 Usage::
 
     sbn-train --config configs/tpc.yaml
+    sbn-train --config configs/tpc.yaml --root-files /data/run1.root /data/run2.root
     python -m sbn_anomaly.train.cli --config configs/pmt.yaml
 """
 
 from __future__ import annotations
 
 import argparse
+import glob as _glob
 import logging
 import sys
 from pathlib import Path
@@ -30,6 +32,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to a YAML configuration file (e.g. configs/tpc.yaml).",
     )
     parser.add_argument(
+        "--root-files",
+        nargs="+",
+        default=None,
+        metavar="PATH",
+        help=(
+            "One or more ROOT file paths (glob patterns accepted). "
+            "When provided with model_type=tpc, streams directly from ROOT "
+            "instead of loading pre-computed .npy feature files."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -48,11 +61,23 @@ def main(argv: list[str] | None = None) -> int:
     with config_path.open() as fh:
         cfg = yaml.safe_load(fh)
 
+    # Expand any glob patterns supplied via --root-files.
+    root_files: list[str] | None = None
+    if args.root_files:
+        root_files = []
+        for pattern in args.root_files:
+            matches = _glob.glob(pattern)
+            if matches:
+                root_files.extend(matches)
+            else:
+                # Treat as a literal path; RootStreamer will raise if missing.
+                root_files.append(pattern)
+
     model_type = cfg.get("model_type", "").lower()
     logger.info("Starting training for model_type='%s'", model_type)
 
     if model_type == "tpc":
-        _train_tpc(cfg)
+        _train_tpc(cfg, root_files=root_files)
     elif model_type == "pmt":
         _train_pmt(cfg)
     elif model_type == "fusion":
@@ -68,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _train_tpc(cfg: dict) -> None:
+def _train_tpc(cfg: dict, root_files: list[str] | None = None) -> None:
     import numpy as np
     from torch.utils.data import DataLoader
 
@@ -81,12 +106,47 @@ def _train_tpc(cfg: dict) -> None:
     model_cfg = cfg.get("model", {})
     train_cfg = cfg.get("training", {})
 
-    features = np.load(data_cfg["features_path"])
-    dataset = TPCDataset(features)
-    loader = DataLoader(dataset, batch_size=train_cfg.get("batch_size", 256), shuffle=True)
+    input_dim = model_cfg.get("input_dim", 256)
+
+    if root_files:
+        from sbn_anomaly.data.stream_dataset import TPCStreamDataset
+
+        logger.info(
+            "Streaming TPC training from %d ROOT file(s): %s",
+            len(root_files),
+            root_files,
+        )
+        dataset = TPCStreamDataset(
+            file_paths=root_files,
+            tree_name=data_cfg.get("tree_name", "sbn_tree"),
+            waveform_branch=data_cfg.get("waveform_branch", "tpc_waveform"),
+            branches=data_cfg.get("tpc_branches"),
+            input_dim=input_dim,
+            batch_size=data_cfg.get("batch_size_stream", 512),
+            normalize=data_cfg.get("normalize", False),
+            max_events=train_cfg.get("max_events"),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=train_cfg.get("batch_size", 256),
+            # shuffle is not supported for IterableDataset
+        )
+        steps_per_epoch = train_cfg.get(
+            "steps_per_epoch",
+            # Default of 100 batches per epoch is a sensible starting point for
+            # streaming; tune via training.steps_per_epoch in the YAML config.
+            100,
+        )
+    else:
+        features = np.load(data_cfg["features_path"])
+        dataset = TPCDataset(features)
+        loader = DataLoader(
+            dataset, batch_size=train_cfg.get("batch_size", 256), shuffle=True
+        )
+        steps_per_epoch = None
 
     model = TPCAutoencoder(
-        input_dim=model_cfg.get("input_dim", 256),
+        input_dim=input_dim,
         latent_dim=model_cfg.get("latent_dim", 32),
     )
     trainer = TPCTrainer(
@@ -94,6 +154,7 @@ def _train_tpc(cfg: dict) -> None:
         lr=train_cfg.get("lr", 1e-3),
         max_epochs=train_cfg.get("max_epochs", 50),
         checkpoint_dir=train_cfg.get("checkpoint_dir"),
+        steps_per_epoch=steps_per_epoch,
     )
     trainer.train(loader)
     if output := train_cfg.get("output_path"):

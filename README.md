@@ -41,11 +41,16 @@ pip install -e ".[dev]"
 ## Training
 
 ```bash
-# Train each model independently
+# Train each model independently (from pre-computed .npy features)
 sbn-train --config configs/tpc.yaml
 sbn-train --config configs/pmt.yaml
 sbn-train --config configs/fusion.yaml
 sbn-train --config configs/window.yaml
+
+# Train TPC directly from ROOT files (streaming — no .npy files needed)
+sbn-train --config configs/tpc.yaml --root-files /data/run1.root /data/run2.root
+# Glob patterns work too (quote to prevent premature shell expansion):
+sbn-train --config configs/tpc.yaml --root-files "/data/sbn/*.root"
 
 # Or via shell scripts
 bash scripts/train_tpc.sh

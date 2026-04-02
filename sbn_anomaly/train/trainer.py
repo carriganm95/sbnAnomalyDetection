@@ -44,6 +44,7 @@ class BaseTrainer(ABC):
         max_epochs: int = 50,
         checkpoint_dir: Optional[str] = None,
         log_interval: int = 50,
+        steps_per_epoch: Optional[int] = None,
     ) -> None:
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -53,6 +54,7 @@ class BaseTrainer(ABC):
         self.max_epochs = max_epochs
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.log_interval = log_interval
+        self.steps_per_epoch = steps_per_epoch
 
         if self.checkpoint_dir:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -81,6 +83,8 @@ class BaseTrainer(ABC):
             running_loss = 0.0
             n_batches = 0
             for batch_idx, batch in enumerate(loader):
+                if self.steps_per_epoch is not None and batch_idx >= self.steps_per_epoch:
+                    break
                 self.optimizer.zero_grad()
                 loss = self.compute_loss(batch)
                 loss.backward()

@@ -41,6 +41,7 @@ class TPCTrainer(BaseTrainer):
         max_epochs: int = 50,
         checkpoint_dir: Optional[str] = None,
         log_interval: int = 50,
+        steps_per_epoch: Optional[int] = None,
     ) -> None:
         if model is None:
             model = TPCAutoencoder()
@@ -54,6 +55,7 @@ class TPCTrainer(BaseTrainer):
             max_epochs=max_epochs,
             checkpoint_dir=checkpoint_dir,
             log_interval=log_interval,
+            steps_per_epoch=steps_per_epoch,
         )
         self.criterion = nn.MSELoss()
 

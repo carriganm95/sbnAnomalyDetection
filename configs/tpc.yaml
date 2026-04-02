@@ -1,5 +1,9 @@
 # TPC autoencoder configuration.
-# Train with:  sbn-train --config configs/tpc.yaml
+# Train from pre-computed .npy features:
+#   sbn-train --config configs/tpc.yaml
+#
+# Train directly from ROOT files (streaming):
+#   sbn-train --config configs/tpc.yaml --root-files /data/run1.root /data/run2.root
 
 model_type: tpc
 
@@ -10,7 +14,10 @@ model:
   dropout: 0.1
 
 data:
+  # Path to pre-computed features (used when --root-files is NOT supplied).
   features_path: data/processed/tpc_features_train.npy
+
+  # ROOT streaming settings (used when --root-files IS supplied).
   tree_name: sbn_tree
   tpc_branches:
     - run
@@ -19,13 +26,21 @@ data:
     - tpc_waveform
     - tpc_channel
     - tpc_tick
+  # Branch whose contents are flattened into the feature vector.
+  waveform_branch: tpc_waveform
   batch_size_stream: 512
+  # Per-event z-score normalisation before feeding to the model.
+  normalize: false
 
 training:
   batch_size: 256
   lr: 0.001
   weight_decay: 1.0e-5
   max_epochs: 50
+  # Maximum batches processed per epoch (applies to ROOT streaming mode).
+  steps_per_epoch: 100
+  # Cap total events read from ROOT stream (null = unlimited).
+  max_events: null
   checkpoint_dir: checkpoints/tpc/
   output_path: checkpoints/tpc/tpc_final.pt
   log_interval: 50
