@@ -81,6 +81,27 @@ class TestTPCStreamDataset:
         defaults.update(kwargs)
         return TPCStreamDataset(**defaults)
 
+    def test_xrootd_url_is_preserved(self):
+        url = "root://fndcadoor.fnal.gov//icarus/persistent/users/micarrig/DQM/file.root"
+        ds = self._dataset(file_paths=[url])
+
+        assert ds.file_paths == [url]
+
+    def test_hit_branches_are_automatically_loaded(self):
+        ds = self._dataset(
+            hit_branches=["hits0.h.integral", "hits0.h.sumadc"],
+            branches=["meta.run", "meta.subrun", "meta.evt"],
+            waveform_branch=None,
+        )
+
+        assert ds.branches == [
+            "meta.run",
+            "meta.subrun",
+            "meta.evt",
+            "hits0.h.integral",
+            "hits0.h.sumadc",
+        ]
+
     def test_yields_correct_feature_dim(self):
         """Each yielded tuple must contain a tensor of shape (input_dim,)."""
         ds = self._dataset(input_dim=64)
@@ -181,6 +202,37 @@ class TestTPCStreamDataset:
         assert tensor.shape == (input_dim,)
         np.testing.assert_array_equal(tensor.numpy(), wave[:input_dim])
 
+    def test_non_finite_features_warn_once(self, caplog):
+        """Repeated non-finite events should only warn once per iterator."""
+        import awkward as ak
+
+        ds = self._dataset(input_dim=8)
+        batch = ak.Array(
+            {
+                "tpc_waveform": [
+                    np.array([1.0, np.nan], dtype=np.float32),
+                    np.array([2.0, np.inf], dtype=np.float32),
+                    np.array([3.0, -np.inf], dtype=np.float32),
+                ]
+            }
+        )
+
+        with patch(
+            "sbn_anomaly.data.stream_dataset.RootStreamer"
+        ) as MockStreamer:
+            instance = MockStreamer.return_value
+            instance.stream.return_value = iter([batch])
+
+            with caplog.at_level("WARNING", logger="sbn_anomaly.data.stream_dataset"):
+                items = list(ds)
+
+        assert len(items) == 3
+        warning_messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
+        assert len(warning_messages) == 1
+        assert "Found non-finite feature values in event" in warning_messages[0]
+        for (tensor,) in items:
+            assert torch.isfinite(tensor).all()
+
 
 # ---------------------------------------------------------------------------
 # extract_hit_features – unit tests
@@ -202,14 +254,15 @@ class TestExtractHitFeatures:
         np.testing.assert_array_equal(result[10:], np.zeros(22, dtype=np.float32))
 
     def test_multiple_branches_concatenated(self):
-        """Values should be concat'd in branch order before padding."""
+        """Values should be interleaved by hit before padding."""
         data = {
             "hit_integral": np.array([1.0, 2.0], dtype=np.float32),
             "hit_charge": np.array([3.0, 4.0], dtype=np.float32),
         }
         result = extract_hit_features(data, ["hit_integral", "hit_charge"], input_dim=8)
         assert result.shape == (8,)
-        np.testing.assert_array_equal(result[:4], [1.0, 2.0, 3.0, 4.0])
+        # Interleaved: [integral_0, charge_0, integral_1, charge_1, ...]
+        np.testing.assert_array_equal(result[:4], [1.0, 3.0, 2.0, 4.0])
         np.testing.assert_array_equal(result[4:], np.zeros(4, dtype=np.float32))
 
     def test_missing_branch_skipped(self):

@@ -49,6 +49,9 @@ sbn-train --config configs/window.yaml
 
 # Train TPC directly from ROOT files (streaming — no .npy files needed)
 sbn-train --config configs/tpc.yaml --root-files /data/run1.root /data/run2.root
+
+# Or train from a file list manifest
+sbn-train --config configs/tpc.yaml --root-file-list data/train_roots.txt
 # Glob patterns work too (quote to prevent premature shell expansion):
 sbn-train --config configs/tpc.yaml --root-files "/data/sbn/*.root"
 
@@ -57,13 +60,38 @@ bash scripts/train_tpc.sh
 bash scripts/train_pmt.sh
 bash scripts/train_fusion.sh
 bash scripts/train_window.sh
+
+# Compare candidate TPC hit branches with leave-one-out ablation
+sbn-ablate-hit-branches --config configs/tpc.yaml \
+  --root-file-list data/train_roots.txt \
+  --eval-root-file-list data/test_roots.txt \
+  --output-dir ablation/tpc
 ```
+
+Training writes artifacts in the checkpoint/output directory, including:
+- training_history.csv (per-epoch metrics such as loss, score_p95, score_p99,
+  anomaly_fraction_above_threshold, epoch_time_sec, events_per_sec)
+- training_curves.png (metric curves)
+- reconstruction_hist2d.png (2D histogram of original vs reconstructed values)
+
+The ablation runner writes one subdirectory per branch variant plus a summary
+CSV at `ablation_summary.csv` with training and evaluation loss/score
+statistics for each leave-one-out run.
 
 ## Inference
 
 ```bash
 # Score TPC events
 sbn-infer --config configs/tpc.yaml --input data/processed/tpc_features_test.npy
+
+# Score TPC events directly from ROOT files (streaming)
+sbn-infer --config configs/tpc.yaml --root-files /data/run1.root /data/run2.root
+
+# Or score from a file list manifest
+sbn-infer --config configs/tpc.yaml --root-file-list data/test_roots.txt
+
+# Glob patterns also work (quote to prevent premature shell expansion)
+sbn-infer --config configs/tpc.yaml --root-files "/data/sbn/*.root"
 
 # Score with fusion model
 sbn-infer --config configs/fusion.yaml \

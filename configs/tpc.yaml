@@ -8,17 +8,17 @@
 model_type: tpc
 
 model:
-  input_dim: 256
-  latent_dim: 32
-  hidden_dims: [128, 64]
-  dropout: 0.1
+  input_dim: 700
+  latent_dim: 64
+  hidden_dims: [256, 128, 64]
+  dropout: 0.05
 
 data:
   # Path to pre-computed features (used when --root-files is NOT supplied).
-  features_path: data/processed/tpc_features_train.npy
+  features_path: /exp/icarus/data/users/micarrig/tpc_train_features.npz
 
   # ROOT streaming settings (used when --root-files IS supplied).
-  tree_name: sbn_tree
+  tree_name: caloskim/TrackCaloSkim
 
   # ── Input mode ────────────────────────────────────────────────────────────
   # Two modes are available for ROOT streaming:
@@ -33,41 +33,210 @@ data:
   # ──────────────────────────────────────────────────────────────────────────
 
   # Set to null to disable waveform input and use hit_branches instead.
-  waveform_branch: tpc_waveform
+  waveform_branch: null
 
   # Hit-level branches used when waveform_branch is null.
   # Common choices: hit_integral, hit_charge, hit_amplitude, hit_peaktime,
   #                 hit_rms, hit_multiplicity
   hit_branches:
-    - hit_integral
-    - hit_charge
-    - hit_amplitude
+    - hits0.h.integral
+    - hits0.h.sumadc
+    - hits0.h.time
+    - hits0.h.channel
+    - hits0.h.wire
+    # - hits0.h.width # only collection plane has real values
+    # - hits0.h.plane # don't want to give unnecessary position info
+    # - hits0.h.tpc
+    - hits0.h.mult
+    - hits0.h.start
+    - hits0.h.end
+    - hits0.h.hasSP
+    - hits0.h.sp.x
+    - hits0.h.sp.y
+    - hits0.h.sp.z
+
+    - hits0.pitch
+    - hits0.dqdx
+    - hits0.rr
+    - hits0.tp.x
+    - hits0.tp.y
+    - hits0.tp.z
+    - hits0.dir.x
+    - hits0.dir.y
+    - hits0.dir.z
+    - hits0.ontraj
+    - hits0.oncalo
+
+    - hits1.h.integral
+    - hits1.h.sumadc
+    - hits1.h.time
+    - hits1.h.channel
+    - hits1.h.wire
+    # - hits1.h.width # only collection plane has real values
+    # - hits1.h.plane # don't want to give unnecessary position info
+    # - hits1.h.tpc
+    - hits1.h.mult
+    - hits1.h.start
+    - hits1.h.end
+    - hits1.h.hasSP
+    - hits1.h.sp.x
+    - hits1.h.sp.y
+    - hits1.h.sp.z
+
+    - hits1.pitch
+    - hits1.dqdx
+    - hits1.rr
+    - hits1.tp.x
+    - hits1.tp.y
+    - hits1.tp.z
+    - hits1.dir.x
+    - hits1.dir.y
+    - hits1.dir.z
+    - hits1.ontraj
+    - hits1.oncalo
+
+    - hits2.h.integral
+    - hits2.h.sumadc
+    - hits2.h.time
+    - hits2.h.channel
+    - hits2.h.wire
+    - hits2.h.width
+    # - hits2.h.plane # don't want to give unnecessary position info
+    # - hits2.h.tpc
+    - hits2.h.mult
+    - hits2.h.start
+    - hits2.h.end
+    - hits2.h.hasSP
+    - hits2.h.sp.x
+    - hits2.h.sp.y
+    - hits2.h.sp.z
+
+    - hits2.pitch
+    - hits2.dqdx
+    - hits2.rr
+    - hits2.tp.x
+    - hits2.tp.y
+    - hits2.tp.z
+    - hits2.dir.x
+    - hits2.dir.y
+    - hits2.dir.z
+    - hits2.ontraj
+    - hits2.oncalo
 
   tpc_branches:
-    - run
-    - subrun
-    - event
-    - tpc_waveform
-    - tpc_channel
-    - tpc_tick
-  batch_size_stream: 512
+    - meta.run
+    - meta.subrun
+    - meta.evt
+
+  # Number of events per batch read from ROOT stream.  Set to null to read one
+  batch_size_stream: 1024
   # Per-event z-score normalisation before feeding to the model.
-  normalize: false
+  normalize: true
 
 training:
-  batch_size: 256
-  lr: 0.001
+  batch_size: 512
+  lr: 0.0004
   weight_decay: 1.0e-5
-  max_epochs: 50
+  max_epochs: 100
   # Maximum batches processed per epoch (applies to ROOT streaming mode).
-  steps_per_epoch: 100
+  steps_per_epoch: 500
   # Cap total events read from ROOT stream (null = unlimited).
   max_events: null
-  checkpoint_dir: checkpoints/tpc/
-  output_path: checkpoints/tpc/tpc_final.pt
+  # Fixed score threshold used to report anomaly_fraction_above_threshold.
+  # Set to null to disable this metric.
+  anomaly_threshold: 1.0
+  # Max per-epoch sampled scores used for p95/p99 and threshold fraction.
+  metrics_max_samples: 20000
+  # Max sampled scalar values for original-vs-reconstruction 2D histogram.
+  reconstruction_plot_max_values: 50000
+  # When true, save weights and per-epoch histograms only for best-loss epochs
+  # and the final epoch. When false (default), save for all epochs.
+  save_best_only: true
+  # Optional validation split for map-style training inputs and file-level
+  # validation when streaming from ROOT. Set to 0 to disable validation loss.
+  validation_split: 0.2
+  checkpoint_dir: checkpoints/tpc/test/
+  output_path: checkpoints/tpc/test/tpc_final.pt
   log_interval: 50
+  sampling_with_replacement: true
+
+  # Define binning for original-vs-reconstruction 2D histogram.
+  # Each feature may specify `bins`, `range`, and optional `underflow`/
+  # `overflow` values used to clip values before plotting.
+  reconstruction_hist2d_bins: {
+    "hits0.h.integral": {"bins": 310, "range": [-100, 3000], "underflow": -100, "overflow": 3000},
+    "hits0.h.sumadc": {"bins": 110, "range": [-1000, 100], "underflow": -1000, "overflow": 100},
+    "hits0.h.time": {"bins": 50, "range": [-100, 5000], "underflow": -100, "overflow": 5000},
+    # "hits0.h.channel": {"bins": 10000, "range": [0, 10000]},
+    # "hits0.h.wire": {"bins": 2000, "range": [0, 2000]},
+    "hits0.h.mult": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits0.h.start": {"bins": 310, "range": [-100, 3000], "underflow": -100, "overflow": 3000},
+    "hits0.h.end": {"bins": 310, "range": [-100, 3000], "underflow": -100, "overflow": 3000},
+    "hits0.h.hasSP": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits0.h.sp.x": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits0.h.sp.y": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits0.h.sp.z": {"bins": 225, "range": [-600, 500], "underflow": -600, "overflow": 500},
+    "hits0.pitch": {"bins": 40, "range": [-1, 3], "underflow": -1, "overflow": 3},
+    "hits0.dqdx": {"bins": 130, "range": [-100, 1200], "underflow": -100, "overflow": 1200},
+    "hits0.rr": {"bins": 70, "range": [-100, 600], "underflow": -100, "overflow": 600},
+    "hits0.tp.x": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits0.tp.y": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits0.tp.z":{"bins": 225, "range": [-600, 500], "underflow": -600, "overflow": 500},
+    "hits0.dir.x": {"bins": 30, "range": [-2, 1], "underflow": -2, "overflow": 1},
+    "hits0.dir.y": {"bins": 30, "range": [-2, 1], "underflow": -2, "overflow": 1},
+    "hits0.dir.z": {"bins": 30, "range": [-2, 1], "underflow": -2, "overflow": 1},
+    "hits0.ontraj": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits0.oncalo": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits1.h.integral": {"bins": 310, "range": [-100, 3000], "underflow": -100, "overflow": 3000},
+    "hits1.h.sumadc": {"bins": 110, "range": [-1000, 100], "underflow": -1000, "overflow": 100},
+    "hits1.h.time": {"bins": 50, "range": [-100, 5000], "underflow": -100, "overflow": 5000},
+    # "hits1.h.channel": {"bins": 10000, "range": [0, 10000]},
+    # "hits1.h.wire": {"bins": 2000, "range": [0, 2000]},
+    "hits1.h.mult": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits1.h.start": {"bins": 310, "range": [-100, 3000], "underflow": -100, "overflow": 3000},
+    "hits1.h.end": {"bins": 310, "range": [-100, 3000], "underflow": -100, "overflow": 3000},
+    "hits1.h.hasSP": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits1.h.sp.x": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits1.h.sp.y": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits1.h.sp.z": {"bins": 225, "range": [-600, 500], "underflow": -600, "overflow": 500},
+    "hits1.pitch": {"bins": 40, "range": [-1, 3], "underflow": -1, "overflow": 3},
+    "hits1.dqdx": {"bins": 130, "range": [-100, 1200], "underflow": -100, "overflow": 1200},
+    "hits1.rr": {"bins": 70, "range": [-100, 700], "underflow": -100, "overflow": 700},
+    "hits1.tp.x": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits1.tp.y": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits1.tp.z": {"bins": 225, "range": [-600, 500], "underflow": -600, "overflow": 500},
+    "hits1.dir.x": {"bins": 30, "range": [-2, 1], "underflow": -2, "overflow": 1},
+    "hits1.dir.y": {"bins": 30, "range": [-2, 1], "underflow": -2, "overflow": 1},
+    "hits1.dir.z": {"bins": 30, "range": [-2, 1], "underflow": -2, "overflow": 1},
+    "hits1.ontraj": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits1.oncalo": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits2.h.integral": {"bins": 310, "range": [-100, 3000], "underflow": -100, "overflow": 3000},
+    "hits2.h.sumadc": {"bins": 110, "range": [-1000, 100], "underflow": -1000, "overflow": 100},
+    "hits2.h.time": {"bins": 50, "range": [-100, 5000], "underflow": -100, "overflow": 5000},
+    # "hits2.h.channel": {"bins": 50, "range": [0, 5000]},
+    # "hits2.h.wire": {"bins": 50, "range": [0, 500]},
+    "hits2.h.width": {"bins": 50, "range": [0, 10], "underflow": 0, "overflow": 10},
+    "hits2.h.mult": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits2.h.start": {"bins": 310, "range": [-100, 3000], "underflow": -100, "overflow": 3000},
+    "hits2.h.end": {"bins": 310, "range": [-100, 3000], "underflow": -100, "overflow": 3000},
+    "hits2.h.hasSP": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits2.h.sp.x": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits2.h.sp.y": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits2.h.sp.z": {"bins": 225, "range": [-600, 500], "underflow": -600, "overflow": 500},
+    "hits2.pitch": {"bins": 40, "range": [-1, 3], "underflow": -1, "overflow": 3},
+    "hits2.dqdx": {"bins": 130, "range": [-100, 1200], "underflow": -100, "overflow": 1200},
+    "hits2.rr": {"bins": 70, "range": [-100, 700], "underflow": -100, "overflow": 700},
+    "hits2.tp.x": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits2.tp.y": {"bins": 125, "range": [-400, 300], "underflow": -400, "overflow": 300},
+    "hits2.tp.z": {"bins": 225, "range": [-600, 500], "underflow": -600, "overflow": 500},
+    "hits2.dir.x": {"bins": 30, "range": [-2, 1], "underflow": -2, "overflow": 1},
+    "hits2.dir.y": {"bins": 30, "range": [-2, 1], "underflow": -2, "overflow": 1},
+    "hits2.dir.z": {"bins": 30, "range": [-2, 1], "underflow": -2, "overflow": 1},
+    "hits2.ontraj": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+    "hits2.oncalo": {"bins": 3, "range": [-1, 2], "underflow": -1, "overflow": 2},
+  }
 
 inference:
-  checkpoint_path: checkpoints/tpc/tpc_final.pt
-  input_path: data/processed/tpc_features_test.npy
+  checkpoint_path: checkpoints/tpc/test/tpc_final.pt
+  input_path: /exp/icarus/data/users/micarrig/tpc_test_features.npz
   threshold: null

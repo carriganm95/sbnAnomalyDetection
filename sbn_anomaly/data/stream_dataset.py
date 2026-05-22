@@ -51,6 +51,8 @@ from torch.utils.data import IterableDataset
 from sbn_anomaly.data.streaming import RootStreamer
 
 logger = logging.getLogger(__name__)
+_stream_debug_logged = False
+_truncate_warned = False
 
 
 def extract_tpc_features(
@@ -73,6 +75,14 @@ def extract_tpc_features(
     """
     raw = raw.astype(np.float32)
     if len(raw) >= input_dim:
+        global _truncate_warned
+        if not _truncate_warned:
+            logger.warning(
+                "Feature vector longer than input_dim=%d; truncating to %d",
+                input_dim,
+                input_dim,
+            )
+            _truncate_warned = True
         return raw[:input_dim]
     padded = np.zeros(input_dim, dtype=np.float32)
     padded[: len(raw)] = raw
@@ -84,12 +94,16 @@ def extract_hit_features(
     hit_branches: list,
     input_dim: int = 256,
 ) -> np.ndarray:
-    """Concatenate per-event hit quantities and pad/truncate to *input_dim*.
+    """Interleave per-event hit quantities and pad/truncate to *input_dim*.
 
-    Values from each branch in *hit_branches* are flattened and concatenated
-    in order (e.g. all ``hit_integral`` values, then all ``hit_charge`` values,
-    etc.).  The resulting 1-D array is padded with zeros or truncated to
-    produce a fixed-size feature vector.
+    For each hit, values from all branches in *hit_branches* are concatenated
+    in order. Hits are interleaved so that position semantics are consistent
+    across events with different hit multiplicities.
+
+    Example with branches=[integral, sumadc, width, time] and 3 hits:
+    [integral_0, sumadc_0, width_0, time_0,
+     integral_1, sumadc_1, width_1, time_1,
+     integral_2, sumadc_2, width_2, time_2, ...]
 
     Parameters
     ----------
@@ -105,13 +119,39 @@ def extract_hit_features(
     -------
     numpy.ndarray of shape ``(input_dim,)`` and dtype ``float32``.
     """
-    parts = [
-        np.asarray(event_data[b], dtype=np.float32).ravel()
-        for b in hit_branches
-        if b in event_data
-    ]
-    raw = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+    # Load all branch data and find the maximum number of hits
+    branch_data: dict[str, np.ndarray] = {}
+    n_hits = 0
+    for b in hit_branches:
+        if b in event_data:
+            data = np.asarray(event_data[b], dtype=np.float32).ravel()
+            branch_data[b] = data
+            n_hits = max(n_hits, len(data))
+
+    if not branch_data:
+        return np.zeros(input_dim, dtype=np.float32)
+
+    # Interleave: for each hit index, concatenate values from all branches
+    raw_parts: list[float] = []
+    for hit_idx in range(n_hits):
+        for branch in hit_branches:
+            if branch in branch_data:
+                data = branch_data[branch]
+                if hit_idx < len(data):
+                    raw_parts.append(float(data[hit_idx]))
+                else:
+                    raw_parts.append(0.0)  # Pad with zero if hit doesn't exist in this branch
+
+    raw = np.asarray(raw_parts, dtype=np.float32)
     if len(raw) >= input_dim:
+        global _truncate_warned
+        if not _truncate_warned:
+            logger.warning(
+                "Hit-mode feature vector longer than input_dim=%d; truncating to %d",
+                input_dim,
+                input_dim,
+            )
+            _truncate_warned = True
         return raw[:input_dim]
     padded = np.zeros(input_dim, dtype=np.float32)
     padded[: len(raw)] = raw
@@ -178,13 +218,13 @@ class TPCStreamDataset(IterableDataset):
             )
         if isinstance(file_paths, (str, Path)):
             file_paths = [file_paths]
-        self.file_paths = [Path(p) for p in file_paths]
+        self.file_paths = [_normalize_root_input_path(p) for p in file_paths]
         self.tree_name = tree_name
         self.waveform_branch = waveform_branch
         self.hit_branches: list = hit_branches or []
         # Determine which branches to actually request from the streamer.
         if branches is not None:
-            self.branches = branches
+            self.branches = _merge_branches(branches, self.hit_branches)
         elif waveform_branch is not None:
             self.branches = [waveform_branch]
         else:
@@ -208,7 +248,31 @@ class TPCStreamDataset(IterableDataset):
             batch_size=self.batch_size,
         )
 
+        # Use debug logging instead of print so verbosity is controlled by
+        # the configured log level. Include worker id when running with
+        # multiple DataLoader workers to aid debugging without spamming stdout.
+        try:
+            from torch.utils.data import get_worker_info
+
+            worker = get_worker_info()
+        except Exception:
+            worker = None
+        worker_id = f"worker={worker.id}" if worker is not None else "main"
+        # Emit the start message once per-process to avoid spamming stdout/logs
+        # when __iter__ may be invoked multiple times in the same process.
+        global _stream_debug_logged
+        if not _stream_debug_logged:
+            logger.debug(
+                "Starting ROOT stream (%s): files=%s tree=%s branches=%s",
+                worker_id,
+                self.file_paths,
+                self.tree_name,
+                self.branches,
+            )
+            _stream_debug_logged = True
         n_yielded = 0
+        non_finite_count = 0
+        non_finite_warned = False
         for batch in streamer.stream():
             for i in range(len(batch)):
                 if self.waveform_branch is not None:
@@ -231,8 +295,46 @@ class TPCStreamDataset(IterableDataset):
                     if std > 0.0:
                         feat = (feat - mean) / std
 
-                yield (torch.from_numpy(feat),)
+                # Defensive check: replace non-finite feature values and warn.
+                if not np.isfinite(feat).all():
+                    non_finite_count += 1
+                    if not non_finite_warned:
+                        logger.warning(
+                            "Found non-finite feature values in event (replacing with 0)."
+                            " branches=%s file_paths=%s",
+                            self.hit_branches or self.branches,
+                            self.file_paths,
+                        )
+                        non_finite_warned = True
+                    else:
+                        logger.debug(
+                            "Replaced additional non-finite feature values with 0"
+                            " (count=%d).",
+                            non_finite_count,
+                        )
+                    feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
 
+                yield (torch.from_numpy(feat),)
                 n_yielded += 1
                 if self.max_events is not None and n_yielded >= self.max_events:
                     return
+
+
+def _normalize_root_input_path(path: Union[str, Path]) -> Union[str, Path]:
+    """Preserve ROOT URLs while still normalizing local paths as ``Path`` objects."""
+    path_str = str(path)
+    if "://" in path_str:
+        return path_str
+    return Path(path)
+
+
+def _merge_branches(branches: Optional[list], hit_branches: list) -> list:
+    """Return branches with every hit branch included once, preserving order."""
+    merged: list = list(branches or [])
+    seen = {str(branch) for branch in merged}
+    for branch in hit_branches:
+        branch_str = str(branch)
+        if branch_str not in seen:
+            merged.append(branch)
+            seen.add(branch_str)
+    return merged

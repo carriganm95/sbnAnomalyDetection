@@ -12,6 +12,7 @@ from sbn_anomaly.data.dataset import (
     WindowDataset,
 )
 from sbn_anomaly.data.event_joiner import EventJoiner
+from sbn_anomaly.data.streaming import RootStreamer
 
 
 # ---------------------------------------------------------------------------
@@ -165,3 +166,11 @@ class TestEventJoiner:
         tpc_events = ak.to_numpy(t["event"]).tolist()
         pmt_events = ak.to_numpy(p["event"]).tolist()
         assert tpc_events == pmt_events
+
+
+class TestRootStreamer:
+    def test_xrootd_url_is_preserved(self):
+        url = "root://fndcadoor.fnal.gov//store/data/file.root"
+        streamer = RootStreamer(url, tree_name="sbn_tree")
+
+        assert streamer.file_paths == [url]

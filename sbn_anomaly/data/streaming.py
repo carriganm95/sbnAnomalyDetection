@@ -65,7 +65,7 @@ class RootStreamer:
     ) -> None:
         if isinstance(file_paths, (str, Path)):
             file_paths = [file_paths]
-        self.file_paths = [Path(p) for p in file_paths]
+        self.file_paths = [_normalize_root_input_path(p) for p in file_paths]
         self.tree_name = tree_name
         self.branches = branches
         self.batch_size = batch_size
@@ -110,6 +110,9 @@ class RootStreamer:
             except FileNotFoundError:
                 logger.error("ROOT file not found: %s", path)
                 raise
+            except OSError as exc:
+                logger.warning("Skipping unreadable ROOT file %s: %s", path, exc)
+                continue
 
         # Yield remaining events that did not fill a complete batch.
         if buffer:
@@ -138,3 +141,11 @@ class RootStreamer:
         remainder = combined[self.batch_size :]
         new_buffer = [remainder] if len(remainder) > 0 else []
         return batch, new_buffer, buffered_events - self.batch_size
+
+
+def _normalize_root_input_path(path: Union[str, Path]) -> Union[str, Path]:
+    """Preserve ROOT URLs while still normalizing local paths as ``Path`` objects."""
+    path_str = str(path)
+    if "://" in path_str:
+        return path_str
+    return Path(path)
