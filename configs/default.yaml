@@ -19,17 +19,15 @@ data:
     - run
     - subrun
     - event
-    - tpc_waveform
-    - tpc_channel
-    - tpc_tick
-  pmt_branches:
-    - run
-    - subrun
-    - event
-    - pmt_waveform
-    - pmt_channel
-    - pmt_time_ns
+
+  
+
   batch_size_stream: 512   # events per streaming batch
+  # Rolling-window materializer defaults
+  window_size: 20
+  n_temporal_bins: 4
+  stride: 1
+  adjacency_radius: 4
 
 training:
   batch_size: 256

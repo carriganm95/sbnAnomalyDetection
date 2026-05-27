@@ -17,6 +17,8 @@ from sbn_anomaly.train.window_trainer import WindowTrainer
 from sbn_anomaly.models.window_model import WindowAutoencoder
 from sbn_anomaly.data.dataset import WindowDataset
 from sbn_anomaly.utils.plotting import _resolve_hist2d_spec
+from sbn_anomaly.models.gnn_forecaster_pyg import GNNForecasterPyG
+from sbn_anomaly.train.gnn_trainer import GNNTrainerPyG
 
 
 class TestTPCTrainer:
@@ -187,3 +189,109 @@ class TestWindowTrainer:
         trainer = WindowTrainer(model=model, max_epochs=1)
         losses = trainer.train(loader)
         assert len(losses) == 1
+
+
+# ---------------------------------------------------------------------------
+# GNN Trainer (PyG)
+# ---------------------------------------------------------------------------
+
+
+def _make_gnn_loader(
+    n_nodes: int = 10,
+    frame_feat_dim: int = 6,
+    history: int = 2,
+    n_windows: int = 20,
+    batch_size: int = 4,
+):
+    """Build a DataLoader of synthetic PyG graphs for GNN trainer tests."""
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+
+    graphs = []
+    for _ in range(n_windows):
+        src = torch.arange(n_nodes)
+        dst = (src + 1) % n_nodes
+        graphs.append(Data(
+            x=torch.randn(n_nodes, 1 + history * frame_feat_dim),
+            y=torch.randn(n_nodes, frame_feat_dim),
+            edge_index=torch.stack([torch.cat([src, dst]), torch.cat([dst, src])]),
+        ))
+    return PyGDataLoader(graphs, batch_size=batch_size, shuffle=False)
+
+
+class TestGNNTrainerPyG:
+    def test_train_one_epoch_returns_loss(self, tmp_path):
+        loader = _make_gnn_loader()
+        model = GNNForecasterPyG(
+            frame_feat_dim=6, target_dim=6,
+            gnn_hidden=8, gnn_layers=1, gru_hidden=16, history=2,
+        )
+        trainer = GNNTrainerPyG(model=model, max_epochs=1, device="cpu",
+                                checkpoint_dir=str(tmp_path))
+        losses = trainer.train(loader)
+        assert len(losses) == 1
+        assert losses[0] > 0
+
+    def test_train_multiple_epochs(self, tmp_path):
+        loader = _make_gnn_loader()
+        model = GNNForecasterPyG(
+            frame_feat_dim=6, target_dim=6,
+            gnn_hidden=8, gnn_layers=1, gru_hidden=16, history=2,
+        )
+        trainer = GNNTrainerPyG(model=model, max_epochs=3, device="cpu",
+                                checkpoint_dir=str(tmp_path))
+        losses = trainer.train(loader)
+        assert len(losses) == 3
+
+    def test_save_and_load(self, tmp_path):
+        model = GNNForecasterPyG(
+            frame_feat_dim=6, target_dim=6,
+            gnn_hidden=8, gnn_layers=1, gru_hidden=16, history=2,
+        )
+        trainer = GNNTrainerPyG(model=model, max_epochs=1, device="cpu")
+        ckpt = str(tmp_path / "gnn.pt")
+        trainer.save(ckpt)
+        trainer.load(ckpt)
+
+    def test_validation_loss_tracked(self, tmp_path):
+        train_loader = _make_gnn_loader(n_windows=16)
+        val_loader = _make_gnn_loader(n_windows=8)
+        model = GNNForecasterPyG(
+            frame_feat_dim=6, target_dim=6,
+            gnn_hidden=8, gnn_layers=1, gru_hidden=16, history=2,
+        )
+        trainer = GNNTrainerPyG(model=model, max_epochs=2, device="cpu",
+                                checkpoint_dir=str(tmp_path))
+        trainer.train(train_loader, validation_loader=val_loader)
+
+        assert "val_loss" in trainer.history
+        assert len(trainer.history["val_loss"]) == 2
+        assert np.isfinite(trainer.history["val_loss"]).all()
+
+    def test_collect_scores_shape(self):
+        loader = _make_gnn_loader(n_windows=12, batch_size=4)
+        model = GNNForecasterPyG(
+            frame_feat_dim=6, target_dim=6,
+            gnn_hidden=8, gnn_layers=1, gru_hidden=16, history=2,
+        )
+        trainer = GNNTrainerPyG(model=model, max_epochs=1, device="cpu")
+        trainer.train(loader)
+        scores_mean, scores_max = trainer.collect_scores(loader)
+        assert scores_mean.shape == (12,)
+        assert scores_max.shape == (12,)
+        assert np.all(scores_mean >= 0)
+        assert np.all(scores_max >= scores_mean)
+
+    def test_writes_training_plots(self, tmp_path):
+        loader = _make_gnn_loader()
+        model = GNNForecasterPyG(
+            frame_feat_dim=6, target_dim=6,
+            gnn_hidden=8, gnn_layers=1, gru_hidden=16, history=2,
+        )
+        trainer = GNNTrainerPyG(model=model, max_epochs=1, device="cpu",
+                                checkpoint_dir=str(tmp_path))
+        trainer.train(loader)
+        csv_path = trainer.save_training_history(str(tmp_path))
+        plot_path = trainer.save_training_plots(str(tmp_path))
+        assert csv_path is not None and csv_path.exists()
+        assert plot_path is not None and plot_path.exists()

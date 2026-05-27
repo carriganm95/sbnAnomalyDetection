@@ -419,6 +419,182 @@ def save_reconstruction_hist2d(
     return first_path
 
 
+def save_node_mse_plot(
+    channel_mse: "np.ndarray",
+    output_dir: "str | Path",
+    filename: str = "node_mse.png",
+    title: str = "Per-channel average prediction MSE",
+) -> "Path":
+    """Save a bar chart of per-original-channel average prediction MSE.
+
+    Channels that were never active (NaN entries) are shown in a distinct colour.
+    High-MSE channels may indicate dead wires, noisy channels, or edge effects.
+
+    Args:
+        channel_mse: (num_channels,) array of per-channel average MSE; NaN = never seen
+        output_dir: directory to write the PNG
+        filename: output filename (default: node_mse.png)
+        title: plot title
+
+    Returns:
+        Path to the written PNG.
+    """
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    channel_mse = np.asarray(channel_mse, dtype=float)
+    n = len(channel_mse)
+    channels = np.arange(n)
+
+    seen = np.isfinite(channel_mse)
+    mse_seen = np.where(seen, channel_mse, 0.0)
+
+    fig, ax = plt.subplots(figsize=(max(6, n // 40), 4))
+    ax.bar(channels[seen], mse_seen[seen], width=1.0, color="steelblue", label="active channels")
+    if (~seen).any():
+        ax.bar(
+            channels[~seen],
+            np.zeros((~seen).sum()),
+            width=1.0,
+            color="lightgray",
+            label="never active",
+        )
+
+    ax.set_xlabel("Channel index")
+    ax.set_ylabel("Mean MSE")
+    ax.set_title(title)
+    ax.legend(loc="best")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+
+    out_path = out_dir / filename
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def save_score_distribution_plot(
+    scores: "np.ndarray",
+    output_dir: "str | Path",
+    filename: str = "score_distribution.png",
+    threshold: "float | None" = None,
+    title: str = "Window anomaly score distribution",
+    bins: int = 100,
+) -> "Path":
+    """Histogram of per-window anomaly scores.
+
+    Useful for visually choosing an anomaly threshold: the bulk of normal events
+    should form a narrow peak, with anomalies appearing in the high-score tail.
+
+    Args:
+        scores: 1-D array of per-window scores (e.g. mean node MSE)
+        output_dir: directory to write the PNG
+        filename: output filename
+        threshold: if given, draw a vertical line at this value
+        title: plot title
+        bins: histogram bin count
+
+    Returns:
+        Path to the written PNG.
+    """
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    scores = np.asarray(scores, dtype=float)
+    finite = scores[np.isfinite(scores)]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    if finite.size:
+        ax.hist(finite, bins=bins, color="steelblue", alpha=0.8, edgecolor="none")
+        if threshold is not None:
+            ax.axvline(threshold, color="crimson", linestyle="--", linewidth=1.5, label=f"threshold={threshold:.4g}")
+            ax.legend(loc="best")
+        p95 = float(np.percentile(finite, 95))
+        p99 = float(np.percentile(finite, 99))
+        ax.axvline(p95, color="orange", linestyle=":", linewidth=1, label=f"p95={p95:.4g}")
+        ax.axvline(p99, color="red",    linestyle=":", linewidth=1, label=f"p99={p99:.4g}")
+        ax.legend(loc="best")
+
+    ax.set_xlabel("Anomaly score (mean node MSE)")
+    ax.set_ylabel("Windows")
+    ax.set_title(title)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+
+    out_path = out_dir / filename
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def save_score_over_time_plot(
+    scores_mean: "np.ndarray",
+    scores_max: "np.ndarray",
+    output_dir: "str | Path",
+    filename: str = "score_over_time.png",
+    threshold: "float | None" = None,
+    title: str = "Anomaly score over time (window order)",
+) -> "Path":
+    """Line plot of per-window anomaly scores in temporal order.
+
+    Shows whether score magnitude drifts over a run and highlights localized
+    bursts that may correspond to noise runs, beam spills, or other transients.
+
+    Args:
+        scores_mean: (N,) per-window mean-node MSE in window order
+        scores_max:  (N,) per-window max-node MSE in window order
+        output_dir: directory to write the PNG
+        filename: output filename
+        threshold: if given, draw a horizontal threshold line
+        title: plot title
+
+    Returns:
+        Path to the written PNG.
+    """
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    scores_mean = np.asarray(scores_mean, dtype=float)
+    scores_max  = np.asarray(scores_max,  dtype=float)
+    n = max(len(scores_mean), len(scores_max))
+    window_idx = np.arange(n)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    if scores_mean.size:
+        ax.plot(window_idx[:len(scores_mean)], scores_mean, lw=0.8, color="steelblue", label="mean node MSE")
+    if scores_max.size:
+        ax.plot(window_idx[:len(scores_max)], scores_max, lw=0.8, color="darkorange", alpha=0.6, label="max node MSE")
+    if threshold is not None:
+        ax.axhline(threshold, color="crimson", linestyle="--", linewidth=1.2, label=f"threshold={threshold:.4g}")
+
+    ax.set_xlabel("Window index")
+    ax.set_ylabel("Anomaly score")
+    ax.set_title(title)
+    ax.legend(loc="best")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    out_path = out_dir / filename
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def save_epoch_score_hist2d(
     original: Sequence[Any],
     reconstruction: Sequence[Any],

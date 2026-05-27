@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.0.0",
+    "torch-geometric>=2.4.0",
     "numpy>=1.24.0",
     "uproot>=5.0.0",
     "awkward>=2.0.0",
@@ -70,6 +71,9 @@ ignore_missing_imports = true
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 
+[tool.pixi.activation]
+env = { PYTORCH_NO_CUDA_MEMORY_CACHING = "1" }
+
 [tool.pixi.pypi-dependencies]
 sbn-anomaly = { path = ".", editable = true }
 
@@ -83,3 +87,4 @@ dev = { features = ["dev"], solve-group = "default" }
 colorlog = ">=6.10.1,<7"
 root = ">=6.38.4,<7"
 fsspec-xrootd = ">=0.5.2,<0.6"
+pip = ">=26.1.1,<27"

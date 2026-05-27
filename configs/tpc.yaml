@@ -48,6 +48,13 @@ data:
     # - hits0.h.plane # don't want to give unnecessary position info
     # - hits0.h.tpc
     - hits0.h.mult
+
+  # TPC metadata branches (run, subrun, event info)
+  # These will be extracted and saved to the output metadata
+  tpc_branches:
+    - run
+    - subrun
+    - evt
     - hits0.h.start
     - hits0.h.end
     - hits0.h.hasSP
