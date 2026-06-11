@@ -55,7 +55,7 @@ model:
   # Node feature dimension; if omitted, trainer will use windows.shape[-1]
   node_feat_dim: null
   # GNN / temporal architecture
-  gnn_hidden: 128
+  gnn_hidden: 64
   gnn_layers: 3
   gru_hidden: 256
   gru_layers: 2
@@ -75,6 +75,11 @@ training:
   log_interval: 50
   validation_split: 0.1
   use_amp: true
+
+  # How to reduce the two per-window anomaly scores returned by the GNN trainer.
+  # The trainer computes per-node MSE, then returns [mean, max] across nodes in the window.
+  # score_mode=mean selects the mean across nodes; score_mode=max selects the max across nodes.
+  score_mode: mean
 
 inference:
   checkpoint_path: checkpoints/gnn/may-27-v1/gnn_final.pt

@@ -84,6 +84,7 @@ class GNNTrainerPyG(BaseTrainer):
         anomaly_threshold: Optional[float] = None,
         save_best_only: bool = False,
         use_amp: bool = False,
+        score_mode: str = "mean",
     ) -> None:
         if model is None:
             raise ValueError("GNNTrainerPyG requires a model instance")
@@ -98,6 +99,7 @@ class GNNTrainerPyG(BaseTrainer):
             anomaly_threshold=anomaly_threshold,
             save_best_only=save_best_only,
             use_amp=use_amp,
+            score_mode=score_mode,
         )
         self.criterion = nn.MSELoss()
 

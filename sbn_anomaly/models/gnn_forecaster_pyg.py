@@ -73,9 +73,16 @@ class GNNForecasterPyG(nn.Module):
             gcn_in = gnn_hidden
         self.gcn_layers = nn.ModuleList(gcn_layers)
 
+        # Projection layer: compress GCN output to match GRU input
+        # If gnn_hidden != gru_hidden, add a linear projection
+        if gnn_hidden != gru_hidden:
+            self.gnn_to_gru = nn.Linear(gnn_hidden, gru_hidden)
+        else:
+            self.gnn_to_gru = None
+
         # Dropout applies between GRU layers, so only meaningful when gru_layers > 1
         self.gru = nn.GRU(
-            input_size=gnn_hidden,
+            input_size=gru_hidden,
             hidden_size=gru_hidden,
             num_layers=gru_layers,
             batch_first=False,
@@ -138,6 +145,11 @@ class GNNForecasterPyG(nn.Module):
             enc_slices.append(h_t)
 
         enc_seq = torch.stack(enc_slices, dim=0)  # (T, total_nodes, gnn_hidden)
+        
+        # Project GCN output to GRU input dimension if needed
+        if self.gnn_to_gru is not None:
+            enc_seq = self.gnn_to_gru(enc_seq)  # (T, total_nodes, gru_hidden)
+        
         out_seq, _ = self.gru(enc_seq)             # (T, total_nodes, gru_hidden)
         pred = self.decoder(out_seq[-1])            # (total_nodes, target_dim)
         return pred

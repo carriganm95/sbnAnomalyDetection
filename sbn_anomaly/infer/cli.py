@@ -240,7 +240,6 @@ def _score_tpc_from_root(
             branches = list(hit_branches)
 
     batch_size_stream = int(data_cfg.get("batch_size_stream", 512))
-    normalize = bool(data_cfg.get("normalize", False))
     max_events = infer_cfg.get("max_events", train_cfg.get("max_events"))
     max_events = None if max_events is None else int(max_events)
 
@@ -274,12 +273,6 @@ def _score_tpc_from_root(
                 }
                 feat = extract_hit_features(event_data, hit_branches, input_dim)
 
-            if normalize:
-                mean = feat.mean()
-                std = feat.std()
-                if std > 0.0:
-                    feat = (feat - mean) / std
-
             feats.append(feat)
             n_scored += 1
 
@@ -295,13 +288,11 @@ def _score_tpc_from_root(
         return np.empty((0,), dtype=np.float32)
 
     return np.concatenate(score_chunks)
-
-
 def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
     """Run per-node GNN inference and save results as a compressed npz archive.
-
-    Output arrays
-    -------------
+            input_dim = model_cfg.get("input_dim", 256)
+            features = _truncate_or_pad(features, input_dim)
+            scores = scorer.score(features)
     node_scores   : (N_windows, N_channels) float32 — per-channel MSE, NaN = inactive
     scores        : (N_windows,) float32 — mean active-node MSE per window
     scores_max    : (N_windows,) float32 — max active-node MSE per window

@@ -58,6 +58,7 @@ class BaseTrainer(ABC):
         reconstruction_plot_max_values: int = 50000,
         save_best_only: bool = False,
         use_amp: bool = False,
+        score_mode: str = "mean",
     ) -> None:
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -75,6 +76,9 @@ class BaseTrainer(ABC):
         self.save_best_only = bool(save_best_only)
         self.best_loss: Optional[float] = None
         self.use_amp = bool(use_amp) and self.device.type == "cuda"
+        self.score_mode = str(score_mode).lower()
+        if self.score_mode not in {"mean", "max"}:
+            raise ValueError(f"score_mode must be 'mean' or 'max', got {score_mode!r}")
         self._scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
         logger.info("Mixed precision (AMP): %s", "enabled" if self.use_amp else "disabled")
 
@@ -128,6 +132,19 @@ class BaseTrainer(ABC):
             return int(len(first))
         except Exception:
             return 0
+
+    def _select_score_values(self, scores_t: torch.Tensor) -> torch.Tensor:
+        """Normalize score tensors to a 1-D per-sample vector.
+
+        If a subclass returns a 2-D tensor with [mean, max] per sample, this
+        selects the configured column. Otherwise the tensor is flattened.
+        """
+        scores_t = scores_t.detach().to("cpu").float()
+        if scores_t.ndim == 2 and scores_t.shape[1] >= 2:
+            column = 0 if self.score_mode == "mean" else 1
+            return scores_t[:, column].contiguous().view(-1)
+        return scores_t.view(-1)
+
     def _compute_classification_metrics(
         self,
         scores: list[float],
@@ -384,7 +401,7 @@ class BaseTrainer(ABC):
                     try:
                         scores_t = self.compute_scores(batch)
                         if scores_t is not None:
-                            scores_t = scores_t.detach().to("cpu").float().view(-1)
+                            scores_t = self._select_score_values(scores_t)
                             n_keep = min(
                                 int(metrics_max_samples - len(score_buf)),
                                 int(scores_t.numel()),
