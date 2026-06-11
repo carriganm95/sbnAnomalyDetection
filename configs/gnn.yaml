@@ -34,7 +34,7 @@ data:
   # Rolling-window materializer options
   window_size: 20
   n_temporal_bins: 4
-  stride: 5
+  stride: 20
   adjacency_radius: 4
   
   # Per-channel node features computed for each temporal bin
@@ -55,23 +55,29 @@ model:
   # Node feature dimension; if omitted, trainer will use windows.shape[-1]
   node_feat_dim: null
   # GNN / temporal architecture
-  gnn_hidden: 64
-  gnn_layers: 2
-  gru_hidden: 128
+  gnn_hidden: 128
+  gnn_layers: 3
+  gru_hidden: 256
+  gru_layers: 2
+  # Input normalization applied to each frame before the GCN stack.
+  # Options: "none", "batch" (BatchNorm1d per feature), "layer" (LayerNorm per node)
+  # "batch" is recommended when input features span very different scales (e.g. sum vs count).
+  norm_type: batch
 
 training:
-  batch_size: 32
+  batch_size: 16
   num_workers: 4
   lr: 0.001
-  weight_decay: 1.0e-5
-  max_epochs: 10
-  checkpoint_dir: checkpoints/gnn/
-  output_path: checkpoints/gnn/gnn_final.pt
+  weight_decay: 1.0e-4
+  max_epochs: 20
+  checkpoint_dir: checkpoints/gnn/may-28-v1
+  output_path: checkpoints/gnn/may-28-v1/gnn_final.pt
   log_interval: 50
   validation_split: 0.1
+  use_amp: true
 
 inference:
-  checkpoint_path: checkpoints/gnn/gnn_final.pt
+  checkpoint_path: checkpoints/gnn/may-27-v1/gnn_final.pt
   input_path: /nashome/m/micarrig/icarus/ml/sbnAnomalyDetection/data/windows_test.npz
   threshold: null
-  max_windows: 100  # set to an integer to score only the first N windows
+  max_windows: null  # set to an integer to score only the first N windows

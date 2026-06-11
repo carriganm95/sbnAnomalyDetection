@@ -206,10 +206,6 @@ def _truncate_or_pad(features: np.ndarray, target_dim: int) -> np.ndarray:
     adjusted[:, :copy_len] = features[:, :copy_len]
     return adjusted
 
-    np.save(args.output, scores)
-    logger.info("Saved %d anomaly scores to %s", len(scores), args.output)
-    return 0
-
 
 def _score_tpc_from_root(
     cfg: dict,
@@ -381,11 +377,17 @@ def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
     num_channels = dataset.num_nodes
     frame_feat_dim = dataset.node_feat_dim
 
+    # Keep a reference to the base dataset before any Subset so we can call
+    # window_metadata() with the correct window indices afterward.
+    base_dataset = dataset
+    scored_indices = range(len(dataset))
+
     max_windows = infer_cfg.get("max_windows")
     if max_windows is not None and int(max_windows) < len(dataset):
         from torch.utils.data import Subset
         total = len(dataset)
-        dataset = Subset(dataset, range(int(max_windows)))
+        scored_indices = range(int(max_windows))
+        dataset = Subset(base_dataset, scored_indices)
         logger.info("Limiting inference to first %d windows (of %d total)", int(max_windows), total)
 
     logger.info(
@@ -429,7 +431,7 @@ def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
         "node_scores": node_scores,                                    # (N, C)
         "scores": scores_mean,                                         # (N,)
         "scores_max": scores_max,                                      # (N,)
-        "event_index": np.arange(len(scores_mean), dtype=np.int64),
+        "window_index": np.arange(len(scores_mean), dtype=np.int64),  # sequential window position
         "num_channels": np.array(num_channels, dtype=np.int64),
     }
     if threshold is not None:
@@ -438,6 +440,23 @@ def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
     node_feat_names = data_cfg.get("node_features")
     if node_feat_names:
         save_dict["node_feature_names"] = np.asarray(node_feat_names, dtype=str)
+
+    # Attach per-window provenance (run/subrun/event/filename) when available
+    if hasattr(base_dataset, "window_metadata"):
+        provenance = base_dataset.window_metadata(indices=scored_indices)
+        if provenance:
+            for key in ("first_run", "first_subrun", "first_event_num", "last_event_num",
+                        "first_file_idx", "last_file_idx"):
+                if key in provenance:
+                    save_dict[key] = provenance[key]
+            if provenance.get("filenames"):
+                save_dict["filenames"] = np.array(provenance["filenames"], dtype="U512")
+            logger.info("Attached provenance metadata for %d windows", len(scores_mean))
+        else:
+            logger.info(
+                "No provenance metadata available — re-stream from ROOT with save_events_path "
+                "set to generate an events NPZ that includes run/subrun/event/filename."
+            )
 
     out_path = Path(output)
     if out_path.suffix.lower() != ".npz":

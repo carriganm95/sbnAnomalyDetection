@@ -57,6 +57,7 @@ class BaseTrainer(ABC):
         anomaly_threshold: Optional[float] = None,
         reconstruction_plot_max_values: int = 50000,
         save_best_only: bool = False,
+        use_amp: bool = False,
     ) -> None:
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -73,6 +74,9 @@ class BaseTrainer(ABC):
         self.reconstruction_plot_max_values = max(int(reconstruction_plot_max_values), 0)
         self.save_best_only = bool(save_best_only)
         self.best_loss: Optional[float] = None
+        self.use_amp = bool(use_amp) and self.device.type == "cuda"
+        self._scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
+        logger.info("Mixed precision (AMP): %s", "enabled" if self.use_amp else "disabled")
 
         # Training history populated by `train()`.
         # Keys are metric names, values are per-epoch lists.
@@ -329,7 +333,11 @@ class BaseTrainer(ABC):
                 if self.steps_per_epoch is not None and batch_idx >= self.steps_per_epoch:
                     break
                 self.optimizer.zero_grad()
-                loss = self.compute_loss(batch)
+                if self.use_amp:
+                    with torch.amp.autocast("cuda"):
+                        loss = self.compute_loss(batch)
+                else:
+                    loss = self.compute_loss(batch)
                 # Fail fast on non-finite loss to aid debugging (bad input/NaNs).
                 try:
                     loss_val = float(loss.item())
@@ -346,8 +354,13 @@ class BaseTrainer(ABC):
                     )
                     # Surface the problem immediately rather than producing NaN history.
                     raise RuntimeError(f"Non-finite loss detected: {loss_val}")
-                loss.backward()
-                self.optimizer.step()
+                if self.use_amp:
+                    self._scaler.scale(loss).backward()
+                    self._scaler.step(self.optimizer)
+                    self._scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
 
                 running_loss += loss.item()
                 n_batches += 1

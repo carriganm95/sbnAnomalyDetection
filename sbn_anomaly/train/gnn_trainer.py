@@ -83,6 +83,7 @@ class GNNTrainerPyG(BaseTrainer):
         log_interval: int = 50,
         anomaly_threshold: Optional[float] = None,
         save_best_only: bool = False,
+        use_amp: bool = False,
     ) -> None:
         if model is None:
             raise ValueError("GNNTrainerPyG requires a model instance")
@@ -96,6 +97,7 @@ class GNNTrainerPyG(BaseTrainer):
             log_interval=log_interval,
             anomaly_threshold=anomaly_threshold,
             save_best_only=save_best_only,
+            use_amp=use_amp,
         )
         self.criterion = nn.MSELoss()
 

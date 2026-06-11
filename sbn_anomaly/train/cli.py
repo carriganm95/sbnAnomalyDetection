@@ -694,6 +694,7 @@ def _train_gnn(cfg: dict, root_files: list[str] | None = None) -> None:
         gru_layers=int(model_cfg.get("gru_layers", 1)),
         history=history,
         dropout=float(model_cfg.get("dropout", 0.1)),
+        norm_type=str(model_cfg.get("norm_type", "none")),
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -715,6 +716,7 @@ def _train_gnn(cfg: dict, root_files: list[str] | None = None) -> None:
         log_interval=int(train_cfg.get("log_interval", 50)),
         anomaly_threshold=train_cfg.get("anomaly_threshold"),
         save_best_only=bool(train_cfg.get("save_best_only", False)),
+        use_amp=bool(train_cfg.get("use_amp", False)),
     )
 
     logger.info("Starting training (%d epochs) ...", int(train_cfg.get("max_epochs", 20)))

@@ -45,6 +45,7 @@ class GNNForecasterPyG(nn.Module):
         gru_layers: int = 1,
         history: int = 4,
         dropout: float = 0.1,
+        norm_type: str = "none",
     ) -> None:
         super().__init__()
         self.frame_feat_dim = frame_feat_dim
@@ -55,9 +56,17 @@ class GNNForecasterPyG(nn.Module):
         self.history = history
         self.dropout = dropout
         self.target_dim = int(target_dim)
+        self.norm_type = norm_type
+
+        gcn_in = 1 + frame_feat_dim
+        if norm_type == "batch":
+            self.input_norm: nn.Module | None = nn.BatchNorm1d(gcn_in)
+        elif norm_type == "layer":
+            self.input_norm = nn.LayerNorm(gcn_in)
+        else:
+            self.input_norm = None
 
         # GCN input per time step: channel_idx (1) + per-frame features
-        gcn_in = 1 + frame_feat_dim
         gcn_layers = []
         for _ in range(gnn_layers):
             gcn_layers.append(GCNConv(gcn_in, gnn_hidden))
@@ -87,7 +96,7 @@ class GNNForecasterPyG(nn.Module):
         Returns:
             h: (total_nodes, gnn_hidden)
         """
-        h = x
+        h = self.input_norm(x) if self.input_norm is not None else x
         for gcn in self.gcn_layers:
             h = gcn(h, edge_index)
             h = F.relu(h)

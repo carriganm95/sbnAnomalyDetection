@@ -32,6 +32,43 @@ logger = logging.getLogger(__name__)
 _ALLOWED_FEATURES = {"sum", "min", "max", "stdev", "mean", "count"}
 
 
+def _run_subrun_evt_key(meta: dict, tpc_branches: List[str]) -> tuple:
+    """Return a (run, subrun, evt) sort key from a per-event meta dict."""
+    run = subrun = evtnum = None
+    for b in tpc_branches:
+        if b in meta:
+            bl = b.lower()
+            if "run" in bl and "subrun" not in bl:
+                run = int(meta[b])
+            elif "subrun" in bl:
+                subrun = int(meta[b])
+            elif "evt" in bl:
+                evtnum = int(meta[b])
+    return (run or 999999999, subrun or 999999999, evtnum or 999999999)
+
+
+def _extract_provenance(
+    raw_events: list,
+    tpc_branches: List[str],
+) -> tuple:
+    """Return (evt_run, evt_subrun, evt_num) int32 arrays from sorted raw_events."""
+    runs, subruns, evtnums = [], [], []
+    for e in raw_events:
+        r, s, n = _run_subrun_evt_key(e["meta"], tpc_branches)
+        runs.append(r if r != 999999999 else -1)
+        subruns.append(s if s != 999999999 else -1)
+        evtnums.append(n if n != 999999999 else -1)
+    dtype = np.int32
+    if not raw_events:
+        empty = np.empty(0, dtype=dtype)
+        return empty, empty, empty
+    return (
+        np.array(runs, dtype=dtype),
+        np.array(subruns, dtype=dtype),
+        np.array(evtnums, dtype=dtype),
+    )
+
+
 class SparseWindowDatasetPyG(Dataset):
     """PyG dataset that stores raw sparse events and builds windows in __getitem__.
 
@@ -66,10 +103,30 @@ class SparseWindowDatasetPyG(Dataset):
         radius: int = 4,
         node_features: Optional[List[str]] = None,
         prune_inactive: bool = True,
+        evt_run: Optional[np.ndarray] = None,
+        evt_subrun: Optional[np.ndarray] = None,
+        evt_num: Optional[np.ndarray] = None,
+        evt_file_idx: Optional[np.ndarray] = None,
+        filenames: Optional[List[str]] = None,
+        times_flat: Optional[np.ndarray] = None,
+        wires_flat: Optional[np.ndarray] = None,
+        planes_flat: Optional[np.ndarray] = None,
+        tpcs_flat: Optional[np.ndarray] = None,
     ) -> None:
         self._channels_flat = np.asarray(channels_flat, dtype=np.int64)
         self._integrals_flat = np.asarray(integrals_flat, dtype=np.float32)
         self._offsets = np.asarray(offsets, dtype=np.int64)
+        self._times_flat = np.asarray(times_flat, dtype=np.float32) if times_flat is not None else None
+        self._wires_flat = np.asarray(wires_flat, dtype=np.int32) if wires_flat is not None else None
+        self._planes_flat = np.asarray(planes_flat, dtype=np.int32) if planes_flat is not None else None
+        self._tpcs_flat = np.asarray(tpcs_flat, dtype=np.int32) if tpcs_flat is not None else None
+
+        # Optional per-event provenance (run, subrun, event number, source file)
+        self._evt_run = np.asarray(evt_run, dtype=np.int32) if evt_run is not None else None
+        self._evt_subrun = np.asarray(evt_subrun, dtype=np.int32) if evt_subrun is not None else None
+        self._evt_num = np.asarray(evt_num, dtype=np.int32) if evt_num is not None else None
+        self._evt_file_idx = np.asarray(evt_file_idx, dtype=np.int32) if evt_file_idx is not None else None
+        self._filenames: List[str] = list(filenames) if filenames is not None else []
 
         self.num_nodes = int(n_channels)
         self.history = int(history)
@@ -139,62 +196,108 @@ class SparseWindowDatasetPyG(Dataset):
         """Load events from ROOT files and build the dataset.
 
         Events are optionally sorted by (run, subrun, event) before windowing.
-        Pass ``sort_events=False`` if files are already in temporal order.
+        Per-event provenance (run, subrun, event number, source filename) is
+        extracted and stored so it can be saved with :meth:`save_events` and
+        surfaced per-window via :meth:`window_metadata`.
         """
+        import uproot
         import awkward as ak
         from sbn_anomaly.data.materialize_windows import _group_hit_prefixes, _extract_tpc_branch_value
-        from sbn_anomaly.data.streaming import RootStreamer
 
         prefixes = _group_hit_prefixes(hit_branches)
         integral_branches = [p + ".integral" for p in prefixes]
         channel_branches = [p + ".channel" for p in prefixes]
-        all_branches = list(set(integral_branches + channel_branches))
+        time_branches = [p + ".time" for p in prefixes]
+        wire_branches = [p + ".wire" for p in prefixes]
+        plane_branches = [p + ".plane" for p in prefixes]
+        tpc_hit_branches = [p + ".tpc" for p in prefixes]
+        all_branches = list(set(
+            integral_branches + channel_branches +
+            time_branches + wire_branches + plane_branches + tpc_hit_branches
+        ))
         if tpc_branches:
             all_branches.extend(tpc_branches)
 
-        streamer = RootStreamer(
-            file_paths=root_files,
-            tree_name=tree_name,
-            branches=all_branches,
-            batch_size=512,
-        )
-
+        file_list = list(root_files) if not isinstance(root_files, list) else root_files
+        filenames = [str(p) for p in file_list]
         raw_events: list[dict] = []
         discovered_max = -1
 
-        logger.info("Streaming events from %d ROOT file(s)...", len(list(root_files)) if isinstance(root_files, list) else 1)
-        for batch in streamer.stream():
-            for i in range(len(batch)):
-                if max_events is not None and len(raw_events) >= max_events:
-                    break
-
-                ch_parts, val_parts = [], []
-                for integ_b, ch_b in zip(integral_branches, channel_branches):
-                    try:
-                        integrals = ak.to_numpy(ak.flatten(batch[integ_b][i], axis=None)).astype(np.float32)
-                        channels = ak.to_numpy(ak.flatten(batch[ch_b][i], axis=None)).astype(np.int64)
-                    except Exception:
+        logger.info("Streaming events from %d ROOT file(s)...", len(file_list))
+        for file_idx, path in enumerate(file_list):
+            try:
+                with uproot.open(str(path)) as root_file:
+                    if tree_name not in root_file:
+                        logger.warning("Tree '%s' not found in %s – skipping.", tree_name, path)
                         continue
-                    m = min(len(integrals), len(channels))
-                    if m == 0:
-                        continue
-                    valid = channels[:m] >= 0
-                    ch_parts.append(channels[:m][valid])
-                    val_parts.append(integrals[:m][valid])
+                    tree = root_file[tree_name]
+                    logger.info("  [%d/%d] %s — %d entries", file_idx + 1, len(file_list), path, tree.num_entries)
+                    for chunk in tree.iterate(all_branches, step_size=512, library="ak"):
+                        for i in range(len(chunk)):
+                            if max_events is not None and len(raw_events) >= max_events:
+                                break
 
-                ch_arr = np.concatenate(ch_parts) if ch_parts else np.empty(0, dtype=np.int64)
-                val_arr = np.concatenate(val_parts) if val_parts else np.empty(0, dtype=np.float32)
-                if ch_arr.size:
-                    discovered_max = max(discovered_max, int(ch_arr.max()))
+                            ch_parts, val_parts = [], []
+                            time_parts, wire_parts, plane_parts, tpc_parts = [], [], [], []
+                            for integ_b, ch_b, time_b, wire_b, plane_b, tpc_b in zip(
+                                integral_branches, channel_branches,
+                                time_branches, wire_branches, plane_branches, tpc_hit_branches,
+                            ):
+                                try:
+                                    integrals = ak.to_numpy(ak.flatten(chunk[integ_b][i], axis=None)).astype(np.float32)
+                                    channels = ak.to_numpy(ak.flatten(chunk[ch_b][i], axis=None)).astype(np.int64)
+                                    times = ak.to_numpy(ak.flatten(chunk[time_b][i], axis=None)).astype(np.float32)
+                                    wires = ak.to_numpy(ak.flatten(chunk[wire_b][i], axis=None)).astype(np.int32)
+                                    planes = ak.to_numpy(ak.flatten(chunk[plane_b][i], axis=None)).astype(np.int32)
+                                    tpcs = ak.to_numpy(ak.flatten(chunk[tpc_b][i], axis=None)).astype(np.int32)
+                                except Exception:
+                                    continue
+                                m = min(len(integrals), len(channels), len(times), len(wires), len(planes), len(tpcs))
+                                if m == 0:
+                                    continue
+                                valid = channels[:m] >= 0
+                                ch_parts.append(channels[:m][valid])
+                                val_parts.append(integrals[:m][valid])
+                                time_parts.append(times[:m][valid])
+                                wire_parts.append(wires[:m][valid])
+                                plane_parts.append(planes[:m][valid])
+                                tpc_parts.append(tpcs[:m][valid])
 
-                meta: dict = {}
-                if tpc_branches:
-                    for b in tpc_branches:
-                        v = _extract_tpc_branch_value(batch, i, b)
-                        if v is not None:
-                            meta[b] = v
+                            ch_arr = np.concatenate(ch_parts) if ch_parts else np.empty(0, dtype=np.int64)
+                            val_arr = np.concatenate(val_parts) if val_parts else np.empty(0, dtype=np.float32)
+                            time_arr = np.concatenate(time_parts) if time_parts else np.empty(0, dtype=np.float32)
+                            wire_arr = np.concatenate(wire_parts) if wire_parts else np.empty(0, dtype=np.int32)
+                            plane_arr = np.concatenate(plane_parts) if plane_parts else np.empty(0, dtype=np.int32)
+                            tpc_arr = np.concatenate(tpc_parts) if tpc_parts else np.empty(0, dtype=np.int32)
+                            if ch_arr.size:
+                                discovered_max = max(discovered_max, int(ch_arr.max()))
 
-                raw_events.append({"channels": ch_arr, "integrals": val_arr, "meta": meta})
+                            meta: dict = {}
+                            if tpc_branches:
+                                for b in tpc_branches:
+                                    v = _extract_tpc_branch_value(chunk, i, b)
+                                    if v is not None:
+                                        meta[b] = v
+
+                            raw_events.append({
+                                "channels": ch_arr,
+                                "integrals": val_arr,
+                                "times": time_arr,
+                                "wires": wire_arr,
+                                "planes": plane_arr,
+                                "tpcs": tpc_arr,
+                                "meta": meta,
+                                "file_idx": file_idx,
+                            })
+
+                        if max_events is not None and len(raw_events) >= max_events:
+                            break
+            except FileNotFoundError:
+                logger.error("ROOT file not found: %s", path)
+                raise
+            except OSError as exc:
+                logger.warning("Skipping unreadable ROOT file %s: %s", path, exc)
+                continue
 
             if max_events is not None and len(raw_events) >= max_events:
                 break
@@ -202,22 +305,14 @@ class SparseWindowDatasetPyG(Dataset):
         logger.info("Loaded %d events. Sorting: %s", len(raw_events), sort_events)
 
         if sort_events and tpc_branches:
-            def _sort_key(evt):
-                m = evt["meta"]
-                run = subrun = evtnum = None
-                for b in tpc_branches:
-                    if b in m:
-                        if "run" in b.lower() and "subrun" not in b.lower():
-                            run = int(m[b])
-                        elif "subrun" in b.lower():
-                            subrun = int(m[b])
-                        elif "evt" in b.lower():
-                            evtnum = int(m[b])
-                return (run or 999999999, subrun or 999999999, evtnum or 999999999)
-            raw_events.sort(key=_sort_key)
+            raw_events.sort(key=lambda e: _run_subrun_evt_key(e["meta"], tpc_branches))
 
         ch_flat = np.concatenate([e["channels"] for e in raw_events]) if raw_events else np.empty(0, dtype=np.int64)
         val_flat = np.concatenate([e["integrals"] for e in raw_events]) if raw_events else np.empty(0, dtype=np.float32)
+        time_flat = np.concatenate([e["times"] for e in raw_events]) if raw_events else np.empty(0, dtype=np.float32)
+        wire_flat = np.concatenate([e["wires"] for e in raw_events]) if raw_events else np.empty(0, dtype=np.int32)
+        plane_flat = np.concatenate([e["planes"] for e in raw_events]) if raw_events else np.empty(0, dtype=np.int32)
+        tpc_flat = np.concatenate([e["tpcs"] for e in raw_events]) if raw_events else np.empty(0, dtype=np.int32)
         sizes = np.array([len(e["channels"]) for e in raw_events], dtype=np.int64)
         offsets = np.concatenate([[0], np.cumsum(sizes)])
 
@@ -225,33 +320,81 @@ class SparseWindowDatasetPyG(Dataset):
         logger.info(
             "Events packed: %d total hits, n_channels=%d  (~%.1f MB)",
             len(ch_flat), n_ch,
-            (ch_flat.nbytes + val_flat.nbytes + offsets.nbytes) / 1e6,
+            (ch_flat.nbytes + val_flat.nbytes + time_flat.nbytes + wire_flat.nbytes + plane_flat.nbytes + tpc_flat.nbytes + offsets.nbytes) / 1e6,
         )
-        return cls(ch_flat, val_flat, offsets, n_ch, **dataset_kwargs)
+
+        # Extract per-event provenance arrays from sorted raw_events
+        evt_run, evt_subrun, evt_num = _extract_provenance(raw_events, tpc_branches or [])
+        evt_file_idx = np.array([e["file_idx"] for e in raw_events], dtype=np.int32) if raw_events else np.empty(0, dtype=np.int32)
+
+        return cls(
+            ch_flat, val_flat, offsets, n_ch,
+            evt_run=evt_run, evt_subrun=evt_subrun, evt_num=evt_num,
+            evt_file_idx=evt_file_idx, filenames=filenames,
+            times_flat=time_flat, wires_flat=wire_flat,
+            planes_flat=plane_flat, tpcs_flat=tpc_flat,
+            **dataset_kwargs,
+        )
 
     @classmethod
     def from_npz(cls, events_path: str, **dataset_kwargs) -> "SparseWindowDatasetPyG":
-        """Load a compact events file saved with :meth:`save_events`."""
+        """Load a compact events file saved with :meth:`save_events`.
+
+        Provenance arrays (evt_run, evt_subrun, evt_num, evt_file_idx, filenames)
+        are loaded automatically when present; older files without them load fine.
+        """
         data = np.load(events_path, allow_pickle=False)
         n_channels = int(data["n_channels"])
+        meta_kwargs: dict = {}
+        for key in ("evt_run", "evt_subrun", "evt_num", "evt_file_idx"):
+            if key in data:
+                meta_kwargs[key] = data[key]
+        if "filenames" in data:
+            meta_kwargs["filenames"] = [str(f) for f in data["filenames"]]
+        for key in ("times_flat", "wires_flat", "planes_flat", "tpcs_flat"):
+            if key in data:
+                meta_kwargs[key] = data[key]
         return cls(
             channels_flat=data["channels_flat"],
             integrals_flat=data["integrals_flat"],
             offsets=data["offsets"],
             n_channels=n_channels,
+            **meta_kwargs,
             **dataset_kwargs,
         )
 
     def save_events(self, path: str) -> None:
-        """Save compact sparse events to an npz file for fast reloading."""
-        np.savez_compressed(
-            path,
-            channels_flat=self._channels_flat,
-            integrals_flat=self._integrals_flat,
-            offsets=self._offsets,
-            n_channels=np.array(self.num_nodes, dtype=np.int64),
+        """Save compact sparse events (and provenance metadata if present) to an npz file."""
+        arrays: dict = {
+            "channels_flat": self._channels_flat,
+            "integrals_flat": self._integrals_flat,
+            "offsets": self._offsets,
+            "n_channels": np.array(self.num_nodes, dtype=np.int64),
+        }
+        if self._times_flat is not None:
+            arrays["times_flat"] = self._times_flat
+        if self._wires_flat is not None:
+            arrays["wires_flat"] = self._wires_flat
+        if self._planes_flat is not None:
+            arrays["planes_flat"] = self._planes_flat
+        if self._tpcs_flat is not None:
+            arrays["tpcs_flat"] = self._tpcs_flat
+        if self._evt_run is not None:
+            arrays["evt_run"] = self._evt_run
+            arrays["evt_subrun"] = self._evt_subrun
+            arrays["evt_num"] = self._evt_num
+        if self._evt_file_idx is not None:
+            arrays["evt_file_idx"] = self._evt_file_idx
+        if self._filenames:
+            arrays["filenames"] = np.array(self._filenames, dtype="U512")
+        np.savez_compressed(path, **arrays)
+        has_meta = self._evt_run is not None
+        has_hit_geo = self._times_flat is not None
+        logger.info(
+            "Saved sparse events to %s%s%s", path,
+            " (with provenance metadata)" if has_meta else "",
+            " (with hit geometry)" if has_hit_geo else "",
         )
-        logger.info("Saved sparse events to %s", path)
 
     # ------------------------------------------------------------------
     # Dataset protocol
@@ -280,6 +423,44 @@ class SparseWindowDatasetPyG(Dataset):
                 active_idx = torch.zeros(1, dtype=torch.long)
             return self._make_pruned_data(x, target_flat, active_idx)
         return Data(x=x, y=target_flat, edge_index=self.edge_index_full)
+
+    def window_metadata(self, indices=None) -> dict:
+        """Return per-window provenance for the given window indices (default: all).
+
+        Returns an empty dict if the dataset was loaded without provenance data
+        (i.e. from an events NPZ that pre-dates metadata support).
+
+        Keys present when provenance is available
+        -----------------------------------------
+        first_run, first_subrun, first_event_num : (N,) int32
+            Run/subrun/event number of the first event in each window.
+        last_event_num : (N,) int32
+            Event number of the last event in each window.
+        first_file_idx, last_file_idx : (N,) int32
+            Index into ``filenames`` for the first and last event.
+        filenames : list[str]
+            Ordered list of source ROOT filenames.
+        """
+        if self._evt_run is None:
+            return {}
+
+        starts = np.array(self._starts, dtype=np.int64)
+        if indices is not None:
+            starts = starts[np.asarray(indices)]
+
+        ends = starts + self.events_per_sample - 1  # inclusive last event index
+
+        result: dict = {
+            "first_run":       self._evt_run[starts],
+            "first_subrun":    self._evt_subrun[starts],
+            "first_event_num": self._evt_num[starts],
+            "last_event_num":  self._evt_num[ends],
+            "filenames":       list(self._filenames),
+        }
+        if self._evt_file_idx is not None:
+            result["first_file_idx"] = self._evt_file_idx[starts]
+            result["last_file_idx"]  = self._evt_file_idx[ends]
+        return result
 
     # ------------------------------------------------------------------
     # Helpers
