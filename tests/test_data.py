@@ -12,6 +12,8 @@ from sbn_anomaly.data.dataset import (
     WindowDataset,
 )
 from sbn_anomaly.data.event_joiner import EventJoiner
+from sbn_anomaly.data.streaming import RootStreamer
+from sbn_anomaly.data.sparse_window_dataset import SparseWindowDatasetPyG
 
 
 # ---------------------------------------------------------------------------
@@ -165,3 +167,124 @@ class TestEventJoiner:
         tpc_events = ak.to_numpy(t["event"]).tolist()
         pmt_events = ak.to_numpy(p["event"]).tolist()
         assert tpc_events == pmt_events
+
+
+class TestRootStreamer:
+    def test_xrootd_url_is_preserved(self):
+        url = "root://fndcadoor.fnal.gov//store/data/file.root"
+        streamer = RootStreamer(url, tree_name="sbn_tree")
+
+        assert streamer.file_paths == [url]
+
+
+# ---------------------------------------------------------------------------
+# SparseWindowDatasetPyG
+# ---------------------------------------------------------------------------
+
+
+def _make_sparse_dataset(
+    n_events: int = 40,
+    n_channels: int = 16,
+    avg_hits: int = 10,
+    seed: int = 0,
+    **kwargs,
+) -> SparseWindowDatasetPyG:
+    """Build a small SparseWindowDatasetPyG from synthetic sparse events."""
+    rng = np.random.default_rng(seed)
+    sizes = rng.integers(0, avg_hits * 2 + 1, size=n_events).astype(np.int64)
+    total = int(sizes.sum())
+    channels_flat = rng.integers(0, n_channels, size=total).astype(np.int64)
+    integrals_flat = rng.random(total).astype(np.float32)
+    offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+    defaults = dict(history=2, window_size=4, n_bins=2, stride=1, radius=2)
+    defaults.update(kwargs)
+    return SparseWindowDatasetPyG(channels_flat, integrals_flat, offsets, n_channels, **defaults)
+
+
+class TestSparseWindowDatasetPyG:
+    def test_len(self):
+        # events_per_sample = (history+1)*window_size = 3*4 = 12
+        # samples = n_events - events_per_sample + 1 = 40 - 12 + 1 = 29
+        ds = _make_sparse_dataset(n_events=40)
+        assert len(ds) == 40 - (2 + 1) * 4 + 1
+
+    def test_len_with_stride(self):
+        ds = _make_sparse_dataset(n_events=40, stride=2)
+        events_per_sample = (2 + 1) * 4
+        expected = len(range(0, 40 - events_per_sample + 1, 2))
+        assert len(ds) == expected
+
+    def test_getitem_y_shape(self):
+        n_bins, n_features = 2, 3
+        ds = _make_sparse_dataset(
+            n_events=40, n_bins=n_bins,
+            node_features=["sum", "count", "max"],
+        )
+        item = ds[0]
+        assert item.y.ndim == 2
+        assert item.y.shape[1] == n_bins * n_features
+
+    def test_getitem_x_shape(self):
+        # x: (active_nodes, 1 + history * node_feat_dim)
+        n_bins, n_features, history = 2, 3, 2
+        ds = _make_sparse_dataset(
+            n_events=40, n_bins=n_bins, history=history,
+            node_features=["sum", "count", "max"],
+        )
+        item = ds[0]
+        expected_x_width = 1 + history * (n_bins * n_features)
+        assert item.x.shape[1] == expected_x_width
+
+    def test_getitem_edge_index_shape(self):
+        ds = _make_sparse_dataset()
+        item = ds[0]
+        assert item.edge_index.ndim == 2
+        assert item.edge_index.shape[0] == 2
+
+    def test_all_node_features(self):
+        ds = _make_sparse_dataset(
+            n_events=40,
+            node_features=["sum", "min", "max", "mean", "stdev", "count"],
+        )
+        item = ds[0]
+        assert item.y.shape[1] == 2 * 6  # n_bins * n_features
+
+    def test_save_load_roundtrip(self, tmp_path):
+        ds = _make_sparse_dataset(n_events=40)
+        path = str(tmp_path / "events.npz")
+        ds.save_events(path)
+        ds2 = SparseWindowDatasetPyG.from_npz(
+            path, history=2, window_size=4, n_bins=2, stride=1, radius=2,
+        )
+        assert len(ds2) == len(ds)
+        item1 = ds[0]
+        item2 = ds2[0]
+        import torch
+        assert torch.allclose(item1.y, item2.y)
+
+    def test_empty_events_do_not_crash(self):
+        """Dataset with interleaved empty events should construct and yield items."""
+        n_channels = 8
+        rng = np.random.default_rng(2)
+        sizes = np.array([0, 5, 0, 3, 0, 7, 0, 4, 0, 6, 0, 8, 0, 2, 0, 5], dtype=np.int64)
+        total = int(sizes.sum())
+        channels_flat = rng.integers(0, n_channels, size=total).astype(np.int64)
+        integrals_flat = rng.random(total).astype(np.float32)
+        offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+        ds = SparseWindowDatasetPyG(
+            channels_flat, integrals_flat, offsets, n_channels,
+            history=1, window_size=2, n_bins=2, stride=1, radius=1,
+        )
+        if len(ds) > 0:
+            _ = ds[0]  # should not raise
+
+    def test_feature_values_finite(self):
+        """All feature values in a sample should be finite (no NaN/inf from stdev)."""
+        import torch
+        ds = _make_sparse_dataset(
+            n_events=40,
+            node_features=["sum", "min", "max", "mean", "stdev", "count"],
+        )
+        item = ds[0]
+        assert torch.isfinite(item.x).all()
+        assert torch.isfinite(item.y).all()

@@ -1,0 +1,83 @@
+# GNN forecasting configuration for rolling-window anomaly detection
+# Two-stage workflow:
+#   1. Materialize: python -m sbn_anomaly.data.materialize_windows --config configs/gnn.yaml --root-files /data/*.root --output windows.npz
+#   2. Train: sbn-train --config configs/gnn.yaml
+
+model_type: gnn
+
+data:
+  # Path to sparse events .npz saved by SparseWindowDatasetPyG.save_events()
+  events_path: /nashome/m/micarrig/icarus/ml/sbnAnomalyDetection/data/windows_train.npz
+
+  # ROOT tree to read from (used by materializer)
+  tree_name: caloskim/TrackCaloSkim
+
+  # Hit branches used during materialization (which channels/integrals to aggregate)
+  # Example: TPC hits from two collection planes
+  hit_branches:
+    # Plane 0
+    - hits0.h.integral
+    - hits0.h.channel
+    # Plane 1
+    - hits1.h.integral
+    - hits1.h.channel
+    # Plane 2 (induction)
+    - hits2.h.integral
+    - hits2.h.channel
+
+  # TPC metadata branches (run, subrun, event) to track provenance
+  tpc_branches:
+    - meta.run
+    - meta.subrun
+    - meta.evt
+
+  # Rolling-window materializer options
+  window_size: 20
+  n_temporal_bins: 4
+  stride: 20
+  adjacency_radius: 4
+  
+  # Per-channel node features computed for each temporal bin
+  # Default: [sum, min, max, stdev, count]
+  # Options: sum, min, max, stdev, mean, count
+  node_features:
+    - sum
+    - min
+    - max
+    - mean
+    - stdev
+    - count
+
+
+model:
+  # Number of past windows used to predict the next window
+  history: 4
+  # Node feature dimension; if omitted, trainer will use windows.shape[-1]
+  node_feat_dim: null
+  # GNN / temporal architecture
+  gnn_hidden: 128
+  gnn_layers: 3
+  gru_hidden: 256
+  gru_layers: 2
+  # Input normalization applied to each frame before the GCN stack.
+  # Options: "none", "batch" (BatchNorm1d per feature), "layer" (LayerNorm per node)
+  # "batch" is recommended when input features span very different scales (e.g. sum vs count).
+  norm_type: batch
+
+training:
+  batch_size: 16
+  num_workers: 4
+  lr: 0.001
+  weight_decay: 1.0e-4
+  max_epochs: 20
+  checkpoint_dir: checkpoints/gnn/may-28-v1
+  output_path: checkpoints/gnn/may-28-v1/gnn_final.pt
+  log_interval: 50
+  validation_split: 0.1
+  use_amp: true
+
+inference:
+  checkpoint_path: checkpoints/gnn/may-27-v1/gnn_final.pt
+  input_path: /nashome/m/micarrig/icarus/ml/sbnAnomalyDetection/data/windows_test.npz
+  threshold: null
+  max_windows: null  # set to an integer to score only the first N windows

@@ -15,10 +15,14 @@ from sbn_anomaly.models.tpc_model import TPCAutoencoder
 from sbn_anomaly.models.pmt_model import PMTAutoencoder
 from sbn_anomaly.models.fusion_model import FusionAutoencoder
 from sbn_anomaly.models.window_model import WindowAutoencoder
+from sbn_anomaly.models.gnn_forecaster import GNNForecaster
+from sbn_anomaly.models.gnn_forecaster_pyg import GNNForecasterPyG
 
 __all__ = [
     "TPCAutoencoder",
     "PMTAutoencoder",
     "FusionAutoencoder",
     "WindowAutoencoder",
+    "GNNForecaster",
+    "GNNForecasterPyG",
 ]

@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.0.0",
+    "torch-geometric>=2.4.0",
     "numpy>=1.24.0",
     "uproot>=5.0.0",
     "awkward>=2.0.0",
@@ -44,6 +45,7 @@ dev = [
 [project.scripts]
 sbn-train = "sbn_anomaly.train.cli:main"
 sbn-infer = "sbn_anomaly.infer.cli:main"
+sbn-ablate-hit-branches = "sbn_anomaly.train.ablation:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -64,3 +66,25 @@ addopts = "-v --tb=short"
 [tool.mypy]
 python_version = "3.9"
 ignore_missing_imports = true
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.activation]
+env = { PYTORCH_NO_CUDA_MEMORY_CACHING = "1" }
+
+[tool.pixi.pypi-dependencies]
+sbn-anomaly = { path = ".", editable = true }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[tool.pixi.tasks]
+
+[tool.pixi.dependencies]
+colorlog = ">=6.10.1,<7"
+root = ">=6.38.4,<7"
+fsspec-xrootd = ">=0.5.2,<0.6"
+pip = ">=26.1.1,<27"

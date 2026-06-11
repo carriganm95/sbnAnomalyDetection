@@ -32,6 +32,7 @@ ENV/
 .idea/
 *.swp
 *.swo
+.history/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -68,3 +69,6 @@ Thumbs.db
 # Outputs
 outputs/
 runs/
+# pixi environments
+.pixi/*
+!.pixi/config.toml

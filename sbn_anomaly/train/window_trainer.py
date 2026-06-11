@@ -41,6 +41,9 @@ class WindowTrainer(BaseTrainer):
         max_epochs: int = 50,
         checkpoint_dir: Optional[str] = None,
         log_interval: int = 50,
+        anomaly_threshold: Optional[float] = None,
+        reconstruction_plot_max_values: int = 50000,
+        save_best_only: bool = False,
     ) -> None:
         if model is None:
             model = WindowAutoencoder()
@@ -54,6 +57,9 @@ class WindowTrainer(BaseTrainer):
             max_epochs=max_epochs,
             checkpoint_dir=checkpoint_dir,
             log_interval=log_interval,
+            anomaly_threshold=anomaly_threshold,
+            reconstruction_plot_max_values=reconstruction_plot_max_values,
+            save_best_only=save_best_only,
         )
         self.criterion = nn.MSELoss()
 
@@ -69,3 +75,22 @@ class WindowTrainer(BaseTrainer):
             x = x.unsqueeze(1)
         x_hat, _ = self.model(x)
         return self.criterion(x_hat, x)
+
+    def compute_scores(self, batch: tuple) -> torch.Tensor:
+        """Per-sample reconstruction MSE across channels and time."""
+        x = batch[0].to(self.device)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        return self.model.reconstruction_error(x)
+
+    def compute_reconstruction_pair(
+        self,
+        batch: tuple,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return original and reconstructed windows for plotting."""
+        x = batch[0].to(self.device)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        with torch.no_grad():
+            x_hat, _ = self.model(x)
+        return x, x_hat

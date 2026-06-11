@@ -44,6 +44,9 @@ class FusionTrainer(BaseTrainer):
         max_epochs: int = 50,
         checkpoint_dir: Optional[str] = None,
         log_interval: int = 50,
+        anomaly_threshold: Optional[float] = None,
+        reconstruction_plot_max_values: int = 50000,
+        save_best_only: bool = False,
     ) -> None:
         if model is None:
             model = FusionAutoencoder()
@@ -57,6 +60,9 @@ class FusionTrainer(BaseTrainer):
             max_epochs=max_epochs,
             checkpoint_dir=checkpoint_dir,
             log_interval=log_interval,
+            anomaly_threshold=anomaly_threshold,
+            reconstruction_plot_max_values=reconstruction_plot_max_values,
+            save_best_only=save_best_only,
         )
         self.criterion = nn.MSELoss()
 
@@ -70,3 +76,20 @@ class FusionTrainer(BaseTrainer):
         x_pmt = batch[1].to(self.device)
         recon, _, combined = self.model(x_tpc, x_pmt)
         return self.criterion(recon, combined)
+
+    def compute_scores(self, batch: tuple) -> torch.Tensor:
+        """Per-sample reconstruction MSE in the combined feature space."""
+        x_tpc = batch[0].to(self.device)
+        x_pmt = batch[1].to(self.device)
+        return self.model.reconstruction_error(x_tpc, x_pmt)
+
+    def compute_reconstruction_pair(
+        self,
+        batch: tuple,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return combined input and reconstruction tensors for plotting."""
+        x_tpc = batch[0].to(self.device)
+        x_pmt = batch[1].to(self.device)
+        with torch.no_grad():
+            recon, _, combined = self.model(x_tpc, x_pmt)
+        return combined, recon
