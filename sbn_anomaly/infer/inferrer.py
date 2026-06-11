@@ -158,7 +158,7 @@ class AnomalyScorer:
     ) -> None:
         if model_type not in ("tpc", "pmt", "fusion", "window", "gnn"):
             raise ValueError(
-                f"model_type must be one of tpc/pmt/fusion/window, got '{model_type}'."
+                f"model_type must be one of tpc/pmt/fusion/window/gnn, got '{model_type}'."
             )
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
