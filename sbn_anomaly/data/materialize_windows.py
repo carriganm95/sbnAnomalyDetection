@@ -6,9 +6,9 @@ output is a NumPy array of shape (N_windows, N_channels, n_bins) and is
 saved to an .npz archive along with provenance metadata.
 
 Usage (simple):
-  python -m sbn_anomaly.data.materialize_windows \
-      --root-files /data/run1.root /data/run2.root \
-      --output windows.npz --window-size 20 --n-bins 4
+    python -m sbn_anomaly.data.materialize_windows \
+            --root-files /data/run1.root /data/run2.root \
+            --output events.npz --window-size 20 --n-bins 4
 
 Or provide a YAML config with `data.hit_branches`, `data.tree_name`,
 `data.window_size`, `data.n_temporal_bins` and `data.adjacency_radius`.
@@ -460,10 +460,15 @@ def _main_cli(argv=None):
     parser.add_argument("--hit-branches", nargs="+", default=None, help="List of hit branch names; overrides config")
     parser.add_argument("--node-features", nargs="+", default=None, help="Node features to compute: sum, min, max, stdev, mean, count (default: all)")
     parser.add_argument("--max-events", type=int, default=None, help="Stop after collecting this many events (useful for testing)")
-    parser.add_argument("--save-events", action="store_true", default=False,
-                        help="Save compact sparse events file instead of dense windows. "
-                             "Much smaller (~1 GB vs 85 GB) and used by SparseWindowDatasetPyG. "
-                             "Output path is used directly as the .npz filename.")
+    parser.add_argument(
+        "--windows",
+        action="store_true",
+        default=False,
+        help=(
+            "Save dense windows as .npy + _meta.npz instead of the default sparse events .npz. "
+            "This is mainly for legacy workflows that expect prebuilt window arrays."
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Load defaults from YAML config if provided
@@ -529,11 +534,11 @@ def _main_cli(argv=None):
 
     out_path = Path(args.output)
 
-    if args.save_events:
-        # --- Compact sparse events path ---
-        # Stores raw (channels, integrals) per event — ~1 GB instead of 85 GB.
-        # No window computation; windows are formed on the fly during training
-        # by SparseWindowDatasetPyG.
+    if not args.windows:
+        # --- Compact sparse events path (default) ---
+        # Stores raw (channels, integrals) per event — small enough to reuse
+        # across training runs. Windows are formed on the fly by
+        # SparseWindowDatasetPyG.
         from sbn_anomaly.data.sparse_window_dataset import SparseWindowDatasetPyG
         dataset = SparseWindowDatasetPyG.from_root(
             root_files=root_files,
@@ -559,8 +564,8 @@ def _main_cli(argv=None):
         )
         return
 
-    # Derive output paths: windows go to a .npy file (memory-mapped, no RAM spike),
-    # metadata goes to a companion _meta.npz.
+    # Derive output paths for dense windows: windows go to a .npy file
+    # (memory-mapped, no RAM spike), metadata goes to a companion _meta.npz.
     npy_path = out_path.with_suffix(".npy") if out_path.suffix != ".npy" else out_path
     meta_path = npy_path.with_name(npy_path.stem + "_meta.npz")
 

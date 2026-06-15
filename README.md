@@ -237,6 +237,116 @@ dataset = SparseWindowDatasetPyG.from_root(
     radius=4,
 )
 dataset.save_events("events_cache.npz")  # cache for future runs
+
+### Materialize windows / events (.npz)
+
+Use the materializer to produce a compact events `.npz` by default. This is
+the preferred format for GNN training because windows are built lazily by
+`SparseWindowDatasetPyG`. Pass `--windows` only when you explicitly want the
+legacy dense `.npy` window array plus a companion `_meta.npz` file.
+
+Sparse events NPZ (default, recommended for GNN training; saved as `data/events_cache.npz`):
+
+```bash
+python -m sbn_anomaly.data.materialize_windows \
+  --root-files /data/run1.root /data/run2.root \
+  --output data/events_cache.npz \
+  --window-size 20 \
+  --n-bins 4 \
+  --stride 5
+```
+
+Dense windows (legacy opt-in, saved as `data/windows.npy` + `data/windows_meta.npz`):
+
+```bash
+python -m sbn_anomaly.data.materialize_windows \
+  --root-files /data/run1.root /data/run2.root \
+  --output data/windows \
+  --window-size 20 \
+  --n-bins 4 \
+  --stride 5 \
+  --windows
+```
+
+Alternatively, build and save the sparse events programmatically (same result):
+
+```bash
+python - <<'PY'
+from sbn_anomaly.data.sparse_window_dataset import SparseWindowDatasetPyG
+
+ds = SparseWindowDatasetPyG.from_root(
+    root_files=["/data/run1.root", "/data/run2.root"],
+    tree_name="caloskim/TrackCaloSkim",
+    hit_branches=["hits0.h.integral", "hits0.h.channel"],
+    history=4,
+    window_size=20,
+    n_bins=4,
+    stride=5,
+    radius=4,
+)
+ds.save_events("data/events_cache.npz")
+PY
+```
+
+Note on defaults and precedence
+--------------------------------
+
+If you omit `--window-size`, `--n-bins` (temporal bins), or `--stride` on the
+command line, the materializer and the train/infer CLIs will read those values
+from the provided YAML config under the `data` section (`data.window_size`,
+`data.n_temporal_bins`, `data.stride`). Command-line flags override values in
+the YAML. If neither CLI flags nor the config supply a value, the materializer
+falls back to sensible built-in defaults (e.g. `window_size=20`,
+`n_temporal_bins=4`, `stride=1`).
+
+This precedence also applies when training or running inference: the CLI will
+use values from the config unless you explicitly pass overriding flags.
+
+
+### Using a ROOT file list (manifest)
+
+You can pass a file containing ROOT paths (one per line, `#` allowed for comments)
+instead of listing files on the command line. This is convenient for long runs
+or reproducible manifests.
+
+Materialize sparse events from a manifest file:
+
+```bash
+python -m sbn_anomaly.data.materialize_windows \
+  --root-file-list data/train_files.txt \
+  --output data/events_cache.npz \
+  --window-size 20 \
+  --n-bins 4 \
+  --stride 5
+```
+
+Materialize dense windows from a manifest file:
+
+```bash
+python -m sbn_anomaly.data.materialize_windows \
+  --root-file-list data/train_files.txt \
+  --output data/windows \
+  --window-size 20 \
+  --n-bins 4 \
+  --stride 5 \
+  --windows
+```
+
+Train using a manifest (streaming path):
+
+```bash
+sbn-train --config configs/gnn.yaml \
+  --root-file-list data/train_files.txt
+```
+
+Infer/score using a manifest (streaming TPC path):
+
+```bash
+sbn-infer --config configs/gnn.yaml \
+  --root-file-list data/test_files.txt \
+  --output scores_from_manifest.npz
+```
+
 ```
 
 ## Legacy Autoencoder Models
