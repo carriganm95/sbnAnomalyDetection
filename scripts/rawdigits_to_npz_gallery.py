@@ -21,6 +21,13 @@ import argparse
 import sys
 from pathlib import Path
 
+# Make `import sbn_anomaly` work no matter how the script is launched, by adding
+# the repo root (parent of scripts/) to sys.path. Avoids needing PYTHONPATH or
+# an editable install just to run the gallery dump in an SL7 container.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 
 def main(argv=None) -> int:
     import numpy as np

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import logging
 import sys
-from colorlog import ColoredFormatter
+
+try:
+    from colorlog import ColoredFormatter
+except ImportError:  # colorlog is optional (e.g. minimal SL7/LArSoft envs)
+    ColoredFormatter = None
+
 
 def setup_logging(
     level: str = "INFO",
@@ -24,17 +29,20 @@ def setup_logging(
     """
     numeric_level = getattr(logging, level.upper(), logging.INFO)
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(ColoredFormatter(
-        fmt="%(log_color)s" + fmt,
-        datefmt=datefmt,
-        log_colors={
-            'DEBUG':    'cyan',
-            'INFO':     'green',
-            'WARNING':  'yellow',
-            'ERROR':    'red',
-            'CRITICAL': 'bold_red',
-        }
-    ))    
+    if ColoredFormatter is not None:
+        handler.setFormatter(ColoredFormatter(
+            fmt="%(log_color)s" + fmt,
+            datefmt=datefmt,
+            log_colors={
+                'DEBUG':    'cyan',
+                'INFO':     'green',
+                'WARNING':  'yellow',
+                'ERROR':    'red',
+                'CRITICAL': 'bold_red',
+            }
+        ))
+    else:  # plain formatter fallback when colorlog isn't installed
+        handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
     root_logger = logging.getLogger()
     # Avoid adding duplicate handlers in interactive environments.
     if not root_logger.handlers:
