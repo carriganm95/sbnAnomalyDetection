@@ -150,6 +150,8 @@ def preprocess_event(
     adc: np.ndarray,
     pedestal: Optional[np.ndarray] = None,
     *,
+    subtract_pedestal: bool = True,
+    pedestal_mode: str = "stored",
     coherent_group_size: int = 64,
     coherent_groups: Optional[np.ndarray] = None,
     remove_coherent: bool = True,
@@ -159,9 +161,32 @@ def preprocess_event(
     """Full preprocessing for one event's ``(n_channels, n_ticks)`` ADC matrix.
 
     Order: pedestal subtraction -> coherent-noise removal -> scaling -> length fix.
-    Returns float32 ``(n_channels, n_ticks)``.
+    Each step is individually controllable so callers can expose them in config.
+
+    Parameters
+    ----------
+    subtract_pedestal:
+        If False, skip baseline subtraction entirely (store raw ADC, only
+        scaled/length-fixed).
+    pedestal_mode:
+        ``"stored"`` uses the per-channel ``pedestal`` passed in (e.g.
+        ``RawDigit.GetPedestal()``); ``"median"`` ignores it and uses the robust
+        per-channel median over ticks instead.
+    coherent_groups:
+        Optional ``(n_channels,)`` group-id array (e.g. from the electronics
+        map) overriding the positional ``coherent_group_size`` blocks.
+    remove_coherent, coherent_group_size, scale, n_ticks:
+        See the individual transform functions.
     """
-    wf = pedestal_subtract(adc, pedestal)
+    if pedestal_mode not in ("stored", "median"):
+        raise ValueError(f"pedestal_mode must be 'stored' or 'median', got {pedestal_mode!r}")
+
+    if subtract_pedestal:
+        ped = pedestal if pedestal_mode == "stored" else None
+        wf = pedestal_subtract(adc, ped)
+    else:
+        wf = np.asarray(adc, dtype=np.float32)
+
     if remove_coherent:
         wf = remove_coherent_noise(
             wf, group_size=coherent_group_size, groups=coherent_groups

@@ -34,10 +34,17 @@ data:
   adjacency_radius: 4
 
   # Pre-processing used by build_raw_latents when encoding waveforms.
+  # MUST match what the VAE was trained on (configs/raw_vae.yaml preprocess).
   preprocess:
-    remove_coherent: true
-    coherent_group_size: 64
-    scale: 64.0
+    subtract_pedestal: true   # false = keep raw baseline
+    pedestal_mode: stored     # "stored" (GetPedestal) or "median"
+    remove_coherent: true     # false = skip common-mode removal
+    coherent_group_size: 64   # channels per positional group
+    scale: 64.0               # divide ADC by this; 1.0 keeps ADC counts
+
+  # Optional electronics-aware coherent grouping (channel-id-indexed .npy of
+  # group ids); overrides coherent_group_size when set.
+  # coherent_groups_path: configs/sbnd_coherent_groups.npy
 
 model:
   # Temporal history: number of past events used to predict the next event.

@@ -51,6 +51,7 @@ def materialize_waveforms(
     channels_per_event: Optional[int] = None,
     max_waveforms: Optional[int] = None,
     preprocess_kwargs: Optional[dict] = None,
+    coherent_groups_path: Optional[str] = None,
     seed: int = 0,
 ) -> dict[str, np.ndarray]:
     """Stream events, preprocess, and stack waveforms into dense arrays.
@@ -68,6 +69,14 @@ def materialize_waveforms(
     pp.setdefault("n_ticks", input_length)
     rng = np.random.default_rng(seed)
 
+    # Optional electronics-aware coherent grouping: a channel-id-indexed array
+    # mapping each detector channel to a coherent-noise group (e.g. FEMB id).
+    chan_to_group = None
+    if coherent_groups_path:
+        chan_to_group = np.load(coherent_groups_path)
+        logger.info("Loaded coherent-noise groups from %s (%d channels)",
+                    coherent_groups_path, chan_to_group.shape[0])
+
     if events is None:
         if root_files is None:
             raise ValueError("Provide either root_files or events.")
@@ -81,7 +90,11 @@ def materialize_waveforms(
 
     for ev_idx, ev in enumerate(events):
         provenance.append((ev.run, ev.subrun, ev.event))
-        wf = preprocess_event(ev.adc, ev.pedestal, **pp)  # (nchan, input_length)
+        ev_pp = pp
+        if chan_to_group is not None:
+            # Map this event's channels (in digit order) to their groups.
+            ev_pp = {**pp, "coherent_groups": chan_to_group[ev.channel.astype(np.int64)]}
+        wf = preprocess_event(ev.adc, ev.pedestal, **ev_pp)  # (nchan, input_length)
         n_chan = wf.shape[0]
         if channels_per_event is not None and channels_per_event < n_chan:
             sel = rng.choice(n_chan, size=channels_per_event, replace=False)
@@ -159,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         channels_per_event=data_cfg.get("channels_per_event"),
         max_waveforms=args.max_waveforms,
         preprocess_kwargs=data_cfg.get("preprocess", {}) or {},
+        coherent_groups_path=data_cfg.get("coherent_groups_path"),
     )
 
     out_path = Path(args.output)

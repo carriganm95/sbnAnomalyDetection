@@ -41,10 +41,22 @@ data:
   channels_per_event: 1024
 
   # Pre-processing applied to each event's (n_channels, n_ticks) ADC matrix.
+  # Order: pedestal subtraction -> coherent-noise removal -> scaling -> pad/truncate.
+  # Every step is a knob here; the produced npz reflects exactly these settings.
   preprocess:
-    remove_coherent: true
-    coherent_group_size: 64   # channels per common-mode group (FEMB/motherboard)
-    scale: 64.0               # divide ADC by this to land near [-1, 1]
+    # --- pedestal ---
+    subtract_pedestal: true   # false = keep raw baseline (no subtraction)
+    pedestal_mode: stored     # "stored" = RawDigit.GetPedestal(); "median" = per-channel median over ticks
+    # --- coherent (common-mode) noise ---
+    remove_coherent: false     # false = skip common-mode removal
+    coherent_group_size: 64   # channels per positional group (used unless coherent_groups_path is set)
+    # --- amplitude scaling ---
+    scale: 64.0               # divide ADC by this (~[-1,1]); set 1.0 to keep ADC counts
+
+  # Optional electronics-aware coherent grouping. Path to a .npy array indexed
+  # by detector channel id giving each channel's group (e.g. FEMB id). When set,
+  # it overrides coherent_group_size with the true electronics mapping.
+  # coherent_groups_path: configs/sbnd_coherent_groups.npy
 
   # Optional: train from a pre-materialised waveform array instead of streaming
   # ROOT every epoch. Build it once with:

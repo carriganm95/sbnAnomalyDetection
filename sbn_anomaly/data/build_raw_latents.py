@@ -53,8 +53,15 @@ def encode_events_to_latents(
     encode_batch: int = 512,
     preprocess_kwargs: Optional[dict] = None,
     channel_to_node: Optional[np.ndarray] = None,
+    coherent_groups_path: Optional[str] = None,
+    events=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Encode every event's channels into latents.
+
+    Provide ``root_files`` (flat-ntuple path) or an ``events`` iterable of
+    RawEvents (e.g. a gallery reader). ``coherent_groups_path`` optionally
+    applies electronics-map coherent grouping, identically to the waveform
+    materializer.
 
     Returns
     -------
@@ -71,13 +78,19 @@ def encode_events_to_latents(
     latent_dim = int(vae.latent_dim)
     vae = vae.to(device).eval()
 
-    reader = RawDigitReader(root_files, tree_name=tree_name, max_events=max_events)
+    chan_to_group = np.load(coherent_groups_path) if coherent_groups_path else None
+
+    if events is None:
+        events = RawDigitReader(root_files, tree_name=tree_name, max_events=max_events)
 
     event_latents: list[np.ndarray] = []
     provenance: list[tuple[int, int, int]] = []
 
-    for ev in reader:
-        wf = preprocess_event(ev.adc, ev.pedestal, **pp)  # (nchan, input_length)
+    for ev in events:
+        ev_pp = pp
+        if chan_to_group is not None:
+            ev_pp = {**pp, "coherent_groups": chan_to_group[ev.channel.astype(np.int64)]}
+        wf = preprocess_event(ev.adc, ev.pedestal, **ev_pp)  # (nchan, input_length)
         # Map detector channel id -> fixed node row.
         if channel_to_node is None:
             node_rows = ev.channel.astype(np.int64)
@@ -174,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         tree_name=data_cfg.get("raw_tree_name", "rawdigits"),
         max_events=args.max_events,
         preprocess_kwargs=pp,
+        coherent_groups_path=data_cfg.get("coherent_groups_path"),
     )
 
     out = Path(args.output)

@@ -94,3 +94,46 @@ def test_reshape_adc_length_mismatch_raises():
 def test_pedestal_subtract_bad_shape_raises():
     with pytest.raises(ValueError):
         pedestal_subtract(np.zeros(5), None)
+
+
+def test_preprocess_subtract_pedestal_false_keeps_raw():
+    adc = np.array([[105, 110, 95], [205, 200, 195]], dtype=np.float32)
+    ped = np.array([100, 200], dtype=np.float32)
+    out = preprocess_event(adc, ped, subtract_pedestal=False,
+                           remove_coherent=False, scale=1.0)
+    np.testing.assert_allclose(out, adc)
+
+
+def test_preprocess_pedestal_mode_median_ignores_stored():
+    adc = np.array([[10, 12, 11, 100]], dtype=np.float32)
+    out = preprocess_event(adc, np.array([999], dtype=np.float32),
+                           pedestal_mode="median", remove_coherent=False, scale=1.0)
+    np.testing.assert_allclose(out[0], [-1.5, 0.5, -0.5, 88.5])
+
+
+def test_preprocess_pedestal_mode_stored_uses_pedestal():
+    adc = np.array([[105, 110, 95]], dtype=np.float32)
+    out = preprocess_event(adc, np.array([100], dtype=np.float32),
+                           pedestal_mode="stored", remove_coherent=False, scale=1.0)
+    np.testing.assert_allclose(out[0], [5, 10, -5])
+
+
+def test_preprocess_invalid_pedestal_mode_raises():
+    with pytest.raises(ValueError):
+        preprocess_event(np.zeros((2, 4), dtype=np.float32), pedestal_mode="bogus")
+
+
+def test_preprocess_explicit_coherent_groups_nonadjacent():
+    # Electronics-aware grouping: channels {0,2,4} share a common mode that
+    # positional blocks would miss; median over the group removes it.
+    nt = 8
+    common = np.sin(np.arange(nt) / 2.0).astype(np.float32)
+    adc = np.stack([common.copy() for _ in range(5)])
+    adc[1] = -common  # different group
+    adc[3] = -common
+    adc[0, 4] += 50.0  # spike on a group-0 channel
+    groups = np.array([0, 1, 0, 1, 0])
+    out = preprocess_event(adc, None, coherent_groups=groups,
+                           remove_coherent=True, scale=1.0, subtract_pedestal=False)
+    assert np.abs(out[2]).max() < 1e-3  # clean group-0 channel -> ~0
+    assert out[0, 4] > 20.0             # spike survives

@@ -69,6 +69,7 @@ def main(argv=None) -> int:
         channels_per_event=data_cfg.get("channels_per_event"),
         max_waveforms=args.max_waveforms,
         preprocess_kwargs=data_cfg.get("preprocess", {}) or {},
+        coherent_groups_path=data_cfg.get("coherent_groups_path"),
     )
 
     out_path = Path(args.output)
