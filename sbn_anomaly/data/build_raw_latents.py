@@ -157,7 +157,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", required=True, help="raw_gnn / raw_vae YAML config.")
     parser.add_argument("--vae-checkpoint", required=True, help="Trained VAE checkpoint (.pt).")
-    parser.add_argument("--root-files", nargs="+", required=True, help="Flat raw-ADC ntuple(s).")
+    parser.add_argument("--root-files", nargs="+", default=None,
+                        help="Flat raw-ADC ntuple path(s) or glob(s).")
+    parser.add_argument("--root-file-list", nargs="+", default=None, metavar="FILE",
+                        help="Manifest file(s), one ROOT path per line (# comments ok).")
     parser.add_argument("--output", required=True, help="Output .npz (key 'windows').")
     parser.add_argument("--max-events", type=int, default=None)
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
@@ -176,10 +179,16 @@ def main(argv: list[str] | None = None) -> int:
     input_length = int(model_cfg.get("input_length", 4096))
     pp = data_cfg.get("preprocess", {}) or {}
 
+    from sbn_anomaly.data.root_files import resolve_root_files
+    inputs = list(args.root_files or []) + list(args.root_file_list or [])
+    if not inputs:
+        parser.error("provide --root-files and/or --root-file-list")
+    root_files = resolve_root_files(inputs)
+
     vae = _load_vae_from_checkpoint(args.vae_checkpoint, model_cfg)
 
     latents, prov = encode_events_to_latents(
-        root_files=args.root_files,
+        root_files=root_files,
         vae=vae,
         num_channels=num_channels,
         input_length=input_length,

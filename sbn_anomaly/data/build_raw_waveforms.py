@@ -145,7 +145,10 @@ def main(argv: list[str] | None = None) -> int:
         description="Materialise preprocessed raw waveforms to an .npz for VAE training."
     )
     parser.add_argument("--config", required=True, help="raw_vae YAML config.")
-    parser.add_argument("--root-files", nargs="+", required=True, help="Flat raw-ADC ntuple(s).")
+    parser.add_argument("--root-files", nargs="+", default=None,
+                        help="Flat raw-ADC ntuple path(s) or glob(s).")
+    parser.add_argument("--root-file-list", nargs="+", default=None, metavar="FILE",
+                        help="Manifest file(s), one ROOT path per line (# comments ok).")
     parser.add_argument("--output", required=True, help="Output .npz (key 'waveforms').")
     parser.add_argument("--max-events", type=int, default=None)
     parser.add_argument("--max-waveforms", type=int, default=None,
@@ -163,9 +166,15 @@ def main(argv: list[str] | None = None) -> int:
     data_cfg = cfg.get("data", {})
     model_cfg = cfg.get("model", {})
 
+    from sbn_anomaly.data.root_files import resolve_root_files
+    inputs = list(args.root_files or []) + list(args.root_file_list or [])
+    if not inputs:
+        parser.error("provide --root-files and/or --root-file-list")
+    root_files = resolve_root_files(inputs)
+
     input_length = int(model_cfg.get("input_length", 4096))
     out = materialize_waveforms(
-        root_files=args.root_files,
+        root_files=root_files,
         input_length=input_length,
         tree_name=data_cfg.get("raw_tree_name", "rawdigits"),
         max_events=args.max_events,

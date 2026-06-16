@@ -35,11 +35,16 @@ def main(argv=None) -> int:
 
     from sbn_anomaly.data.gallery_reader import GalleryRawDigitReader
     from sbn_anomaly.data.build_raw_waveforms import materialize_waveforms
+    from sbn_anomaly.data.root_files import resolve_root_files
     from sbn_anomaly.utils.logging import setup_logging
 
     p = argparse.ArgumentParser(description="art RawDigits -> waveform npz (gallery, one step)")
     p.add_argument("--config", required=True, help="raw_vae YAML config")
-    p.add_argument("--files", nargs="+", required=True, help="art ROOT file(s)")
+    p.add_argument("--files", "--root-files", nargs="+", default=None, dest="files",
+                   help="art ROOT file path(s) or glob pattern(s)")
+    p.add_argument("--root-file-list", nargs="+", default=None, metavar="FILE",
+                   help="Manifest file(s) with one ROOT path per line (# comments ok), "
+                        "like the GNN's --root-file-list.")
     p.add_argument("--output", required=True, help="output .npz (key 'waveforms')")
     p.add_argument("--tag", default="daq", help="RawDigit product tag / module label")
     p.add_argument("--max-events", type=int, default=None)
@@ -51,6 +56,14 @@ def main(argv=None) -> int:
 
     setup_logging(args.log_level)
 
+    inputs = list(args.files or []) + list(args.root_file_list or [])
+    if not inputs:
+        p.error("provide --files / --root-files and/or --root-file-list")
+    files = resolve_root_files(inputs)
+    if not files:
+        p.error("no ROOT files resolved from the given inputs")
+    print(f"# resolved {len(files)} ROOT file(s)")
+
     with open(args.config) as fh:
         cfg = yaml.safe_load(fh)
     data_cfg = cfg.get("data", {})
@@ -58,7 +71,7 @@ def main(argv=None) -> int:
     input_length = int(model_cfg.get("input_length", 4096))
 
     reader = GalleryRawDigitReader(
-        file_paths=args.files,
+        file_paths=files,
         tag=args.tag,
         max_events=args.max_events,
     )
