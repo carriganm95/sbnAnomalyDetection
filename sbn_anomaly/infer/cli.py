@@ -97,9 +97,32 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("inference.checkpoint_path not set in config.")
         return 1
 
-    # GNN uses a separate PyG-based inference path with per-node output
-    if model_type == "gnn":
+    # GNN uses a separate PyG-based inference path with per-node output.
+    # raw_gnn reuses the same path: it scores a pre-computed per-channel latent
+    # windows npz (from sbn_anomaly.data.build_raw_latents).
+    if model_type in ("gnn", "raw_gnn"):
         _infer_gnn(cfg, checkpoint, args.output)
+        return 0
+
+    # raw_vae streams raw-ADC ntuples and scores each channel waveform directly.
+    if model_type == "raw_vae":
+        from sbn_anomaly.data.root_files import resolve_root_files
+
+        raw_inputs: list[str] = []
+        if args.root_files:
+            raw_inputs.extend(args.root_files)
+        if args.root_file_list:
+            raw_inputs.extend(args.root_file_list)
+        if args.input:
+            raw_inputs.append(args.input)
+        if not raw_inputs:
+            raw_inputs.append(cfg.get("inference", {}).get("input_path"))
+        raw_inputs = [r for r in raw_inputs if r]
+        if not raw_inputs:
+            logger.error("raw_vae inference needs --root-files / --input or inference.input_path.")
+            return 1
+        raw_files = resolve_root_files(raw_inputs)
+        _infer_raw_vae(cfg, checkpoint, raw_files, args.output)
         return 0
 
     scorer = _build_scorer(cfg, model_type, checkpoint)
@@ -288,6 +311,97 @@ def _score_tpc_from_root(
         return np.empty((0,), dtype=np.float32)
 
     return np.concatenate(score_chunks)
+def _infer_raw_vae(
+    cfg: dict,
+    checkpoint: str,
+    root_files: list[str],
+    output: str,
+) -> None:
+    """Score per-channel raw waveforms with the trained VAE.
+
+    Streams events from flat raw-ADC ntuples, pre-processes each, and computes a
+    per-channel anomaly score (reconstruction MSE + beta*KL). Saves a compressed
+    npz with:
+
+        node_scores : (N_events, n_channels) float32 — per-channel score, NaN=missing
+        scores      : (N_events,) float32 — mean over present channels
+        scores_max  : (N_events,) float32 — max over present channels
+        provenance  : (N_events, 3) int32 — (run, subrun, event)
+    """
+    import torch
+
+    from sbn_anomaly.data.build_raw_latents import _load_vae_from_checkpoint
+    from sbn_anomaly.data.raw_digit_reader import RawDigitReader
+    from sbn_anomaly.data.raw_preprocess import preprocess_event
+
+    logger = logging.getLogger(__name__)
+    data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
+    infer_cfg = cfg.get("inference", {})
+
+    n_channels = int(data_cfg.get("n_channels", 11264))
+    input_length = int(model_cfg.get("input_length", 4096))
+    pp = dict(data_cfg.get("preprocess", {}) or {})
+    pp.setdefault("n_ticks", input_length)
+    score_beta = float(infer_cfg.get("score_beta", cfg.get("training", {}).get("beta", 1.0)))
+    encode_batch = int(infer_cfg.get("batch_size", 512))
+    max_events = infer_cfg.get("max_windows") or infer_cfg.get("max_events")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    vae = _load_vae_from_checkpoint(checkpoint, model_cfg).to(device).eval()
+
+    reader = RawDigitReader(
+        root_files,
+        tree_name=data_cfg.get("raw_tree_name", "rawdigits"),
+        max_events=int(max_events) if max_events else None,
+    )
+
+    node_scores: list[np.ndarray] = []
+    prov: list[tuple] = []
+    for ev in reader:
+        wf = preprocess_event(ev.adc, ev.pedestal, **pp)
+        row = np.full(n_channels, np.nan, dtype=np.float32)
+        chans = ev.channel.astype(np.int64)
+        valid = (chans >= 0) & (chans < n_channels)
+        wf, chans = wf[valid], chans[valid]
+        with torch.no_grad():
+            for s in range(0, wf.shape[0], encode_batch):
+                x = torch.from_numpy(wf[s:s + encode_batch]).float().to(device)
+                sc = vae.anomaly_score(x, beta=score_beta).cpu().numpy()
+                row[chans[s:s + encode_batch]] = sc
+        node_scores.append(row)
+        prov.append((ev.run, ev.subrun, ev.event))
+
+    if not node_scores:
+        logger.warning("No events scored.")
+        return
+
+    node_scores_arr = np.stack(node_scores, axis=0)
+    with np.errstate(invalid="ignore"):
+        mean_scores = np.nanmean(node_scores_arr, axis=1).astype(np.float32)
+        max_scores = np.nanmax(node_scores_arr, axis=1).astype(np.float32)
+    prov_arr = np.asarray(prov, dtype=np.int32)
+
+    out = {
+        "node_scores": node_scores_arr,
+        "scores": mean_scores,
+        "scores_max": max_scores,
+        "provenance": prov_arr,
+    }
+    threshold = infer_cfg.get("threshold")
+    if threshold is not None:
+        out["is_anomaly"] = (mean_scores > float(threshold))
+
+    out_path = Path(output)
+    if out_path.suffix != ".npz":
+        out_path = out_path.with_suffix(".npz")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_path, **out)
+    logger.info(
+        "Saved raw_vae scores for %d events to %s", node_scores_arr.shape[0], out_path
+    )
+
+
 def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
     """Run per-node GNN inference and save results as a compressed npz archive.
             input_dim = model_cfg.get("input_dim", 256)

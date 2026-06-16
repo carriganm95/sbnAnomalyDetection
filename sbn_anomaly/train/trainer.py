@@ -316,6 +316,9 @@ class BaseTrainer(ABC):
 
         processed_any = False
         for epoch in range(1, self.max_epochs + 1):
+            # Expose the current (1-indexed) epoch so subclasses can implement
+            # epoch-dependent schedules (e.g. VAE KL warmup). Purely additive.
+            self.epoch = epoch
             epoch_t0 = time.perf_counter()
             running_loss = 0.0
             n_batches = 0

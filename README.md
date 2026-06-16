@@ -2,6 +2,11 @@
 
 Streaming anomaly detection pipeline for the [Short-Baseline Neutrino (SBN)](https://sbn.fnal.gov/) experiment at Fermilab.
 
+Two complementary tracks share the same GNN+GRU forecasting core:
+
+- **Hit-level** (reconstructed) — node features are per-channel hit aggregates. See below.
+- **Raw-ADC** — a 1-D convolutional **VAE** compresses each channel's raw ADC waveform into a latent that feeds the same forecaster. See **[RAW_ADC_WORKFLOW.md](RAW_ADC_WORKFLOW.md)** (model types `raw_vae` and `raw_gnn`, configs `configs/raw_vae.yaml` and `configs/raw_gnn.yaml`).
+
 ## Primary Architecture — GNN Forecaster
 
 The current model is a **graph neural network forecaster** (`GNNForecasterPyG`) that treats TPC channels as nodes in a spatial graph and learns to predict the next time window from a history of past windows. Anomaly scores are the per-channel MSE between the predicted and actual next window.

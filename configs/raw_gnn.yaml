@@ -1,0 +1,83 @@
+# Raw-ADC GNN forecaster configuration.
+#
+# Stage 2 of the raw-ADC anomaly pipeline. Per-channel VAE latents (stage 1) are
+# treated as graph node features; each event is one temporal frame. The GNN
+# (GCN spatial message passing + GRU) forecasts the next event's per-channel
+# latents and flags large per-channel prediction errors -- reusing the SAME
+# GNNForecasterPyG stack as the hit-level configs/gnn.yaml.
+#
+# Three-step workflow:
+#   1. Dump raw digits:   root -l -b -q 'scripts/dump_rawdigits.C("decoded.root","raw_run.root","daq",0)'
+#   2. Train VAE:         sbn-train --config configs/raw_vae.yaml --root-files raw_run*.root
+#   3. Materialise latents into a windows array, then train/score the GNN:
+#        python -m sbn_anomaly.data.build_raw_latents \
+#            --config configs/raw_gnn.yaml \
+#            --vae-checkpoint checkpoints/raw_vae/v1/vae_final.pt \
+#            --root-files raw_run*.root \
+#            --output data/raw_latents_train.npz
+#        sbn-train --config configs/raw_gnn.yaml
+#        sbn-infer --config configs/raw_gnn.yaml --output raw_gnn_scores.npz
+
+model_type: raw_gnn
+
+data:
+  # Per-channel latent windows produced by build_raw_latents:
+  # shape (num_events, n_channels, latent_dim). One event = one frame.
+  windows_path: data/raw_latents_train.npz
+
+  # Detector channel count and raw ntuple tree (used by build_raw_latents).
+  n_channels: 11264
+  raw_tree_name: rawdigits
+
+  # Graph + windowing. stride=1 forecasts every successive event.
+  stride: 1
+  adjacency_radius: 4
+
+  # Pre-processing used by build_raw_latents when encoding waveforms.
+  preprocess:
+    remove_coherent: true
+    coherent_group_size: 64
+    scale: 64.0
+
+model:
+  # Temporal history: number of past events used to predict the next event.
+  history: 4
+
+  # GNN / GRU architecture (matches GNNForecasterPyG).
+  node_feat_dim: null        # inferred from latent_dim of the windows array
+  gnn_hidden: 64
+  gnn_layers: 3
+  gru_hidden: 256
+  gru_layers: 2
+  dropout: 0.1
+  norm_type: batch
+
+  # --- VAE params (must match the trained raw_vae checkpoint) ---
+  # Read by build_raw_latents to reconstruct the encoder before encoding.
+  input_length: 4096
+  latent_dim: 24
+  base_channels: 16
+  depth: 4
+  kernel_size: 7
+
+training:
+  batch_size: 16
+  num_workers: 4
+  lr: 0.001
+  weight_decay: 1.0e-4
+  max_epochs: 20
+  validation_split: 0.1
+  use_amp: true
+  score_mode: mean
+  save_best_only: true
+  checkpoint_dir: checkpoints/raw_gnn/v1
+  output_path: checkpoints/raw_gnn/v1/raw_gnn_final.pt
+  log_interval: 50
+
+inference:
+  checkpoint_path: checkpoints/raw_gnn/v1/raw_gnn_final.pt
+  # Latent windows for the data you want to score (build with build_raw_latents).
+  input_path: data/raw_latents_test.npz
+  threshold: null
+  max_windows: null
+  batch_size: 4

@@ -17,6 +17,7 @@ from sbn_anomaly.models.fusion_model import FusionAutoencoder
 from sbn_anomaly.models.window_model import WindowAutoencoder
 from sbn_anomaly.models.gnn_forecaster import GNNForecaster
 from sbn_anomaly.models.gnn_forecaster_pyg import GNNForecasterPyG
+from sbn_anomaly.models.tpc_waveform_vae import TPCWaveformVAE
 
 __all__ = [
     "TPCAutoencoder",
@@ -25,4 +26,5 @@ __all__ = [
     "WindowAutoencoder",
     "GNNForecaster",
     "GNNForecasterPyG",
+    "TPCWaveformVAE",
 ]

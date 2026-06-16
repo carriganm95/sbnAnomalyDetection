@@ -1,0 +1,84 @@
+# Raw-ADC waveform VAE configuration.
+#
+# Stage 1 of the raw-ADC anomaly pipeline: compress each channel's raw ADC
+# waveform into a low-dim latent with a 1-D convolutional variational
+# autoencoder. The latent feeds the raw_gnn forecaster (configs/raw_gnn.yaml);
+# the VAE's own reconstruction + KL score is also a standalone per-channel
+# anomaly signal.
+#
+# Prereq: convert art RawDigit files to flat ntuples first:
+#   root -l -b -q 'scripts/dump_rawdigits.C("decoded.root","raw_run.root","daq",0)'
+#
+# Train (stream from flat ntuples):
+#   sbn-train --config configs/raw_vae.yaml --root-files raw_run*.root
+#
+# Score channels with the trained VAE:
+#   sbn-infer --config configs/raw_vae.yaml --root-files raw_run.root --output raw_vae_scores.npz
+
+model_type: raw_vae
+
+model:
+  # input_length MUST be divisible by 2**depth. SBND ~3415 ticks, ICARUS ~4096;
+  # pick a power-of-two-friendly length; waveforms are padded/truncated to it.
+  input_length: 4096
+  latent_dim: 24
+  base_channels: 16
+  depth: 4          # 4 stride-2 layers -> encoder length = 4096 / 16 = 256
+  kernel_size: 7
+  dropout: 0.0
+
+data:
+  # Number of detector channels (used by inference to lay out per-channel scores).
+  # SBND TPC ~11264; set to your detector's channel count.
+  n_channels: 11264
+
+  # TTree name written by dump_rawdigits.C
+  raw_tree_name: rawdigits
+  raw_step_size: 32
+
+  # Randomly sample this many channels per event each epoch (bounds memory and
+  # balances events). null = use all channels.
+  channels_per_event: 1024
+
+  # Pre-processing applied to each event's (n_channels, n_ticks) ADC matrix.
+  preprocess:
+    remove_coherent: true
+    coherent_group_size: 64   # channels per common-mode group (FEMB/motherboard)
+    scale: 64.0               # divide ADC by this to land near [-1, 1]
+
+  # Optional: train from a pre-materialised waveform array instead of streaming
+  # ROOT every epoch. Build it once with:
+  #   python -m sbn_anomaly.data.build_raw_waveforms \
+  #       --config configs/raw_vae.yaml --root-files raw_run*.root \
+  #       --output data/raw_waveforms_train.npz --max-waveforms 2000000
+  # then set waveforms_path (and omit --root-files when training).
+  # waveforms_path: data/raw_waveforms_train.npz   # key 'waveforms', shape (N, input_length)
+
+training:
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 1.0e-5
+  max_epochs: 50
+  steps_per_epoch: 200      # batches per epoch when streaming
+  num_workers: 4
+  use_amp: true
+
+  # beta-VAE controls. Warm up KL to avoid early posterior collapse.
+  beta: 1.0
+  beta_warmup_epochs: 10
+  score_beta: 1.0           # KL weight used when reporting anomaly scores
+
+  validation_split: 0.1
+  save_best_only: true
+  checkpoint_dir: checkpoints/raw_vae/v1
+  output_path: checkpoints/raw_vae/v1/vae_final.pt
+  anomaly_threshold: null
+  log_interval: 50
+
+inference:
+  checkpoint_path: checkpoints/raw_vae/v1/vae_final.pt
+  input_path: null          # or pass --root-files on the CLI
+  threshold: null
+  score_beta: 1.0
+  batch_size: 512
+  max_windows: null

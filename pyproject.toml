@@ -71,7 +71,7 @@ ignore_missing_imports = true
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 
 [tool.pixi.activation]
 env = { PYTORCH_NO_CUDA_MEMORY_CACHING = "1" }
@@ -90,3 +90,4 @@ colorlog = ">=6.10.1,<7"
 root = ">=6.38.4,<7"
 fsspec-xrootd = ">=0.5.2,<0.6"
 pip = ">=26.1.1,<27"
+ipykernel = ">=7.3.0,<8"

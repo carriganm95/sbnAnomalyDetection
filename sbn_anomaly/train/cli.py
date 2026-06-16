@@ -166,9 +166,18 @@ def main(argv: list[str] | None = None) -> int:
         _train_window(cfg)
     elif model_type == "gnn":
         _train_gnn(cfg, root_files=root_files)
+    elif model_type == "raw_vae":
+        _train_raw_vae(cfg, root_files=root_files)
+    elif model_type == "raw_gnn":
+        # Raw-ADC GNN forecasting consumes a pre-computed per-channel latent
+        # windows array (see sbn_anomaly.data.build_raw_latents) through the
+        # same dense GraphWindowDatasetPyG path as the legacy GNN. Raw ntuples
+        # are not streamed here; latents are materialised first.
+        _train_gnn(cfg, root_files=None)
     else:
         logger.error(
-            "Unknown model_type '%s'. Choose from: tpc, pmt, fusion, window.", model_type
+            "Unknown model_type '%s'. Choose from: tpc, pmt, fusion, window, "
+            "gnn, raw_vae, raw_gnn.", model_type
         )
         return 1
 
@@ -346,6 +355,120 @@ def _train_tpc(
     trainer.save_training_history(plot_dir)
     trainer.save_training_plots(plot_dir, bins=train_cfg.get("reconstruction_hist2d_bins"))
     logger.info("TPC training complete.")
+
+
+def _train_raw_vae(
+    cfg: dict,
+    root_files: list[str] | None = None,
+) -> None:
+    """Train the raw-waveform VAE (model_type='raw_vae').
+
+    Streams per-channel ADC waveforms from flat raw-ADC ntuples (output of
+    scripts/dump_rawdigits.C) when --root-files is given, otherwise trains from
+    a pre-materialised waveform array (data.waveforms_path).
+    """
+    import numpy as np
+    from torch.utils.data import DataLoader
+
+    from sbn_anomaly.data.raw_waveform_dataset import (
+        RawWaveformArrayDataset,
+        RawWaveformStreamDataset,
+    )
+    from sbn_anomaly.models.tpc_waveform_vae import TPCWaveformVAE
+    from sbn_anomaly.train.vae_trainer import VAETrainer
+
+    logger = logging.getLogger(__name__)
+    data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
+    train_cfg = cfg.get("training", {})
+
+    input_length = int(model_cfg.get("input_length", 4096))
+    preprocess_kwargs = data_cfg.get("preprocess", {}) or {}
+
+    model = TPCWaveformVAE(
+        input_length=input_length,
+        latent_dim=int(model_cfg.get("latent_dim", 24)),
+        base_channels=int(model_cfg.get("base_channels", 16)),
+        depth=int(model_cfg.get("depth", 4)),
+        kernel_size=int(model_cfg.get("kernel_size", 7)),
+        dropout=float(model_cfg.get("dropout", 0.0)),
+    )
+
+    validation_loader = None
+    if root_files:
+        logger.info("Streaming raw-waveform VAE training from %d ntuple(s)", len(root_files))
+        dataset = RawWaveformStreamDataset(
+            file_paths=root_files,
+            input_length=input_length,
+            tree_name=data_cfg.get("raw_tree_name", "rawdigits"),
+            step_size=int(data_cfg.get("raw_step_size", 32)),
+            max_events=train_cfg.get("max_events"),
+            channels_per_event=data_cfg.get("channels_per_event"),
+            preprocess_kwargs=preprocess_kwargs,
+            seed=int(train_cfg.get("validation_seed", 42)),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=int(train_cfg.get("batch_size", 256)),
+            num_workers=int(train_cfg.get("num_workers", 0)),
+        )
+        steps_per_epoch = train_cfg.get("steps_per_epoch", 200)
+    else:
+        waveforms_path = data_cfg["waveforms_path"]
+        logger.info("Loading pre-materialised waveforms from %s", waveforms_path)
+        dataset = RawWaveformArrayDataset(waveforms_path)
+        validation_split = float(train_cfg.get("validation_split", 0.0) or 0.0)
+        validation_seed = int(train_cfg.get("validation_seed", 42))
+        train_dataset, val_dataset = _split_dataset_for_validation(
+            dataset, validation_split, validation_seed
+        )
+        loader = DataLoader(
+            train_dataset,
+            batch_size=int(train_cfg.get("batch_size", 256)),
+            shuffle=True,
+            num_workers=int(train_cfg.get("num_workers", 0)),
+        )
+        if val_dataset is not None:
+            validation_loader = DataLoader(
+                val_dataset,
+                batch_size=int(train_cfg.get("batch_size", 256)),
+                shuffle=False,
+                num_workers=int(train_cfg.get("num_workers", 0)),
+            )
+        steps_per_epoch = train_cfg.get("steps_per_epoch", None)
+
+    trainer = VAETrainer(
+        model=model,
+        lr=float(train_cfg.get("lr", 1e-3)),
+        weight_decay=float(train_cfg.get("weight_decay", 1e-5)),
+        max_epochs=int(train_cfg.get("max_epochs", 50)),
+        checkpoint_dir=train_cfg.get("checkpoint_dir"),
+        steps_per_epoch=steps_per_epoch,
+        anomaly_threshold=train_cfg.get("anomaly_threshold"),
+        reconstruction_plot_max_values=int(
+            train_cfg.get("reconstruction_plot_max_values", 50000)
+        ),
+        save_best_only=bool(train_cfg.get("save_best_only", False)),
+        use_amp=bool(train_cfg.get("use_amp", False)),
+        beta=float(train_cfg.get("beta", 1.0)),
+        beta_warmup_epochs=int(train_cfg.get("beta_warmup_epochs", 0)),
+        score_beta=train_cfg.get("score_beta"),
+    )
+    trainer.train(
+        loader,
+        validation_loader=validation_loader,
+        metrics_max_samples=int(train_cfg.get("metrics_max_samples", 20000)),
+    )
+    output = train_cfg.get("output_path")
+    if output:
+        trainer.save(output)
+
+    plot_dir = train_cfg.get("checkpoint_dir")
+    if plot_dir is None and output:
+        plot_dir = str(Path(output).parent)
+    trainer.save_training_history(plot_dir)
+    trainer.save_training_plots(plot_dir)
+    logger.info("Raw-waveform VAE training complete.")
 
 
 def _train_pmt(cfg: dict) -> None:
