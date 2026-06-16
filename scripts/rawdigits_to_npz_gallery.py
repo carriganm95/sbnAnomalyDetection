@@ -34,7 +34,7 @@ def main(argv=None) -> int:
     import yaml
 
     from sbn_anomaly.data.gallery_reader import GalleryRawDigitReader
-    from sbn_anomaly.data.build_raw_waveforms import materialize_waveforms
+    from sbn_anomaly.data.build_raw_waveforms import write_waveform_shards
     from sbn_anomaly.data.root_files import resolve_root_files
     from sbn_anomaly.utils.logging import setup_logging
 
@@ -45,10 +45,15 @@ def main(argv=None) -> int:
     p.add_argument("--root-file-list", nargs="+", default=None, metavar="FILE",
                    help="Manifest file(s) with one ROOT path per line (# comments ok), "
                         "like the GNN's --root-file-list.")
-    p.add_argument("--output", required=True, help="output .npz (key 'waveforms')")
+    p.add_argument("--output", required=True,
+                   help="output .npz; with --shard-size, shards become <stem>_000.npz, ...")
     p.add_argument("--tag", default="daq", help="RawDigit product tag / module label")
+    p.add_argument("--shard-size", type=int, default=None,
+                   help="Waveforms per output shard. When set, write <output>_NNN.npz "
+                        "every shard-size waveforms and keep processing.")
     p.add_argument("--max-events", type=int, default=None)
-    p.add_argument("--max-waveforms", type=int, default=None)
+    p.add_argument("--max-waveforms", type=int, default=None,
+                   help="Global cap across all shards (None = process everything).")
     p.add_argument("--compress", action="store_true", help="write compressed npz")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -70,29 +75,26 @@ def main(argv=None) -> int:
     model_cfg = cfg.get("model", {})
     input_length = int(model_cfg.get("input_length", 4096))
 
-    reader = GalleryRawDigitReader(
-        file_paths=files,
-        tag=args.tag,
-        max_events=args.max_events,
-    )
+    # One reader per file so file boundaries (for per-file counts) are known and
+    # shards can span files.
+    def reader_factory(fpath):
+        return GalleryRawDigitReader(file_paths=[fpath], tag=args.tag)
 
-    out = materialize_waveforms(
-        events=reader,
+    written = write_waveform_shards(
+        file_inputs=files,
+        reader_factory=reader_factory,
         input_length=input_length,
+        output=args.output,
+        shard_size=args.shard_size,
         channels_per_event=data_cfg.get("channels_per_event"),
+        max_events=args.max_events,
         max_waveforms=args.max_waveforms,
         preprocess_kwargs=data_cfg.get("preprocess", {}) or {},
         coherent_groups_path=data_cfg.get("coherent_groups_path"),
+        compress=args.compress,
     )
-
-    out_path = Path(args.output)
-    if out_path.suffix != ".npz":
-        out_path = out_path.with_suffix(".npz")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    saver = np.savez_compressed if args.compress else np.savez
-    saver(out_path, **out)
-    print(f"# Wrote waveforms {out['waveforms'].shape} to {out_path}")
-    print(f"# Now set data.waveforms_path: {out_path} in {args.config} and run sbn-train.")
+    print(f"# Wrote {len(written)} shard file(s): {written}")
+    print(f"# Point data.waveforms_path at them (a glob works) and run sbn-train.")
     return 0
 
 

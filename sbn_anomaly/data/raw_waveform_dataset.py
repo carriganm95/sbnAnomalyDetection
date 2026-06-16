@@ -109,19 +109,35 @@ class RawWaveformArrayDataset(Dataset):
     Parameters
     ----------
     waveforms:
-        Array or path to a ``.npy``/``.npz`` (key ``waveforms``) of shape
-        ``(n_waveforms, input_length)``.  Assumed already pre-processed unless
-        ``preprocess`` kwargs request otherwise (not applied here — supply
-        ready waveforms).
+        One of: an in-memory ``(n_waveforms, input_length)`` array; a path to a
+        single ``.npy``/``.npz`` (key ``waveforms``); a glob string matching
+        several shard files (e.g. ``data/raw_waveforms_train_*.npz``); or a list
+        of such paths. Multiple files are loaded and concatenated, so the sharded
+        output of ``write_waveform_shards`` can be trained on directly.
     """
 
-    def __init__(self, waveforms: Union[np.ndarray, str, Path]) -> None:
-        if isinstance(waveforms, (str, Path)):
-            arr = np.load(waveforms, allow_pickle=True)
-            if isinstance(arr, np.lib.npyio.NpzFile):
-                arr = arr["waveforms"]
-            waveforms = arr
-        wf = np.asarray(waveforms, dtype=np.float32)
+    def __init__(self, waveforms: Union[np.ndarray, str, Path, list]) -> None:
+        import glob as _glob
+
+        paths: list = []
+        if isinstance(waveforms, (list, tuple)):
+            for w in waveforms:
+                paths.extend(sorted(_glob.glob(str(w))) or [str(w)])
+        elif isinstance(waveforms, (str, Path)):
+            matches = sorted(_glob.glob(str(waveforms)))
+            paths = matches if matches else [str(waveforms)]
+
+        if paths:
+            arrays = []
+            for pth in paths:
+                arr = np.load(pth, allow_pickle=True)
+                if isinstance(arr, np.lib.npyio.NpzFile):
+                    arr = arr["waveforms"]
+                arrays.append(np.asarray(arr, dtype=np.float32))
+            wf = np.concatenate(arrays, axis=0) if len(arrays) > 1 else arrays[0]
+        else:
+            wf = np.asarray(waveforms, dtype=np.float32)
+
         if wf.ndim != 2:
             raise ValueError(
                 f"waveforms must be 2-D (n_waveforms, input_length), got {wf.ndim}-D"

@@ -68,7 +68,11 @@ def _label(npz, row: int) -> str:
     parts = [f"row {row}"]
     if "channel" in npz:
         parts.append(f"ch {int(npz['channel'][row])}")
-    if "event_idx" in npz and "provenance" in npz and npz["provenance"].size:
+    # Sharded files store per-row (run, subrun, event) under 'prov'.
+    if "prov" in npz and npz["prov"].size:
+        r, s, e = npz["prov"][row]
+        parts.append(f"run {r} sr {s} evt {e}")
+    elif "event_idx" in npz and "provenance" in npz and npz["provenance"].size:
         ei = int(npz["event_idx"][row])
         if 0 <= ei < npz["provenance"].shape[0]:
             r, s, e = npz["provenance"][ei]
