@@ -198,6 +198,135 @@ The `inference.input_path` in `configs/gnn.yaml` points at the windows/events fi
 | `event_index` | `(N_windows,)` | Window index |
 | `is_anomaly` | `(N_windows,)` | Boolean flag (only when `inference.threshold` is set) |
 
+## Raw-ADC VAE Pipeline
+
+The raw-ADC track compresses each channel's raw waveform with a 1-D convolutional
+variational autoencoder (`model_type: raw_vae`); the latents then feed the same
+GNN forecaster as `raw_gnn`. Full design notes are in
+[RAW_ADC_WORKFLOW.md](RAW_ADC_WORKFLOW.md); this section covers building the
+training `.npz` files and training the VAE on them.
+
+### Step 1 — Create the waveform `.npz` (one step, on a LArSoft node)
+
+Raw `raw::RawDigit` ADCs live in art files and can only be decoded by
+LArSoft/gallery (uproot cannot read the memberwise-serialized vector). So the
+dump runs on a gpvm or in an SL7/LArSoft container where the experiment software
+is set up. `scripts/rawdigits_to_npz_gallery.py` reads the digits via gallery,
+applies preprocessing, and writes the `.npz` in **one step** — no intermediate
+flat ROOT file:
+
+```bash
+# on a gpvm / SL7 container, AFTER: source .../setup_icarus.sh ; setup icaruscode ...
+python scripts/rawdigits_to_npz_gallery.py \
+    --config configs/raw_vae.yaml \
+    --root-files /pnfs/.../raw_decoded_reco_056.root \
+    --output data/raw_waveforms_train.npz \
+    --tag daq
+```
+
+Minimal dependencies for this step are just **numpy + PyYAML** (ROOT/PyROOT comes
+from the LArSoft setup, not pip). If `import sbn_anomaly` fails, run with
+`PYTHONPATH=$PWD` or `pip install -e . --no-deps`.
+
+#### Input file lists (same as the GNN)
+
+You can pass individual files, glob patterns, or a manifest — identical to the
+GNN's `--root-file-list`:
+
+```bash
+# explicit files or a glob
+python scripts/rawdigits_to_npz_gallery.py --config configs/raw_vae.yaml \
+    --root-files '/pnfs/.../raw_decoded_reco_*.root' --output data/raw_waveforms_train.npz
+
+# a manifest: one ROOT path per line, blank lines and #-comment lines ignored
+python scripts/rawdigits_to_npz_gallery.py --config configs/raw_vae.yaml \
+    --root-file-list data/filelist_train.txt --output data/raw_waveforms_train.npz
+```
+
+Gallery chains the whole list in one pass; `(run, subrun, event)` provenance is
+kept per waveform so events stay distinguishable. After **each input file** the
+run logs how many waveforms it contributed:
+
+```
+File /pnfs/.../raw_decoded_reco_056.root: added 360448 waveforms (running total 360448)
+File /pnfs/.../raw_decoded_reco_057.root: added 360448 waveforms (running total 720896)
+```
+
+#### Chunking large file lists into shards
+
+For long file lists the waveforms won't fit in memory, so use `--shard-size` to
+flush fixed-size shards and keep processing. Output `data/raw_waveforms_train.npz`
+becomes `data/raw_waveforms_train_000.npz`, `_001.npz`, …:
+
+```bash
+python scripts/rawdigits_to_npz_gallery.py --config configs/raw_vae.yaml \
+    --root-file-list data/filelist_train.txt \
+    --output data/raw_waveforms_train.npz \
+    --shard-size 2000000 --tag daq
+```
+
+Behavior:
+
+- A new shard is written every `--shard-size` **waveforms** (not events). Shards
+  span file boundaries, and a single event larger than a shard is split across
+  shards. The final shard holds the remainder.
+- Omit `--shard-size` to write a single `.npz`.
+- `--max-waveforms N` caps the **global** total across all shards (useful to stop
+  early); `--max-events N` caps total events.
+- `--compress` writes compressed npz (smaller, slower to load).
+
+**`--max-waveforms` counts per-channel waveforms, not events.** Each row of the
+output is one channel from one event, so with ~11k channels per event the count
+climbs ~11k per event. The `data.channels_per_event` config key controls how many
+channels each event contributes (e.g. `1024` to subsample and spread a fixed
+budget across more events).
+
+Each shard is self-contained: `waveforms` `(N, input_length)` float32, `channel`
+`(N,)`, and `prov` `(N, 3)` = `(run, subrun, event)` per row. The waveforms are
+already preprocessed per the `data.preprocess` block (pedestal subtraction,
+coherent-noise removal, scaling) — see the comments in `configs/raw_vae.yaml` to
+tune each step.
+
+> Already have flat `rawdigits` ntuples (e.g. from `scripts/dump_rawdigits.C`)?
+> The same flags work via `python -m sbn_anomaly.data.build_raw_waveforms`
+> (numpy + uproot, no LArSoft needed).
+
+### Step 2 — Train the VAE on the `.npz`
+
+Point `data.waveforms_path` in `configs/raw_vae.yaml` at the file — a single
+`.npz`, or a **glob across shards** — and run training:
+
+```yaml
+# configs/raw_vae.yaml
+data:
+  waveforms_path: data/raw_waveforms_train_*.npz   # glob picks up all shards
+```
+
+```bash
+sbn-train --config configs/raw_vae.yaml
+```
+
+The dataset loads every matching shard and concatenates them, so sharded output
+trains transparently. (This holds the full set in RAM at start; if your shards
+exceed memory, train on a subset glob or open an issue for a lazy multi-shard
+loader.) Training writes a checkpoint to `training.output_path`
+(default `checkpoints/raw_vae/v1/vae_final.pt`) plus loss/score plots.
+
+You can also skip the cached `.npz` and stream straight from flat ntuples with
+`sbn-train --config configs/raw_vae.yaml --root-files ...`, but for repeated
+training the cached `.npz` is faster.
+
+### Step 3 — Plot / sanity-check waveforms
+
+```bash
+python scripts/plot_raw_waveforms.py --input data/raw_waveforms_train_000.npz \
+    --random 9 --output sample.png
+```
+
+The y-axis is the preprocessed (pedestal-subtracted, coherent-noise-removed,
+scaled) waveform; set `data.preprocess.scale: 1.0` and `remove_coherent: false`
+in the config if you want raw ADC counts instead.
+
 ## Data Pipeline
 
 ### Sparse event representation
