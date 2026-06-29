@@ -1,0 +1,85 @@
+# Graph variational autoencoder for window-level anomaly detection.
+#
+# Reconstruction (not forecasting) variant of the GNN: encodes one window's
+# per-channel feature graph and reconstructs it. Trained on GOOD runs only, so
+# anomalous windows reconstruct poorly. Unlike the GRU forecaster it compares to
+# the absolute nominal, so persistently-bad windows stay flagged.
+#
+# Input source (priority): ROOT files (sbn-train --root-files / --root-file-list),
+# a compact sparse events npz (data.events_path), or a dense windows array
+# (data.windows_path). The sparse paths form single-window reconstruction graphs
+# on the fly -- no dense windows needed. Build the events npz with:
+#   python -m sbn_anomaly.data.materialize_windows --config configs/graph_vae.yaml \
+#       --root-file-list data/filelist_train.txt --output data/events_train.npz
+#
+# Train:  sbn-train --config configs/graph_vae.yaml
+#   (or: sbn-train --config configs/graph_vae.yaml --root-file-list data/filelist_train.txt)
+# Score:  sbn-infer --config configs/graph_vae.yaml --output gvae_scores.npz
+# Re-aggregate windows with different options without re-running the model:
+#   python -m sbn_anomaly.infer.window_score --scores gvae_scores.npz \
+#       --aggregator group_max_mean --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv
+
+model_type: graph_vae
+
+data:
+  # Compact sparse events npz (preferred). Windows formed on the fly.
+  events_path: data/events_train.npz
+  # windows_path: data/windows_train.npz   # alternative: dense (num_windows, num_nodes, F)
+
+  # Window definition (how events are grouped into one reconstruction frame).
+  window_size: 20
+  n_temporal_bins: 4
+  stride: 20
+
+  adjacency_radius: 4
+  prune_inactive: true
+  standardize: true                       # z-score features on good-run stats
+
+  # ROOT streaming fields (used with --root-files). Match configs/gnn.yaml.
+  tree_name: caloskim/TrackCaloSkim
+  # hit_branches: [hits0.h.integral, hits0.h.channel, ...]
+  # tpc_branches: [meta.run, meta.subrun, meta.evt]
+  n_channels: 11276
+
+  # Geometry-aware graph (see configs/gnn.yaml). electronics recommended.
+  channel_map: configs/SBNDTPCChannelMap_v2_with_positions.csv
+  edge_mode: electronics
+
+  # Per-channel node features per temporal bin (sets F = n_bins * len(features)).
+  node_features: [sum, min, max, mean, stdev, count]
+
+model:
+  latent_dim: 12          # per-node bottleneck
+  gnn_hidden: 64
+  gnn_layers: 2
+  dec_hidden: 64
+  dropout: 0.1
+  mask_ratio: 0.15        # denoising: fraction of nodes masked at train time
+  use_channel_idx: true
+  conv: sage              # sage (self-preserving) | gcn
+
+training:
+  batch_size: 16
+  num_workers: 4
+  lr: 0.001
+  weight_decay: 1.0e-4
+  max_epochs: 30
+  validation_split: 0.1
+  use_amp: true
+  save_best_only: true
+  beta: 1.0               # KL weight
+  beta_warmup_epochs: 10
+  checkpoint_dir: checkpoints/graph_vae/v1
+  output_path: checkpoints/graph_vae/v1/graph_vae_final.pt
+  anomaly_threshold: null
+  log_interval: 50
+
+inference:
+  checkpoint_path: checkpoints/graph_vae/v1/graph_vae_final.pt
+  input_path: data/events_test.npz       # sparse events npz (or a dense windows npz)
+  batch_size: 8
+  # Window aggregator: mean | max | topk_mean | group_max_mean
+  window_aggregator: group_max_mean
+  group_level: femb       # femb | asic  (for group_max_mean)
+  topk: 64                # for topk_mean
+  threshold: null

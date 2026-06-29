@@ -6,6 +6,7 @@ from sbn_anomaly.train.pmt_trainer import PMTTrainer
 from sbn_anomaly.train.fusion_trainer import FusionTrainer
 from sbn_anomaly.train.window_trainer import WindowTrainer
 from sbn_anomaly.train.vae_trainer import VAETrainer
+from sbn_anomaly.train.graph_vae_trainer import GraphVAETrainer
 
 __all__ = [
     "BaseTrainer",
@@ -14,4 +15,5 @@ __all__ = [
     "FusionTrainer",
     "WindowTrainer",
     "VAETrainer",
+    "GraphVAETrainer",
 ]

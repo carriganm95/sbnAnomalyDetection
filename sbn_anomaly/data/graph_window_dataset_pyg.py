@@ -39,6 +39,35 @@ def build_sparse_edge_index(num_nodes: int, radius: int = 4) -> torch.LongTensor
     return torch.stack([torch.cat(src_list), torch.cat(dst_list)])
 
 
+def _build_edge_index(
+    num_nodes: int,
+    *,
+    radius: int = 4,
+    channel_map: str | None = None,
+    edge_mode: str = "sequential",
+) -> torch.LongTensor:
+    """Build the graph edge index for the GNN.
+
+    ``edge_mode="sequential"`` (default) uses the radius-based sequential-channel
+    graph (:func:`build_sparse_edge_index`). Any other mode
+    (``"electronics"``/``"wire"``/``"both"``) builds a geometry-aware graph from
+    the channel-map CSV via :mod:`sbn_anomaly.data.channel_graph`, clamped to
+    ``num_nodes`` so node ids line up with the dataset.
+    """
+    if channel_map and edge_mode and edge_mode != "sequential":
+        from sbn_anomaly.data.channel_graph import build_channel_map_edge_index
+
+        logger.info(
+            "Building '%s' edge index from channel map %s (num_nodes=%d, radius=%d)",
+            edge_mode, channel_map, num_nodes, radius,
+        )
+        return build_channel_map_edge_index(
+            channel_map, mode=edge_mode, radius=radius, num_nodes=num_nodes
+        )
+    logger.info("Building sequential edge index: %d nodes, radius=%d", num_nodes, radius)
+    return build_sparse_edge_index(num_nodes, radius=radius)
+
+
 class GraphWindowDatasetPyG(Dataset):
     """PyG-compatible dataset for graph-structured temporal windows.
 
@@ -62,6 +91,8 @@ class GraphWindowDatasetPyG(Dataset):
         radius: int = 4,
         prune_inactive: bool = True,
         node_feature_names: list[str] | None = None,
+        channel_map: str | None = None,
+        edge_mode: str = "sequential",
     ) -> None:
         """Initialize dataset from pre-materialized windows.
 
@@ -73,6 +104,8 @@ class GraphWindowDatasetPyG(Dataset):
             prune_inactive: drop zero-activity nodes per sample to save memory
             node_feature_names: optional list of F feature names (e.g. ["sum","min","max"]);
                 stored as ``hit_branches`` so BaseTrainer labels reconstruction plots
+            channel_map: optional channel-map CSV path for geometry-aware edges
+            edge_mode: "sequential" (default), "electronics", "wire", or "both"
         """
         _windows = np.asarray(windows, dtype=np.float32)
         if _windows.ndim != 3:
@@ -87,8 +120,12 @@ class GraphWindowDatasetPyG(Dataset):
         self.num_windows, self.num_nodes, self.node_feat_dim = _windows.shape
         self._windows = _windows  # kept for lazy __getitem__
 
-        logger.info("Building edge index: %d nodes, radius=%d", self.num_nodes, radius)
-        self.edge_index_full = build_sparse_edge_index(self.num_nodes, radius=radius)
+        self.channel_map = channel_map
+        self.edge_mode = str(edge_mode)
+        self.edge_index_full = _build_edge_index(
+            self.num_nodes, radius=radius,
+            channel_map=channel_map, edge_mode=self.edge_mode,
+        )
         logger.info("Edge index built: %d edges", self.edge_index_full.shape[1])
 
         # Pre-extract as numpy for fast indexing in _make_pruned_data

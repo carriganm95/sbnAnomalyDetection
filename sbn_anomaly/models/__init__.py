@@ -18,6 +18,7 @@ from sbn_anomaly.models.window_model import WindowAutoencoder
 from sbn_anomaly.models.gnn_forecaster import GNNForecaster
 from sbn_anomaly.models.gnn_forecaster_pyg import GNNForecasterPyG
 from sbn_anomaly.models.tpc_waveform_vae import TPCWaveformVAE
+from sbn_anomaly.models.graph_vae import GraphVAE
 
 __all__ = [
     "TPCAutoencoder",
@@ -27,4 +28,5 @@ __all__ = [
     "GNNForecaster",
     "GNNForecasterPyG",
     "TPCWaveformVAE",
+    "GraphVAE",
 ]

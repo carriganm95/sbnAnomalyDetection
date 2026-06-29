@@ -104,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
         _infer_gnn(cfg, checkpoint, args.output)
         return 0
 
+    if model_type == "graph_vae":
+        _infer_graph_vae(cfg, checkpoint, args.output)
+        return 0
+
     # raw_vae streams raw-ADC ntuples and scores each channel waveform directly.
     if model_type == "raw_vae":
         from sbn_anomaly.data.root_files import resolve_root_files
@@ -402,6 +406,154 @@ def _infer_raw_vae(
     )
 
 
+def _infer_graph_vae(cfg: dict, checkpoint: str, output: str) -> None:
+    """Score windows with the graph VAE.
+
+    Saves per-window per-channel reconstruction error (`node_scores`, NaN for
+    inactive channels) plus an aggregated per-window `scores` (default
+    group_max_mean). Re-aggregate later with sbn_anomaly.infer.window_score.
+    """
+    import torch
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+
+    from sbn_anomaly.data.graph_recon_dataset import GraphReconDataset
+    from sbn_anomaly.models.graph_vae import GraphVAE
+    from sbn_anomaly.infer.window_score import aggregate_windows, channel_to_group
+
+    logger = logging.getLogger(__name__)
+    data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
+    infer_cfg = cfg.get("inference", {})
+
+    input_path = infer_cfg.get("input_path") or data_cfg.get("events_path") or data_cfg.get("windows_path")
+    if not input_path:
+        raise ValueError("Set inference.input_path (events npz or dense windows) for graph_vae.")
+
+    # Load training standardization (saved next to the checkpoint).
+    std_path = data_cfg.get("standardization_path") or str(Path(checkpoint).parent / "standardization.npz")
+    feat_mean = feat_std = None
+    if Path(std_path).exists():
+        s = np.load(std_path)
+        feat_mean, feat_std = s["feature_mean"], s["feature_std"]
+        logger.info("Loaded standardization from %s", std_path)
+    else:
+        logger.warning("No standardization.npz at %s; standardizing from input.", std_path)
+
+    arch = np.load(input_path, allow_pickle=True)
+    is_sparse = isinstance(arch, np.lib.npyio.NpzFile) and "channels_flat" in arch
+    provenance = None
+
+    if is_sparse:
+        from sbn_anomaly.data.sparse_window_dataset import SparseWindowDatasetPyG
+        logger.info("Loading sparse events for graph_vae from %s", input_path)
+        dataset = SparseWindowDatasetPyG.from_npz(
+            input_path,
+            window_size=int(data_cfg.get("window_size", 20)),
+            n_bins=int(data_cfg.get("n_temporal_bins", 4)),
+            stride=int(data_cfg.get("stride", 1)),
+            radius=int(data_cfg.get("adjacency_radius", 4)),
+            node_features=data_cfg.get("node_features") or None,
+            prune_inactive=bool(data_cfg.get("prune_inactive", True)),
+            channel_map=data_cfg.get("channel_map"),
+            edge_mode=str(data_cfg.get("edge_mode", "sequential")),
+            reconstruction=True,
+            standardize=bool(data_cfg.get("standardize", True)),
+            feature_mean=feat_mean, feature_std=feat_std,
+        )
+    else:
+        windows = arch["windows"] if (isinstance(arch, np.lib.npyio.NpzFile) and "windows" in arch) \
+            else (arch["features"] if isinstance(arch, np.lib.npyio.NpzFile) else np.asarray(arch))
+        windows = np.asarray(windows)
+        if windows.ndim == 4:
+            N, C, T, Fd = windows.shape
+            windows = windows.reshape(N, C, T * Fd)
+        if isinstance(arch, np.lib.npyio.NpzFile) and "provenance" in arch:
+            provenance = arch["provenance"]
+        dataset = GraphReconDataset(
+            windows,
+            radius=int(data_cfg.get("adjacency_radius", 4)),
+            prune_inactive=bool(data_cfg.get("prune_inactive", True)),
+            node_feature_names=data_cfg.get("node_features") or None,
+            channel_map=data_cfg.get("channel_map"),
+            edge_mode=str(data_cfg.get("edge_mode", "sequential")),
+            feature_mean=feat_mean, feature_std=feat_std,
+            standardize=bool(data_cfg.get("standardize", True)),
+        )
+    num_channels = dataset.num_nodes
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = GraphVAE(
+        in_dim=dataset.node_feat_dim,
+        latent_dim=int(model_cfg.get("latent_dim", 12)),
+        hidden=int(model_cfg.get("gnn_hidden", 64)),
+        enc_layers=int(model_cfg.get("gnn_layers", 2)),
+        dec_hidden=int(model_cfg.get("dec_hidden", 64)),
+        dropout=float(model_cfg.get("dropout", 0.1)),
+        mask_ratio=0.0,  # no masking at inference
+        use_channel_idx=bool(model_cfg.get("use_channel_idx", True)),
+        conv=str(model_cfg.get("conv", "sage")),
+    )
+    state = torch.load(checkpoint, map_location="cpu")
+    if isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+    model.load_state_dict(state)
+    model = model.to(device).eval()
+
+    loader = PyGDataLoader(dataset, batch_size=int(infer_cfg.get("batch_size", 8)), shuffle=False)
+    rows: list = []
+    with torch.no_grad():
+        for batch in loader:
+            data = batch.to(device)
+            x_hat, _, _, _ = model(data)
+            per_node = ((x_hat - data.y.float()) ** 2).mean(dim=-1).cpu().numpy()
+            bidx = data.batch.cpu().numpy()
+            amask = data.active_mask.cpu().numpy()
+            ng = int(getattr(data, "num_graphs", 1))
+            for g in range(ng):
+                sel = bidx == g
+                row = np.full(num_channels, np.nan, dtype=np.float32)
+                row[amask[sel]] = per_node[sel]
+                rows.append(row)
+
+    node_scores = np.stack(rows, axis=0) if rows else np.zeros((0, num_channels), np.float32)
+
+    # Per-window provenance from the sparse events' metadata, when available.
+    if is_sparse and provenance is None:
+        meta = dataset.window_metadata()
+        if meta:
+            provenance = np.stack(
+                [meta["first_run"], meta["first_subrun"], meta["first_event_num"]], axis=1
+            ).astype(np.int32)
+
+    aggregator = str(infer_cfg.get("window_aggregator", "group_max_mean"))
+    groups = None
+    if aggregator == "group_max_mean" and data_cfg.get("channel_map"):
+        groups = channel_to_group(data_cfg["channel_map"],
+                                  level=str(infer_cfg.get("group_level", "femb")),
+                                  num_channels=num_channels)
+    elif aggregator == "group_max_mean":
+        logger.warning("group_max_mean needs data.channel_map; falling back to mean.")
+        aggregator = "mean"
+    scores = aggregate_windows(node_scores, aggregator, groups=groups,
+                               k=int(infer_cfg.get("topk", 64)))
+
+    out = {"node_scores": node_scores, "scores": scores.astype(np.float32),
+           "window_index": np.arange(node_scores.shape[0], dtype=np.int64)}
+    if provenance is not None:
+        out["provenance"] = provenance
+    threshold = infer_cfg.get("threshold")
+    if threshold is not None:
+        out["is_anomaly"] = (scores > float(threshold))
+
+    out_path = Path(output)
+    if out_path.suffix != ".npz":
+        out_path = out_path.with_suffix(".npz")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_path, **out)
+    logger.info("Saved graph_vae scores for %d windows to %s (aggregator=%s)",
+                node_scores.shape[0], out_path, aggregator)
+
+
 def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
     """Run per-node GNN inference and save results as a compressed npz archive.
             input_dim = model_cfg.get("input_dim", 256)
@@ -439,6 +591,8 @@ def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
     node_features = data_cfg.get("node_features") or None
     window_size = int(data_cfg.get("window_size", 20))
     n_bins = int(data_cfg.get("n_temporal_bins", 4))
+    channel_map = data_cfg.get("channel_map")
+    edge_mode = str(data_cfg.get("edge_mode", "sequential"))
 
     # Detect sparse events NPZ (has 'channels_flat') vs legacy dense windows NPZ.
     archive = np.load(input_path, allow_pickle=False)
@@ -457,6 +611,8 @@ def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
             radius=radius,
             node_features=node_features,
             prune_inactive=True,
+            channel_map=channel_map,
+            edge_mode=edge_mode,
         )
     else:
         from sbn_anomaly.data.graph_window_dataset_pyg import GraphWindowDatasetPyG
@@ -477,6 +633,8 @@ def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
             radius=radius,
             prune_inactive=True,
             node_feature_names=node_features,
+            channel_map=channel_map,
+            edge_mode=edge_mode,
         )
 
     num_channels = dataset.num_nodes

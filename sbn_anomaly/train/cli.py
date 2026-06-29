@@ -174,10 +174,12 @@ def main(argv: list[str] | None = None) -> int:
         # same dense GraphWindowDatasetPyG path as the legacy GNN. Raw ntuples
         # are not streamed here; latents are materialised first.
         _train_gnn(cfg, root_files=None)
+    elif model_type == "graph_vae":
+        _train_graph_vae(cfg, root_files=root_files)
     else:
         logger.error(
             "Unknown model_type '%s'. Choose from: tpc, pmt, fusion, window, "
-            "gnn, raw_vae, raw_gnn.", model_type
+            "gnn, raw_vae, raw_gnn, graph_vae.", model_type
         )
         return 1
 
@@ -471,6 +473,157 @@ def _train_raw_vae(
     logger.info("Raw-waveform VAE training complete.")
 
 
+def _load_windows_array(data_cfg: dict):
+    """Load a dense (num_windows, num_nodes, F) windows array from config."""
+    import numpy as np
+
+    windows_path = data_cfg.get("windows_path")
+    if not windows_path:
+        raise ValueError("graph_vae requires data.windows_path (a dense windows .npy/.npz).")
+    if str(windows_path).endswith(".npy"):
+        windows = np.load(windows_path, mmap_mode="r")
+    else:
+        arch = np.load(windows_path, allow_pickle=True)
+        if isinstance(arch, np.lib.npyio.NpzFile):
+            windows = arch["windows"] if "windows" in arch else arch["features"]
+        else:
+            windows = np.asarray(arch)
+    windows = np.asarray(windows)
+    if windows.ndim == 4:
+        N, C, T, Fdim = windows.shape
+        windows = windows.reshape(N, C, T * Fdim)
+    return windows
+
+
+def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
+    """Train the graph VAE (window reconstruction).
+
+    Input source, in priority order: ROOT files (--root-files), a compact sparse
+    events npz (data.events_path), or a dense windows array (data.windows_path).
+    The sparse paths form single-window reconstruction graphs on the fly -- no
+    dense windows ever needed.
+    """
+    import numpy as np
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+
+    from sbn_anomaly.data.graph_recon_dataset import GraphReconDataset
+    from sbn_anomaly.models.graph_vae import GraphVAE
+    from sbn_anomaly.train.graph_vae_trainer import GraphVAETrainer
+
+    logger = logging.getLogger(__name__)
+    data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
+    train_cfg = cfg.get("training", {})
+
+    events_path = data_cfg.get("events_path")
+    sparse_kwargs = dict(
+        window_size=int(data_cfg.get("window_size", 20)),
+        n_bins=int(data_cfg.get("n_temporal_bins", 4)),
+        stride=int(data_cfg.get("stride", 1)),
+        radius=int(data_cfg.get("adjacency_radius", 4)),
+        node_features=data_cfg.get("node_features") or None,
+        prune_inactive=bool(data_cfg.get("prune_inactive", True)),
+        channel_map=data_cfg.get("channel_map"),
+        edge_mode=str(data_cfg.get("edge_mode", "sequential")),
+        reconstruction=True,
+        standardize=bool(data_cfg.get("standardize", True)),
+    )
+
+    if root_files:
+        from sbn_anomaly.data.sparse_window_dataset import SparseWindowDatasetPyG
+        logger.info("Streaming graph_vae events from %d ROOT file(s)", len(root_files))
+        dataset = SparseWindowDatasetPyG.from_root(
+            root_files=root_files,
+            tree_name=data_cfg.get("tree_name", "sbn_tree"),
+            hit_branches=data_cfg.get("hit_branches", []),
+            n_channels=data_cfg.get("n_channels") or None,
+            sort_events=True,
+            tpc_branches=data_cfg.get("tpc_branches") or None,
+            max_events=data_cfg.get("max_events") or None,
+            **sparse_kwargs,
+        )
+        save_events_path = train_cfg.get("save_events_path") or data_cfg.get("save_events_path")
+        if save_events_path:
+            dataset.save_events(save_events_path)
+    elif events_path:
+        from sbn_anomaly.data.sparse_window_dataset import SparseWindowDatasetPyG
+        logger.info("Loading graph_vae events from %s", events_path)
+        dataset = SparseWindowDatasetPyG.from_npz(events_path, **sparse_kwargs)
+    else:
+        windows = _load_windows_array(data_cfg)
+        logger.info("Loaded dense windows %s", (windows.shape,))
+        dataset = GraphReconDataset(
+            windows,
+            radius=sparse_kwargs["radius"],
+            prune_inactive=sparse_kwargs["prune_inactive"],
+            node_feature_names=sparse_kwargs["node_features"],
+            channel_map=sparse_kwargs["channel_map"],
+            edge_mode=sparse_kwargs["edge_mode"],
+            standardize=sparse_kwargs["standardize"],
+        )
+
+    # Persist standardization so inference normalizes identically.
+    ckpt_dir = train_cfg.get("checkpoint_dir")
+    if ckpt_dir:
+        Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+        np.savez(Path(ckpt_dir) / "standardization.npz", **dataset.standardization())
+
+    validation_split = float(train_cfg.get("validation_split", 0.0) or 0.0)
+    validation_seed = int(train_cfg.get("validation_seed", 42))
+    train_dataset, val_dataset = _split_dataset_for_validation(dataset, validation_split, validation_seed)
+
+    batch_size = int(train_cfg.get("batch_size", 16))
+    num_workers = int(train_cfg.get("num_workers", 4))
+    persistent = num_workers > 0
+    loader = PyGDataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                           num_workers=num_workers, persistent_workers=persistent)
+    eval_loader = PyGDataLoader(train_dataset, batch_size=batch_size, shuffle=False,
+                                num_workers=num_workers, persistent_workers=persistent)
+    validation_loader = None
+    if val_dataset is not None and len(val_dataset) > 0:
+        validation_loader = PyGDataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                          num_workers=num_workers, persistent_workers=persistent)
+
+    model = GraphVAE(
+        in_dim=dataset.node_feat_dim,
+        latent_dim=int(model_cfg.get("latent_dim", 12)),
+        hidden=int(model_cfg.get("gnn_hidden", 64)),
+        enc_layers=int(model_cfg.get("gnn_layers", 2)),
+        dec_hidden=int(model_cfg.get("dec_hidden", 64)),
+        dropout=float(model_cfg.get("dropout", 0.1)),
+        mask_ratio=float(model_cfg.get("mask_ratio", 0.15)),
+        use_channel_idx=bool(model_cfg.get("use_channel_idx", True)),
+        conv=str(model_cfg.get("conv", "sage")),
+    )
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info("GraphVAE params=%d  in_dim=%d  latent=%d", n_params,
+                dataset.node_feat_dim, int(model_cfg.get("latent_dim", 12)))
+
+    trainer = GraphVAETrainer(
+        model=model,
+        lr=float(train_cfg.get("lr", 1e-3)),
+        weight_decay=float(train_cfg.get("weight_decay", 1e-5)),
+        max_epochs=int(train_cfg.get("max_epochs", 30)),
+        checkpoint_dir=ckpt_dir,
+        log_interval=int(train_cfg.get("log_interval", 50)),
+        anomaly_threshold=train_cfg.get("anomaly_threshold"),
+        save_best_only=bool(train_cfg.get("save_best_only", False)),
+        use_amp=bool(train_cfg.get("use_amp", False)),
+        beta=float(train_cfg.get("beta", 1.0)),
+        beta_warmup_epochs=int(train_cfg.get("beta_warmup_epochs", 0)),
+    )
+    trainer.train(loader, validation_loader=validation_loader,
+                  metrics_max_samples=int(train_cfg.get("metrics_max_samples", 20000)))
+
+    output = train_cfg.get("output_path")
+    if output:
+        trainer.save(output)
+    plot_dir = ckpt_dir or (str(Path(output).parent) if output else None)
+    trainer.save_training_history(plot_dir)
+    trainer.save_training_plots(plot_dir)
+    logger.info("GraphVAE training complete.")
+
+
 def _train_pmt(cfg: dict) -> None:
     import numpy as np
     from torch.utils.data import DataLoader
@@ -695,6 +848,8 @@ def _train_gnn(cfg: dict, root_files: list[str] | None = None) -> None:
     node_feature_names = data_cfg.get("node_features") or None
     window_size = int(data_cfg.get("window_size", 20))
     n_bins = int(data_cfg.get("n_temporal_bins", 4))
+    channel_map = data_cfg.get("channel_map")
+    edge_mode = str(data_cfg.get("edge_mode", "sequential"))
 
     events_path = data_cfg.get("events_path")
 
@@ -708,6 +863,8 @@ def _train_gnn(cfg: dict, root_files: list[str] | None = None) -> None:
             radius=radius,
             node_features=node_feature_names,
             prune_inactive=True,
+            channel_map=channel_map,
+            edge_mode=edge_mode,
         )
         if events_path and not root_files:
             logger.info("Loading sparse events from %s ...", events_path)
@@ -768,6 +925,8 @@ def _train_gnn(cfg: dict, root_files: list[str] | None = None) -> None:
             radius=radius,
             prune_inactive=True,
             node_feature_names=node_feature_names,
+            channel_map=channel_map,
+            edge_mode=edge_mode,
         )
         num_channels = dataset.num_nodes
         frame_feat_dim = dataset.node_feat_dim

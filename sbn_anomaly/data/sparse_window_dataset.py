@@ -25,7 +25,10 @@ import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 
-from sbn_anomaly.data.graph_window_dataset_pyg import build_sparse_edge_index
+from sbn_anomaly.data.graph_window_dataset_pyg import (
+    build_sparse_edge_index,
+    _build_edge_index,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +115,12 @@ class SparseWindowDatasetPyG(Dataset):
         wires_flat: Optional[np.ndarray] = None,
         planes_flat: Optional[np.ndarray] = None,
         tpcs_flat: Optional[np.ndarray] = None,
+        channel_map: Optional[str] = None,
+        edge_mode: str = "sequential",
+        reconstruction: bool = False,
+        standardize: bool = False,
+        feature_mean: Optional[np.ndarray] = None,
+        feature_std: Optional[np.ndarray] = None,
     ) -> None:
         self._channels_flat = np.asarray(channels_flat, dtype=np.int64)
         self._integrals_flat = np.asarray(integrals_flat, dtype=np.float32)
@@ -146,16 +155,27 @@ class SparseWindowDatasetPyG(Dataset):
         self.node_feat_dim = n_bins * self.n_node_features
         self.hit_branches = self.node_features
 
+        # Reconstruction mode: each sample is ONE window (frame), target = itself
+        # (graph autoencoder). Forecasting mode: history past frames + 1 target.
+        self.reconstruction = bool(reconstruction)
+        self.standardize = bool(standardize)
+
         n_events = len(self._offsets) - 1
-        self.events_per_sample = (history + 1) * window_size
-        self._starts = list(range(0, n_events - self.events_per_sample + 1, stride))
+        if self.reconstruction:
+            self.events_per_sample = window_size
+            self._starts = list(range(0, n_events - window_size + 1, stride))
+        else:
+            self.events_per_sample = (history + 1) * window_size
+            self._starts = list(range(0, n_events - self.events_per_sample + 1, stride))
 
         self._bin_splits = np.array_split(np.arange(window_size), n_bins)
 
-        logger.info(
-            "Building edge index: %d nodes, radius=%d", self.num_nodes, radius
+        self.channel_map = channel_map
+        self.edge_mode = str(edge_mode)
+        self.edge_index_full = _build_edge_index(
+            self.num_nodes, radius=radius,
+            channel_map=channel_map, edge_mode=self.edge_mode,
         )
-        self.edge_index_full = build_sparse_edge_index(self.num_nodes, radius=radius)
         self._edge_src_np = self.edge_index_full[0].numpy().copy()
         self._edge_dst_np = self.edge_index_full[1].numpy().copy()
 
@@ -170,12 +190,49 @@ class SparseWindowDatasetPyG(Dataset):
         logger.info("Pre-aggregating events (%d events)...", len(self._offsets) - 1)
         self._build_event_aggregates()
 
+        # Per-feature standardization (reconstruction/VAE only). Use provided
+        # good-run stats, else fit from a sample of frames.
+        self.feature_mean = None
+        self.feature_std = None
+        if self.reconstruction and self.standardize:
+            if feature_mean is not None and feature_std is not None:
+                self.feature_mean = np.asarray(feature_mean, dtype=np.float32)
+                self.feature_std = np.asarray(feature_std, dtype=np.float32)
+            else:
+                self.feature_mean, self.feature_std = self._fit_standardization()
+            self.feature_std = np.where(self.feature_std < 1e-6, 1.0,
+                                        self.feature_std).astype(np.float32)
+
         logger.info(
             "SparseWindowDatasetPyG ready: %d samples, %d channels, "
-            "%d features/frame, history=%d, window_size=%d, n_bins=%d",
+            "%d features/frame, mode=%s, window_size=%d, n_bins=%d",
             len(self._starts), self.num_nodes, self.node_feat_dim,
-            self.history, self.window_size, self.n_bins,
+            "recon" if self.reconstruction else "forecast",
+            self.window_size, self.n_bins,
         )
+
+    def _fit_standardization(self, max_frames: int = 500):
+        """Fit per-feature mean/std from active channels over a sample of frames."""
+        starts = self._starts
+        if len(starts) > max_frames:
+            rng = np.random.default_rng(0)
+            starts = [starts[i] for i in rng.choice(len(starts), max_frames, replace=False)]
+        rows = []
+        for s in starts:
+            frame = self._compute_frame(s, s + self.window_size).reshape(self.num_nodes, -1)
+            act = np.abs(frame).sum(axis=1) > 1e-6
+            if act.any():
+                rows.append(frame[act])
+        if not rows:
+            return (np.zeros(self.node_feat_dim, np.float32),
+                    np.ones(self.node_feat_dim, np.float32))
+        flat = np.concatenate(rows, axis=0)
+        return flat.mean(axis=0).astype(np.float32), flat.std(axis=0).astype(np.float32)
+
+    def standardization(self) -> dict:
+        mean = self.feature_mean if self.feature_mean is not None else np.zeros(self.node_feat_dim, np.float32)
+        std = self.feature_std if self.feature_std is not None else np.ones(self.node_feat_dim, np.float32)
+        return {"feature_mean": mean, "feature_std": std}
 
     # ------------------------------------------------------------------
     # Class-method constructors
@@ -405,6 +462,26 @@ class SparseWindowDatasetPyG(Dataset):
 
     def __getitem__(self, idx: int) -> Data:
         start = self._starts[idx]
+
+        if self.reconstruction:
+            frame = self._compute_frame(start, start + self.window_size).reshape(
+                self.num_nodes, -1).astype(np.float32)
+            if self.standardize and self.feature_mean is not None:
+                feats = (frame - self.feature_mean) / self.feature_std
+            else:
+                feats = frame
+            feats_t = torch.from_numpy(feats.astype(np.float32))
+            x = torch.cat([self._channel_idx, feats_t], dim=1)
+            if self.prune_inactive:
+                activity = np.abs(frame).sum(axis=1)
+                active = np.where(activity > 1e-6)[0]
+                if active.size == 0:
+                    active = np.zeros(1, dtype=np.int64)
+                active_idx = torch.from_numpy(active.astype(np.int64))
+                return self._make_pruned_data(x, feats_t, active_idx)
+            return Data(x=x, y=feats_t, edge_index=self.edge_index_full,
+                        active_mask=torch.arange(self.num_nodes),
+                        num_nodes_original=self.num_nodes)
 
         frames = []
         for w in range(self.history + 1):

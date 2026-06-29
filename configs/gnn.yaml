@@ -36,7 +36,18 @@ data:
   n_temporal_bins: 4
   stride: 20
   adjacency_radius: 4
-  
+
+  # Graph edge construction:
+  #   edge_mode: sequential (default) | electronics | wire | both
+  #     - sequential  : connect channels within +/- adjacency_radius in offline-channel id
+  #     - electronics : ASIC cliques + per-FEMB readout-chain adjacency (coherent-noise / board graph)
+  #     - wire        : adjacent wires within each (plane, TPC, side)
+  #     - both        : union of electronics + wire
+  # channel_map is required for any non-sequential mode; radius applies to the
+  # FEMB readout-chain (electronics) and wire (wire) adjacencies.
+  channel_map: configs/SBNDTPCChannelMap_v2_with_positions.csv
+  edge_mode: electronics
+
   # Per-channel node features computed for each temporal bin
   # Default: [sum, min, max, stdev, count]
   # Options: sum, min, max, stdev, mean, count
