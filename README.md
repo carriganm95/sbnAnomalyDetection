@@ -2,10 +2,14 @@
 
 Streaming anomaly detection pipeline for the [Short-Baseline Neutrino (SBN)](https://sbn.fnal.gov/) experiment at Fermilab.
 
-Two complementary tracks share the same GNN+GRU forecasting core:
+There are two data tracks and, on the hit-level track, two model styles:
 
-- **Hit-level** (reconstructed) — node features are per-channel hit aggregates. See below.
-- **Raw-ADC** — a 1-D convolutional **VAE** compresses each channel's raw ADC waveform into a latent that feeds the same forecaster. See **[RAW_ADC_WORKFLOW.md](RAW_ADC_WORKFLOW.md)** (model types `raw_vae` and `raw_gnn`, configs `configs/raw_vae.yaml` and `configs/raw_gnn.yaml`).
+- **Hit-level** (reconstructed) — node features are per-channel hit aggregates over a window of events. Two interchangeable models:
+  - **GNN+GRU forecaster** (`GNNForecasterPyG`, model type `gnn`) — predicts the next window; flags *changes/transients*. See below.
+  - **Graph VAE** (`GraphVAE`, model type `graph_vae`) — a graph autoencoder that *reconstructs* the current window; flags windows that are *absolutely* off-nominal (no warmup, no adapting-away). See [Graph VAE](#graph-vae--reconstruction-anomaly-detection).
+- **Raw-ADC** — a 1-D convolutional **VAE** compresses each channel's raw ADC waveform into a latent that feeds the forecaster (a genuine two-stage pipeline). See **[RAW_ADC_WORKFLOW.md](RAW_ADC_WORKFLOW.md)** (model types `raw_vae` and `raw_gnn`).
+
+> Note: the Graph VAE is a *single* model — its encoder and decoder are GNN layers (message passing on the electronics graph), trained end-to-end as a VAE. It is not "a GNN followed by an autoencoder." The only true two-stage pipeline is the raw-ADC track (conv VAE → GNN).
 
 ## Primary Architecture — GNN Forecaster
 
@@ -197,6 +201,92 @@ The `inference.input_path` in `configs/gnn.yaml` points at the windows/events fi
 | `node_scores` | `(N_windows, N_channels)` | Per-channel MSE, NaN for inactive channels |
 | `event_index` | `(N_windows,)` | Window index |
 | `is_anomaly` | `(N_windows,)` | Boolean flag (only when `inference.threshold` is set) |
+
+## Graph VAE — Reconstruction Anomaly Detection
+
+A reconstruction-based alternative to the GRU forecaster on the **same** hit-level
+windows and electronics graph (`model_type: graph_vae`). Instead of predicting the
+next window, it encodes one window's per-channel feature graph and reconstructs
+it, trained on **good runs only**. Anomalous windows reconstruct poorly.
+
+### Why it exists (vs the forecaster)
+
+The forecaster conditions on a window's recent history, so it flags *changes* but
+can "adapt to" a persistently-bad state and stop flagging it. The graph VAE
+compares each window to the **absolute** learned nominal, so a persistently-bad
+window stays flagged, with no GRU warmup. Use the forecaster for "did something
+just change?", the VAE for "is this window off-nominal right now?".
+
+### Architecture (one model, not two stages)
+
+```
+one window's graph (nodes = channels, features = per-channel aggregates)
+        │   electronics edges (ASIC cliques + FEMB readout chain)
+        ▼
+  SAGEConv encoder   ← message passing keeps a self-term so a lone bad
+        │              channel isn't smoothed away by its board-mates
+        ▼
+  per-node variational bottleneck  (mu / logvar → z)   ← masked/denoising:
+        │                                                random nodes rebuilt
+        ▼                                                from neighbours
+  decoder → reconstruct node features
+        │
+        ▼
+  per-channel reconstruction error  →  aggregate → per-window anomaly score
+```
+
+The encoder/decoder **are** GNN layers — the message passing is inside the
+autoencoder, trained end-to-end as a β-VAE (reconstruction MSE + KL).
+
+### Window scoring
+
+Per-channel reconstruction error is aggregated to a per-window score; the
+aggregator is the key knob and is applied as cheap post-processing, so you can
+compare options on saved errors without re-running the model:
+
+| Aggregator | Best for |
+|------------|----------|
+| `mean` | diffuse, many-channel shifts (dilutes localized faults) |
+| `max` | single-channel faults (noisy) |
+| `topk_mean` | localized faults, robust middle ground |
+| `group_max_mean` (default) | coherent ASIC/FEMB failures — pools error within electronics groups, reports the worst group |
+
+### Run it (no dense windows needed)
+
+Input is the compact **sparse events npz** (the default `materialize_windows`
+output), ROOT files directly, or a dense windows array — the sparse paths form
+single-window graphs on the fly.
+
+```bash
+# events npz (compact, "without windows")
+python -m sbn_anomaly.data.materialize_windows --config configs/graph_vae.yaml \
+    --root-file-list data/filelist_train.txt --output data/events_train.npz
+
+# train on good runs (or stream from ROOT with --root-file-list)
+sbn-train --config configs/graph_vae.yaml
+
+# score a test set -> per-window per-channel error + aggregated score + provenance
+sbn-infer --config configs/graph_vae.yaml --output gvae_scores.npz
+
+# try different window aggregators on the saved errors, no model re-run
+python -m sbn_anomaly.infer.window_score --scores gvae_scores.npz \
+    --aggregator group_max_mean \
+    --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv --group-level femb
+```
+
+Inference output (`gvae_scores.npz`):
+
+| Array | Shape | Description |
+|-------|-------|-------------|
+| `node_scores` | `(N_windows, N_channels)` | per-channel reconstruction error, NaN = inactive |
+| `scores` | `(N_windows,)` | aggregated per-window score (default `group_max_mean`) |
+| `provenance` | `(N_windows, 3)` | `(run, subrun, event)` of each window's first event |
+| `is_anomaly` | `(N_windows,)` | only when `inference.threshold` is set |
+
+Key config knobs (`configs/graph_vae.yaml`): `model.conv` (`sage`/`gcn`),
+`model.latent_dim`, `model.mask_ratio` (denoising), `data.edge_mode`
+(`electronics` recommended), `training.beta`/`beta_warmup_epochs`, and
+`inference.window_aggregator` / `group_level`.
 
 ## Raw-ADC VAE Pipeline
 
