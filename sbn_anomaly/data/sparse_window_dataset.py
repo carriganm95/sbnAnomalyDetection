@@ -32,7 +32,16 @@ from sbn_anomaly.data.graph_window_dataset_pyg import (
 
 logger = logging.getLogger(__name__)
 
-_ALLOWED_FEATURES = {"sum", "min", "max", "stdev", "mean", "count"}
+_ALLOWED_FEATURES = {
+    "sum", "min", "max", "stdev", "mean", "count",
+    # rate / occupancy (normalized by events-in-bin)
+    "occupancy",   # fraction of events in the bin with >=1 hit on the channel
+    "hit_rate",    # average hits per event
+    # timing (require a per-hit time branch -> times_flat)
+    "time_mean",   # mean hit time per channel per bin
+    "time_spread", # stdev of hit time per channel per bin
+}
+_TIMING_FEATURES = {"time_mean", "time_spread"}
 
 
 def _run_subrun_evt_key(meta: dict, tpc_branches: List[str]) -> tuple:
@@ -151,6 +160,12 @@ class SparseWindowDatasetPyG(Dataset):
         if invalid:
             raise ValueError(f"Unknown node_features: {invalid}")
         self.node_features = list(node_features)
+        if (set(self.node_features) & _TIMING_FEATURES) and times_flat is None:
+            raise ValueError(
+                "Timing features (time_mean/time_spread) require per-hit times. "
+                "Materialize events with a hit-time branch so 'times_flat' is "
+                "present (it is saved by save_events when available)."
+            )
         self.n_node_features = len(self.node_features)
         self.node_feat_dim = n_bins * self.n_node_features
         self.hit_branches = self.node_features
@@ -546,11 +561,14 @@ class SparseWindowDatasetPyG(Dataset):
     def _build_event_aggregates(self) -> None:
         """Pre-aggregate raw hits per channel for each event into CSR format.
 
-        Stores sorted unique (channel, [sum, count, min, max, sum_sq]) arrays
-        so _compute_frame can use np.bincount instead of sorting raw hits on
-        every sample access.  columns: 0=sum 1=count 2=min 3=max 4=sum_sq
+        Stores sorted unique (channel, [sum, count, min, max, sum_sq,
+        time_sum, time_sum_sq]) arrays so _compute_frame can use np.bincount
+        instead of sorting raw hits on every sample access.
+        columns: 0=sum 1=count 2=min 3=max 4=sum_sq 5=time_sum 6=time_sum_sq
+        (time columns are 0 when no per-hit times are available).
         """
         n_events = len(self._offsets) - 1
+        have_times = self._times_flat is not None
         ch_parts: list[np.ndarray] = []
         feat_parts: list[np.ndarray] = []
         agg_offsets = np.zeros(n_events + 1, dtype=np.int64)
@@ -560,10 +578,13 @@ class SparseWindowDatasetPyG(Dataset):
             h_end = int(self._offsets[i + 1])
             ch = self._channels_flat[h_start:h_end]
             val = self._integrals_flat[h_start:h_end]
+            tval = self._times_flat[h_start:h_end] if have_times else None
 
             mask = ch < self.num_nodes
             ch = ch[mask]
             val = val[mask]
+            if have_times:
+                tval = tval[mask]
 
             if ch.size == 0:
                 agg_offsets[i + 1] = agg_offsets[i]
@@ -574,12 +595,16 @@ class SparseWindowDatasetPyG(Dataset):
             val_s = val[order]
             unique_chs, starts, counts = np.unique(ch_s, return_index=True, return_counts=True)
 
-            feats = np.empty((len(unique_chs), 5), dtype=np.float32)
+            feats = np.zeros((len(unique_chs), 7), dtype=np.float32)
             feats[:, 0] = np.add.reduceat(val_s, starts)           # sum
             feats[:, 1] = counts.astype(np.float32)                # count
             feats[:, 2] = np.minimum.reduceat(val_s, starts)       # min
             feats[:, 3] = np.maximum.reduceat(val_s, starts)       # max
             feats[:, 4] = np.add.reduceat(val_s * val_s, starts)   # sum_sq
+            if have_times:
+                tval_s = tval[order]
+                feats[:, 5] = np.add.reduceat(tval_s, starts)            # time_sum
+                feats[:, 6] = np.add.reduceat(tval_s * tval_s, starts)   # time_sum_sq
 
             ch_parts.append(unique_chs)
             feat_parts.append(feats)
@@ -589,7 +614,7 @@ class SparseWindowDatasetPyG(Dataset):
             np.concatenate(ch_parts) if ch_parts else np.empty(0, dtype=np.int64)
         )
         self._agg_feat_flat = (
-            np.concatenate(feat_parts) if feat_parts else np.empty((0, 5), dtype=np.float32)
+            np.concatenate(feat_parts) if feat_parts else np.empty((0, 7), dtype=np.float32)
         )
         self._agg_offsets = agg_offsets
 
@@ -606,8 +631,11 @@ class SparseWindowDatasetPyG(Dataset):
         need_min = "min" in self.node_features
         need_max = "max" in self.node_features
         need_stdev = "stdev" in self.node_features
+        need_occ = "occupancy" in self.node_features
+        need_time = bool(set(self.node_features) & _TIMING_FEATURES)
 
         for b_idx, split in enumerate(self._bin_splits):
+            n_events_bin = max(1, len(split))  # events in this bin (occupancy/rate denom)
             ch_parts = []
             feat_parts = []
             for i in split:
@@ -622,13 +650,20 @@ class SparseWindowDatasetPyG(Dataset):
                 continue
 
             ch = np.concatenate(ch_parts)
-            feat = np.concatenate(feat_parts)  # (n_hits, 5)
+            feat = np.concatenate(feat_parts)  # (n_hits, 7)
 
             # Accumulate sum/count/sum_sq via bincount (O(n + N), no sort needed)
             sums = np.bincount(ch, weights=feat[:, 0], minlength=N).astype(np.float32)
             counts = np.bincount(ch, weights=feat[:, 1], minlength=N).astype(np.float32)
             if need_stdev:
                 sum_sq = np.bincount(ch, weights=feat[:, 4], minlength=N).astype(np.float32)
+            # event_counts: number of events with >=1 hit (each event contributes
+            # a channel once in the aggregates) -> occupancy numerator.
+            if need_occ:
+                event_counts = np.bincount(ch, minlength=N).astype(np.float32)
+            if need_time:
+                time_sum = np.bincount(ch, weights=feat[:, 5], minlength=N).astype(np.float32)
+                time_sum_sq = np.bincount(ch, weights=feat[:, 6], minlength=N).astype(np.float32)
 
             # min/max via scatter (O(n), no sort needed)
             if need_min:
@@ -653,6 +688,16 @@ class SparseWindowDatasetPyG(Dataset):
                     mean = np.where(counts > 0, sums / np.maximum(counts, 1), 0.0)
                     var = np.where(counts > 0, sum_sq / np.maximum(counts, 1) - mean ** 2, 0.0)
                     frame[:, b_idx, fi] = np.sqrt(np.maximum(var, 0.0))
+                elif fname == "occupancy":
+                    frame[:, b_idx, fi] = event_counts / n_events_bin
+                elif fname == "hit_rate":
+                    frame[:, b_idx, fi] = counts / n_events_bin
+                elif fname == "time_mean":
+                    frame[:, b_idx, fi] = np.where(counts > 0, time_sum / np.maximum(counts, 1), 0.0)
+                elif fname == "time_spread":
+                    tmean = np.where(counts > 0, time_sum / np.maximum(counts, 1), 0.0)
+                    tvar = np.where(counts > 0, time_sum_sq / np.maximum(counts, 1) - tmean ** 2, 0.0)
+                    frame[:, b_idx, fi] = np.sqrt(np.maximum(tvar, 0.0))
 
         return frame
 

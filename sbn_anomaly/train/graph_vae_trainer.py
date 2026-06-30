@@ -70,11 +70,26 @@ class GraphVAETrainer(BaseTrainer):
         return recon + self._effective_beta() * kl
 
     @torch.no_grad()
+    def _eval_forward(self, data):
+        """Forward with the model in eval mode (masking off, z = mu).
+
+        Metrics and reconstruction plots must reflect the *clean* reconstruction,
+        not the train-time masked/sampled one, or they look pessimistic.
+        """
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            return self.model(data)
+        finally:
+            if was_training:
+                self.model.train()
+
+    @torch.no_grad()
     def compute_scores(self, batch) -> Optional[torch.Tensor]:
         from torch_geometric.nn import global_max_pool, global_mean_pool
 
         data = batch.to(self.device)
-        x_hat, _, _, _ = self.model(data)
+        x_hat, _, _, _ = self._eval_forward(data)
         per_node = ((x_hat - data.y.float()) ** 2).mean(dim=-1)  # (N,)
         gid = data.batch
         wmean = global_mean_pool(per_node.unsqueeze(1), gid).squeeze(1)
@@ -84,7 +99,7 @@ class GraphVAETrainer(BaseTrainer):
     @torch.no_grad()
     def compute_reconstruction_pair(self, batch):
         data = batch.to(self.device)
-        x_hat, _, _, _ = self.model(data)
+        x_hat, _, _, _ = self._eval_forward(data)
         return data.y.float(), x_hat
 
     def collect_scores(self, loader) -> "tuple[np.ndarray, np.ndarray]":

@@ -46,7 +46,12 @@ data:
   edge_mode: electronics
 
   # Per-channel node features per temporal bin (sets F = n_bins * len(features)).
-  node_features: [sum, min, max, mean, stdev, count]
+  # Integral moments: sum, mean, stdev, min, max, count
+  # Rate/occupancy:   occupancy (fraction of events with a hit), hit_rate (hits/event)
+  # Timing:           time_mean, time_spread  (require a per-hit time branch)
+  # A stronger, less redundant mix than six integral moments:
+  node_features: [sum, mean, stdev, occupancy, time_mean, time_spread]
+  # node_features: [sum, min, max, mean, stdev, count]   # original integral-only set
 
 model:
   latent_dim: 12          # per-node bottleneck

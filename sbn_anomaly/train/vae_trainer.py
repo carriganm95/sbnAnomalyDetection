@@ -103,11 +103,23 @@ class VAETrainer(BaseTrainer):
     @torch.no_grad()
     def compute_scores(self, batch: tuple) -> torch.Tensor:
         x = batch[0].to(self.device)
-        return self.model.anomaly_score(x, beta=self.score_beta)
+        was_training = self.model.training
+        self.model.eval()  # eval: BatchNorm uses running stats (no pollution), z=mu
+        try:
+            return self.model.anomaly_score(x, beta=self.score_beta)
+        finally:
+            if was_training:
+                self.model.train()
 
     @torch.no_grad()
     def compute_reconstruction_pair(self, batch: tuple) -> tuple[torch.Tensor, torch.Tensor]:
         x = batch[0].to(self.device)
         x2 = x if x.dim() == 2 else x.squeeze(1)
-        x_hat, _, _, _ = self.model(x2)
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            x_hat, _, _, _ = self.model(x2)
+        finally:
+            if was_training:
+                self.model.train()
         return x2, x_hat
