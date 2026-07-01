@@ -548,7 +548,8 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
     elif events_path:
         from sbn_anomaly.data.sparse_window_dataset import SparseWindowDatasetPyG
         logger.info("Loading graph_vae events from %s", events_path)
-        dataset = SparseWindowDatasetPyG.from_npz(events_path, **sparse_kwargs)
+        dataset = SparseWindowDatasetPyG.from_npz(
+            events_path, n_channels=data_cfg.get("n_channels"), **sparse_kwargs)
     else:
         windows = _load_windows_array(data_cfg)
         logger.info("Loaded dense windows %s", (windows.shape,))

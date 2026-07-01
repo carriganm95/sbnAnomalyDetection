@@ -416,7 +416,33 @@ class SparseWindowDatasetPyG(Dataset):
         are loaded automatically when present; older files without them load fine.
         """
         data = np.load(events_path, allow_pickle=False)
-        n_channels = int(data["n_channels"])
+        channels_flat = data["channels_flat"]
+        stored_n = int(data["n_channels"])
+        actual_max = int(channels_flat.max()) if channels_flat.size else -1
+
+        # n_channels resolution: explicit override (from config) wins; otherwise
+        # infer from the data when the stored value is missing/too small (an npz
+        # materialized without n_channels can store 0, which drops all channels).
+        override = dataset_kwargs.pop("n_channels", None)
+        if override:
+            n_channels = int(override)
+        elif stored_n <= 0 or actual_max >= stored_n:
+            n_channels = actual_max + 1
+            logger.warning(
+                "events npz stored n_channels=%d but max channel id=%d; using "
+                "n_channels=%d (pass data.n_channels to override).",
+                stored_n, actual_max, n_channels,
+            )
+        else:
+            n_channels = stored_n
+
+        if channels_flat.size == 0:
+            logger.warning(
+                "events npz '%s' has NO hits (channels_flat is empty). It was "
+                "likely materialized with wrong hit branches; re-materialize.",
+                events_path,
+            )
+
         meta_kwargs: dict = {}
         for key in ("evt_run", "evt_subrun", "evt_num", "evt_file_idx"):
             if key in data:
@@ -427,7 +453,7 @@ class SparseWindowDatasetPyG(Dataset):
             if key in data:
                 meta_kwargs[key] = data[key]
         return cls(
-            channels_flat=data["channels_flat"],
+            channels_flat=channels_flat,
             integrals_flat=data["integrals_flat"],
             offsets=data["offsets"],
             n_channels=n_channels,

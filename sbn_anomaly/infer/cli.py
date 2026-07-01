@@ -451,6 +451,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
         logger.info("Loading sparse events for graph_vae from %s", input_path)
         dataset = SparseWindowDatasetPyG.from_npz(
             input_path,
+            n_channels=data_cfg.get("n_channels"),
             window_size=int(data_cfg.get("window_size", 20)),
             n_bins=int(data_cfg.get("n_temporal_bins", 4)),
             stride=int(data_cfg.get("stride", 1)),
