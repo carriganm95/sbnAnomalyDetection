@@ -553,6 +553,30 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str) -> None:
     logger.info("Saved graph_vae scores for %d windows to %s (aggregator=%s)",
                 node_scores.shape[0], out_path, aggregator)
 
+    # Plot the per-window anomaly-score distribution and score-over-time next to
+    # the output, unless disabled.
+    if bool(infer_cfg.get("plot", True)) and scores.size:
+        try:
+            from sbn_anomaly.infer.window_score import max_score
+            from sbn_anomaly.utils.plotting import (
+                save_score_distribution_plot,
+                save_score_over_time_plot,
+            )
+            plot_dir = out_path.parent
+            thr = float(threshold) if threshold is not None else None
+            save_score_distribution_plot(
+                scores, plot_dir, filename=out_path.stem + "_score_distribution.png",
+                threshold=thr, title=f"Window score distribution ({aggregator})",
+            )
+            save_score_over_time_plot(
+                scores, max_score(node_scores), plot_dir,
+                filename=out_path.stem + "_score_over_time.png", threshold=thr,
+                title="Window anomaly score over time",
+            )
+            logger.info("Saved score plots next to %s", out_path)
+        except Exception as exc:
+            logger.warning("Failed to save score plots: %s", exc)
+
 
 def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
     """Run per-node GNN inference and save results as a compressed npz archive.

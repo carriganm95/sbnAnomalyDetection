@@ -19,8 +19,8 @@ def resolve_root_files(inputs: Iterable[str]) -> list[str]:
     Each element in *inputs* may be:
     - a literal ROOT file path
     - a glob pattern (e.g. ``/data/*.root``)
-    - a manifest file (``.txt``/``.lst``/``.csv``) containing one ROOT path
-      per line, with ``#`` comments allowed
+    - a manifest file (``.txt``/``.lst``/``.list``/``.filelist``/``.csv``)
+      containing one ROOT path per line, with ``#`` comments allowed
 
     Empty lines and comments are ignored. Manifest entries may themselves be
     glob patterns or literal paths.
@@ -35,7 +35,9 @@ def resolve_root_files(inputs: Iterable[str]) -> list[str]:
 def _resolve_single_root_input(item: str) -> list[str]:
     parsed = urlparse(item)
 
-    if not parsed.scheme and os.path.isfile(item) and item.lower().endswith((".txt", ".lst", ".csv")):
+    if not parsed.scheme and os.path.isfile(item) and item.lower().endswith(
+        (".txt", ".lst", ".list", ".filelist", ".csv")
+    ):
         return _resolve_manifest_file(item)
 
     matches = _glob.glob(item)
