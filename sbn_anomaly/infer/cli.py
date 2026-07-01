@@ -29,7 +29,8 @@ def main(argv: list[str] | None = None) -> int:
         "--input",
         type=str,
         default=None,
-        help="Path to .npy feature file (tpc/pmt/window modes).",
+        help="Input to score. Overrides inference.input_path/data.events_path for "
+             "gnn/raw_gnn/graph_vae (events or windows npz); .npy features for tpc/pmt/window.",
     )
     parser.add_argument(
         "--root-files",
@@ -101,11 +102,11 @@ def main(argv: list[str] | None = None) -> int:
     # raw_gnn reuses the same path: it scores a pre-computed per-channel latent
     # windows npz (from sbn_anomaly.data.build_raw_latents).
     if model_type in ("gnn", "raw_gnn"):
-        _infer_gnn(cfg, checkpoint, args.output)
+        _infer_gnn(cfg, checkpoint, args.output, input_override=args.input)
         return 0
 
     if model_type == "graph_vae":
-        _infer_graph_vae(cfg, checkpoint, args.output)
+        _infer_graph_vae(cfg, checkpoint, args.output, input_override=args.input)
         return 0
 
     # raw_vae streams raw-ADC ntuples and scores each channel waveform directly.
@@ -406,7 +407,7 @@ def _infer_raw_vae(
     )
 
 
-def _infer_graph_vae(cfg: dict, checkpoint: str, output: str) -> None:
+def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: str | None = None) -> None:
     """Score windows with the graph VAE.
 
     Saves per-window per-channel reconstruction error (`node_scores`, NaN for
@@ -425,9 +426,11 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str) -> None:
     model_cfg = cfg.get("model", {})
     infer_cfg = cfg.get("inference", {})
 
-    input_path = infer_cfg.get("input_path") or data_cfg.get("events_path") or data_cfg.get("windows_path")
+    input_path = (input_override or infer_cfg.get("input_path")
+                  or data_cfg.get("events_path") or data_cfg.get("windows_path"))
     if not input_path:
-        raise ValueError("Set inference.input_path (events npz or dense windows) for graph_vae.")
+        raise ValueError("Set --input, inference.input_path, or data.events_path for graph_vae.")
+    logger.info("graph_vae inference input: %s", input_path)
 
     # Load training standardization (saved next to the checkpoint).
     std_path = data_cfg.get("standardization_path") or str(Path(checkpoint).parent / "standardization.npz")
@@ -578,7 +581,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str) -> None:
             logger.warning("Failed to save score plots: %s", exc)
 
 
-def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
+def _infer_gnn(cfg: dict, checkpoint: str, output: str, input_override: str | None = None) -> None:
     """Run per-node GNN inference and save results as a compressed npz archive.
             input_dim = model_cfg.get("input_dim", 256)
             features = _truncate_or_pad(features, input_dim)
@@ -600,7 +603,8 @@ def _infer_gnn(cfg: dict, checkpoint: str, output: str) -> None:
     infer_cfg = cfg.get("inference", {})
 
     input_path = (
-        infer_cfg.get("input_path")
+        input_override
+        or infer_cfg.get("input_path")
         or data_cfg.get("events_path")
         or data_cfg.get("windows_path")
     )
