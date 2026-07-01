@@ -155,17 +155,27 @@ def _aggregate_file(path: str, aggregator: str, group_args) -> np.ndarray:
     return aggregate_windows(node_scores, aggregator, groups=groups)
 
 
-def _plot_overlay(score_lists, labels, path, aggregator, threshold=None):
+def _plot_overlay(score_lists, labels, path, aggregator, threshold=None, nbins=60):
     import matplotlib
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
+    finite = [np.asarray(s)[np.isfinite(s)] for s in score_lists]
+    nonempty = [f for f in finite if f.size]
+    allv = np.concatenate(nonempty) if nonempty else np.array([0.0, 1.0])
+    lo, hi = float(np.min(allv)), float(np.max(allv))
+    if hi <= lo:
+        hi = lo + 1.0
+    edges = np.linspace(lo, hi, nbins + 1)  # shared bin edges for every series
+
     fig, ax = plt.subplots(figsize=(8, 4))
-    for s, lab in zip(score_lists, labels):
-        v = np.asarray(s)[np.isfinite(s)]
-        ax.hist(v, bins=60, alpha=0.5, density=True, label=f"{lab} (n={v.size})")
+    for v, lab in zip(finite, labels):
+        ax.hist(v, bins=edges, alpha=0.5, density=True, label=f"{lab} (n={v.size})")
     if threshold is not None:
-        ax.axvline(threshold, color="k", ls="--", lw=1, label=f"threshold={threshold:g}")
+        ax.axvline(threshold, color="k", ls="--", lw=1.3,
+                   label=f"threshold = {threshold:.4g}")
+        ax.text(threshold, ax.get_ylim()[1], f" thr={threshold:.4g}",
+                rotation=90, va="top", ha="left", fontsize=8, color="k")
     ax.set_xlabel(f"window score ({aggregator})")
     ax.set_ylabel("density")
     ax.set_yscale("log")
@@ -208,6 +218,9 @@ def main(argv=None) -> int:
           f"mean={np.nanmean(win):.4g} p95={np.nanpercentile(finite,95):.4g} "
           f"p99={np.nanpercentile(finite,99):.4g} max={np.nanmax(win):.4g}")
 
+    # Operating threshold: explicit --threshold, else the good-set 99th pct (~1% FPR).
+    thr = args.threshold if args.threshold is not None else float(np.nanpercentile(finite, 99))
+
     win_cmp = None
     if args.compare:
         win_cmp = _aggregate_file(args.compare, args.aggregator, group_args)
@@ -216,18 +229,33 @@ def main(argv=None) -> int:
               f"p95={np.nanpercentile(fc,95):.4g} max={np.nanmax(win_cmp):.4g}")
         auc = separation_auc(win, win_cmp)
         print(f"# separation AUC ({args.labels[1]} vs {args.labels[0]}) = {auc:.4f}")
-        # If a threshold from good-run p99 or --threshold, report FPR/TPR.
-        thr = args.threshold if args.threshold is not None else float(np.nanpercentile(finite, 99))
-        fpr = float(np.mean(finite > thr))
-        tpr = float(np.mean(fc > thr))
-        print(f"# at threshold={thr:.4g} (good p99 unless --threshold): "
-              f"FPR={fpr:.3f}  TPR({args.labels[1]})={tpr:.3f}")
+
+        # Confusion matrix at `thr` (positive = bad/anomalous, negative = good).
+        tp = int(np.sum(fc > thr))          # bad windows flagged
+        fn = int(fc.size - tp)              # bad windows missed
+        fp = int(np.sum(finite > thr))      # good windows falsely flagged
+        tn = int(finite.size - fp)          # good windows correctly passed
+        precision = tp / (tp + fp) if (tp + fp) else float("nan")
+        recall = tp / (tp + fn) if (tp + fn) else float("nan")   # = TPR
+        f1 = (2 * precision * recall / (precision + recall)
+              if precision + recall > 0 else float("nan"))
+        fpr = fp / (fp + tn) if (fp + tn) else float("nan")
+
+        thr_src = "user" if args.threshold is not None else "good p99"
+        print(f"# threshold = {thr:.4g}  ({thr_src})")
+        print(f"# confusion matrix (rows=actual, cols=predicted; positive={args.labels[1]}):")
+        print(f"#                 pred {args.labels[0]:<6} pred {args.labels[1]:<6}")
+        print(f"#   actual {args.labels[0]:<6}  {tn:>10d}  {fp:>10d}")
+        print(f"#   actual {args.labels[1]:<6}  {fn:>10d}  {tp:>10d}")
+        print(f"# precision={precision:.3f}  recall(TPR)={recall:.3f}  "
+              f"F1={f1:.3f}  FPR={fpr:.3f}")
 
     if args.plot:
+        # Always draw the operating threshold line, labelled with its value.
         if win_cmp is not None:
-            _plot_overlay([win, win_cmp], args.labels, args.plot, args.aggregator, args.threshold)
+            _plot_overlay([win, win_cmp], args.labels, args.plot, args.aggregator, thr)
         else:
-            _plot_overlay([win], [args.labels[0]], args.plot, args.aggregator, args.threshold)
+            _plot_overlay([win], [args.labels[0]], args.plot, args.aggregator, thr)
         print(f"# saved plot to {args.plot}")
 
     if args.output:
