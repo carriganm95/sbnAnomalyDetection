@@ -50,6 +50,10 @@ class GraphVAETrainer(BaseTrainer):
         )
         self.beta = float(beta)
         self.beta_warmup_epochs = int(beta_warmup_epochs)
+        # Running recon/KL accumulators for per-epoch logging.
+        self._recon_sum = 0.0
+        self._kl_sum = 0.0
+        self._term_batches = 0
 
     def _infer_batch_size(self, batch) -> int:
         return int(getattr(batch, "num_graphs", 1))
@@ -67,7 +71,23 @@ class GraphVAETrainer(BaseTrainer):
         kl = -0.5 * torch.mean(
             torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
         ) / max(1, mu.shape[1])
+        # Accumulate the raw (unweighted) terms for per-epoch logging.
+        self._recon_sum += float(recon.detach())
+        self._kl_sum += float(kl.detach())
+        self._term_batches += 1
         return recon + self._effective_beta() * kl
+
+    def _epoch_extra_metrics(self) -> dict:
+        n = max(1, self._term_batches)
+        recon = self._recon_sum / n
+        kl = self._kl_sum / n
+        self._recon_sum = self._kl_sum = 0.0
+        self._term_batches = 0
+        import logging
+        logging.getLogger(__name__).info(
+            "  recon=%.5f  kl=%.5f  beta=%.3f", recon, kl, self._effective_beta()
+        )
+        return {"recon": recon, "kl": kl, "beta": self._effective_beta()}
 
     @torch.no_grad()
     def _eval_forward(self, data):

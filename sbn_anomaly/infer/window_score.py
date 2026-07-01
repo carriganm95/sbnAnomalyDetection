@@ -145,14 +145,110 @@ def separation_auc(good: np.ndarray, bad: np.ndarray) -> float:
     return float(u / (g.size * b.size))
 
 
-def _aggregate_file(path: str, aggregator: str, group_args) -> np.ndarray:
+def _aggregate_file(path: str, aggregator: str, group_args):
+    """Return (per-window scores, provenance-or-None) for a scores npz."""
     arch = np.load(path, allow_pickle=False)
     node_scores = arch["node_scores"] if "node_scores" in arch else arch["scores"]
     groups = None
     if aggregator == "group_max_mean":
         csv, level = group_args
         groups = channel_to_group(csv, level=level, num_channels=node_scores.shape[1])
-    return aggregate_windows(node_scores, aggregator, groups=groups)
+    win = aggregate_windows(node_scores, aggregator, groups=groups)
+    prov = arch["provenance"] if "provenance" in getattr(arch, "files", []) else None
+    return win, prov
+
+
+def per_run_scores(win, prov, thr, stat="frac_above", run_key="run"):
+    """Roll per-window scores up to one score per run.
+
+    ``stat``: ``frac_above`` (fraction of a run's windows above the window
+    threshold ``thr`` -- best for intermittent faults), ``max``, ``p99``, ``mean``.
+    ``run_key``: ``run`` groups by run number; ``runsubrun`` by (run, subrun).
+    Returns (run_ids, run_scores) or (None, None) if no provenance.
+    """
+    if prov is None:
+        return None, None
+    prov = np.asarray(prov)
+    if run_key == "runsubrun":
+        keys = prov[:, 0].astype(np.int64) * 1_000_000 + prov[:, 1].astype(np.int64)
+    else:
+        keys = prov[:, 0].astype(np.int64)
+    win = np.asarray(win, dtype=np.float64)
+    run_ids, run_scores = [], []
+    for k in np.unique(keys):
+        w = win[keys == k]
+        w = w[np.isfinite(w)]
+        if w.size == 0:
+            continue
+        if stat == "frac_above":
+            s = float(np.mean(w > thr))
+        elif stat == "max":
+            s = float(np.max(w))
+        elif stat == "p99":
+            s = float(np.percentile(w, 99))
+        else:
+            s = float(np.mean(w))
+        run_ids.append(int(k))
+        run_scores.append(s)
+    return np.array(run_ids), np.array(run_scores)
+
+
+def stream_detect(win, prov, thr, n=3, m=2, instant=None, run_key="run"):
+    """Streaming M-of-N persistence detector, per run, in window order.
+
+    Walks each run's windows in order; raises an alarm at the first window where
+    either (a) the score exceeds ``instant`` (acute single-window fault), or
+    (b) at least ``m`` of the last ``n`` windows exceed ``thr`` (sustained fault).
+    This is a real-time rule: it fires within a few windows, without waiting for
+    the whole run.
+
+    Returns dict run_id -> (alarmed: bool, latency_windows: int or -1).
+    """
+    if prov is None:
+        return None
+    prov = np.asarray(prov)
+    if run_key == "runsubrun":
+        keys = prov[:, 0].astype(np.int64) * 1_000_000 + prov[:, 1].astype(np.int64)
+    else:
+        keys = prov[:, 0].astype(np.int64)
+    win = np.asarray(win, dtype=np.float64)
+
+    result = {}
+    seen = []
+    for k in keys:                       # preserve first-occurrence run order
+        if k not in seen:
+            seen.append(k)
+    for k in seen:
+        idx = np.where(keys == k)[0]      # windows of this run, in order
+        w = win[idx]
+        recent = []                       # last n booleans (score > thr)
+        alarmed, latency = False, -1
+        for j, s in enumerate(w):
+            hot = bool(np.isfinite(s) and s > thr)
+            recent.append(hot)
+            if len(recent) > n:
+                recent.pop(0)
+            fire = (instant is not None and np.isfinite(s) and s > instant) \
+                or (sum(recent) >= m)
+            if fire:
+                alarmed, latency = True, j + 1   # windows consumed until alarm
+                break
+        result[int(k)] = (alarmed, latency)
+    return result
+
+
+def _confusion(pos_scores, neg_scores, thr, pos_label, neg_label):
+    """Print confusion matrix + precision/recall/F1 (positive = pos_scores)."""
+    tp = int(np.sum(pos_scores > thr)); fn = int(pos_scores.size - tp)
+    fp = int(np.sum(neg_scores > thr)); tn = int(neg_scores.size - fp)
+    prec = tp / (tp + fp) if (tp + fp) else float("nan")
+    rec = tp / (tp + fn) if (tp + fn) else float("nan")
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else float("nan")
+    fpr = fp / (fp + tn) if (fp + tn) else float("nan")
+    print(f"#                 pred {neg_label:<6} pred {pos_label:<6}")
+    print(f"#   actual {neg_label:<6}  {tn:>10d}  {fp:>10d}")
+    print(f"#   actual {pos_label:<6}  {fn:>10d}  {tp:>10d}")
+    print(f"# precision={prec:.3f}  recall(TPR)={rec:.3f}  F1={f1:.3f}  FPR={fpr:.3f}")
 
 
 def _plot_overlay(score_lists, labels, path, aggregator, threshold=None, nbins=60):
@@ -199,11 +295,27 @@ def main(argv=None) -> int:
                    help="second scores npz (e.g. bad runs) to overlay + compute AUC vs --scores")
     p.add_argument("--labels", nargs=2, default=["good", "bad"], metavar=("A", "B"))
     p.add_argument("--threshold", type=float, default=None,
-                   help="draw a threshold line and report TPR/FPR at it")
+                   help="window operating threshold (else good-set p99)")
+    p.add_argument("--per-run", action="store_true",
+                   help="also roll windows up to one score per run and report run-level metrics")
+    p.add_argument("--run-stat", default="frac_above",
+                   choices=["frac_above", "max", "p99", "mean"],
+                   help="how to score a run from its windows (default: fraction above the window threshold)")
+    p.add_argument("--run-key", default="run", choices=["run", "runsubrun"])
+    p.add_argument("--run-threshold", type=float, default=None,
+                   help="run-level decision threshold (else good-run p90)")
+    p.add_argument("--stream", action="store_true",
+                   help="real-time M-of-N streaming detector: report detection latency "
+                        "(bad) and false-alarm rate (good), no full-run wait")
+    p.add_argument("--persist-n", type=int, default=3, help="streaming window count N")
+    p.add_argument("--persist-m", type=int, default=2, help="streaming M-of-N trigger")
+    p.add_argument("--instant-threshold", type=float, default=None,
+                   help="single-window score that fires immediately (default: none)")
     args = p.parse_args(argv)
 
     arch = np.load(args.scores, allow_pickle=False)
     node_scores = arch["node_scores"] if "node_scores" in arch else arch["scores"]
+    prov_good = arch["provenance"] if "provenance" in getattr(arch, "files", []) else None
     if args.aggregator == "group_max_mean" and not args.channel_map:
         p.error("group_max_mean needs --channel-map")
     group_args = (args.channel_map, args.group_level)
@@ -221,34 +333,69 @@ def main(argv=None) -> int:
     # Operating threshold: explicit --threshold, else the good-set 99th pct (~1% FPR).
     thr = args.threshold if args.threshold is not None else float(np.nanpercentile(finite, 99))
 
-    win_cmp = None
+    win_cmp = prov_bad = None
     if args.compare:
-        win_cmp = _aggregate_file(args.compare, args.aggregator, group_args)
+        win_cmp, prov_bad = _aggregate_file(args.compare, args.aggregator, group_args)
         fc = win_cmp[np.isfinite(win_cmp)]
         print(f"# {args.labels[1]}: windows={win_cmp.size} mean={np.nanmean(win_cmp):.4g} "
               f"p95={np.nanpercentile(fc,95):.4g} max={np.nanmax(win_cmp):.4g}")
+
+        # ---- window-level ----
         auc = separation_auc(win, win_cmp)
-        print(f"# separation AUC ({args.labels[1]} vs {args.labels[0]}) = {auc:.4f}")
-
-        # Confusion matrix at `thr` (positive = bad/anomalous, negative = good).
-        tp = int(np.sum(fc > thr))          # bad windows flagged
-        fn = int(fc.size - tp)              # bad windows missed
-        fp = int(np.sum(finite > thr))      # good windows falsely flagged
-        tn = int(finite.size - fp)          # good windows correctly passed
-        precision = tp / (tp + fp) if (tp + fp) else float("nan")
-        recall = tp / (tp + fn) if (tp + fn) else float("nan")   # = TPR
-        f1 = (2 * precision * recall / (precision + recall)
-              if precision + recall > 0 else float("nan"))
-        fpr = fp / (fp + tn) if (fp + tn) else float("nan")
-
         thr_src = "user" if args.threshold is not None else "good p99"
-        print(f"# threshold = {thr:.4g}  ({thr_src})")
-        print(f"# confusion matrix (rows=actual, cols=predicted; positive={args.labels[1]}):")
-        print(f"#                 pred {args.labels[0]:<6} pred {args.labels[1]:<6}")
-        print(f"#   actual {args.labels[0]:<6}  {tn:>10d}  {fp:>10d}")
-        print(f"#   actual {args.labels[1]:<6}  {fn:>10d}  {tp:>10d}")
-        print(f"# precision={precision:.3f}  recall(TPR)={recall:.3f}  "
-              f"F1={f1:.3f}  FPR={fpr:.3f}")
+        print(f"# [window-level] AUC({args.labels[1]} vs {args.labels[0]})={auc:.4f}  "
+              f"threshold={thr:.4g} ({thr_src})")
+        print(f"# confusion (rows=actual, cols=predicted; positive={args.labels[1]}):")
+        _confusion(fc, finite, thr, args.labels[1], args.labels[0])
+
+        # ---- run-level rollup ----
+        if args.per_run:
+            if prov_good is None or prov_bad is None:
+                print("# [run-level] skipped: scores npz has no 'provenance' "
+                      "(re-run inference so provenance is saved).")
+            else:
+                _, rs_good = per_run_scores(win, prov_good, thr, args.run_stat, args.run_key)
+                _, rs_bad = per_run_scores(win_cmp, prov_bad, thr, args.run_stat, args.run_key)
+                run_thr = (args.run_threshold if args.run_threshold is not None
+                           else float(np.percentile(rs_good, 90)) if rs_good.size else 0.0)
+                r_auc = separation_auc(rs_good, rs_bad)
+                print(f"# [run-level] stat={args.run_stat} runs: "
+                      f"{args.labels[0]}={rs_good.size} {args.labels[1]}={rs_bad.size}  "
+                      f"AUC={r_auc:.4f}  run_threshold={run_thr:.4g}"
+                      + ("" if args.run_threshold is not None else " (good-run p90)"))
+                print(f"# run confusion (positive={args.labels[1]}):")
+                _confusion(rs_bad, rs_good, run_thr, args.labels[1], args.labels[0])
+
+    # ---- real-time streaming detector (detection latency, no full-run wait) ----
+    if args.stream:
+        if prov_good is None:
+            print("# [stream] skipped: scores npz has no 'provenance'.")
+        else:
+            gd = stream_detect(win, prov_good, thr, args.persist_n, args.persist_m,
+                               args.instant_threshold, args.run_key)
+            n_good = len(gd)
+            fa = [v for v in gd.values() if v[0]]
+            print(f"# [stream] N={args.persist_n} M={args.persist_m} "
+                  f"window_thr={thr:.4g}"
+                  + (f" instant_thr={args.instant_threshold:.4g}" if args.instant_threshold else ""))
+            print(f"#   {args.labels[0]} runs={n_good}  false-alarm rate="
+                  f"{len(fa)/max(1,n_good):.3f}")
+            if prov_bad is not None:
+                bd = stream_detect(win_cmp, prov_bad, thr, args.persist_n, args.persist_m,
+                                   args.instant_threshold, args.run_key)
+                n_bad = len(bd)
+                det = [v[1] for v in bd.values() if v[0]]
+                det_rate = len(det) / max(1, n_bad)
+                if det:
+                    lat = np.array(det)
+                    print(f"#   {args.labels[1]} runs={n_bad}  detection rate={det_rate:.3f}  "
+                          f"latency(windows): median={np.median(lat):.0f} "
+                          f"mean={lat.mean():.1f} p90={np.percentile(lat,90):.0f} "
+                          f"max={lat.max():.0f}")
+                    print("#   (latency x window_size = events until flagged)")
+                else:
+                    print(f"#   {args.labels[1]} runs={n_bad}  detection rate=0.000 "
+                          "(no bad run alarmed — loosen M/N or lower threshold)")
 
     if args.plot:
         # Always draw the operating threshold line, labelled with its value.

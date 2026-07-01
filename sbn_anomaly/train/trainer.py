@@ -121,6 +121,14 @@ class BaseTrainer(ABC):
     def _append_history(self, key: str, value: Any) -> None:
         self.history.setdefault(key, []).append(value)
 
+    def _epoch_extra_metrics(self) -> dict:
+        """Extra per-epoch metrics contributed by subclasses (empty by default).
+
+        Called once at the end of each epoch; the returned key->value pairs are
+        appended to ``self.history`` (and thus the CSV + curves).
+        """
+        return {}
+
     def _infer_batch_size(self, batch: tuple) -> int:
         """Best-effort extraction of batch size for throughput metrics."""
         if not batch:
@@ -510,6 +518,10 @@ class BaseTrainer(ABC):
             )
             self._append_history("epoch_time_sec", float(epoch_time))
             self._append_history("events_per_sec", float(events_per_sec))
+
+            # Subclass-contributed per-epoch metrics (e.g. VAE recon / KL split).
+            for _k, _v in self._epoch_extra_metrics().items():
+                self._append_history(_k, float(_v))
 
             if score_buf and label_buf:
                 metrics = self._compute_classification_metrics(score_buf, label_buf)

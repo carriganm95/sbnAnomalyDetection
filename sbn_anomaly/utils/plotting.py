@@ -175,12 +175,18 @@ def save_training_curves(
     anomaly_frac = _metric("anomaly_fraction_above_threshold")
     epoch_time_sec = _metric("epoch_time_sec")
     events_per_sec = _metric("events_per_sec")
+    recon = _metric("recon")
+    kl = _metric("kl")
+    beta = _metric("beta")
 
     has_cls_metrics = any(x.size for x in (precision, recall, f1, auc))
     has_score_metrics = any(x.size for x in (score_p95, score_p99, anomaly_frac))
     has_perf_metrics = any(x.size for x in (epoch_time_sec, events_per_sec))
+    has_vae_metrics = any(x.size for x in (recon, kl, beta))
 
-    n_panels = 1 + int(has_score_metrics or has_cls_metrics) + int(has_perf_metrics)
+    n_panels = (1 + int(has_vae_metrics)
+                + int(has_score_metrics or has_cls_metrics)
+                + int(has_perf_metrics))
 
     fig, axes = plt.subplots(
         n_panels,
@@ -200,6 +206,26 @@ def save_training_curves(
     ax0.grid(True, alpha=0.3)
 
     panel_idx = 1
+    if has_vae_metrics:
+        axv = axes[panel_idx]
+        if recon.size:
+            axv.plot(epochs, recon, label="recon", color="tab:blue")
+        if kl.size:
+            axv.plot(epochs, kl, label="kl", color="tab:orange")
+        axv.set_ylabel("Recon / KL")
+        axv.grid(True, alpha=0.3)
+        axv.legend(loc="upper left")
+        if beta.size:
+            axb = axv.twinx()
+            axb.plot(epochs, beta, label="beta", color="tab:green", ls="--", alpha=0.8)
+            axb.set_ylabel("beta")
+            try:
+                axb.set_ylim(0.0, max(1.0, float(np.nanmax(beta)) * 1.05))
+            except Exception:
+                pass
+            axb.legend(loc="upper right")
+        panel_idx += 1
+
     if has_score_metrics or has_cls_metrics:
         ax1 = axes[panel_idx]
         plotted_any = False

@@ -541,13 +541,34 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
     scores = aggregate_windows(node_scores, aggregator, groups=groups,
                                k=int(infer_cfg.get("topk", 64)))
 
+    # Per-channel summary across all windows (which channels are anomalous
+    # overall), alongside the per-window per-channel node_scores and the global
+    # per-window scores.
+    with np.errstate(invalid="ignore", all="ignore"):
+        channel_mean_error = np.nanmean(node_scores, axis=0).astype(np.float32) \
+            if node_scores.shape[0] else np.full(num_channels, np.nan, np.float32)
+        channel_max_error = np.nanmax(node_scores, axis=0).astype(np.float32) \
+            if node_scores.shape[0] else np.full(num_channels, np.nan, np.float32)
+        channel_active_frac = np.mean(np.isfinite(node_scores), axis=0).astype(np.float32) \
+            if node_scores.shape[0] else np.zeros(num_channels, np.float32)
+
     out = {"node_scores": node_scores, "scores": scores.astype(np.float32),
-           "window_index": np.arange(node_scores.shape[0], dtype=np.int64)}
+           "window_index": np.arange(node_scores.shape[0], dtype=np.int64),
+           "channel_mean_error": channel_mean_error,
+           "channel_max_error": channel_max_error,
+           "channel_active_frac": channel_active_frac}
     if provenance is not None:
         out["provenance"] = provenance
     threshold = infer_cfg.get("threshold")
     if threshold is not None:
         out["is_anomaly"] = (scores > float(threshold))
+
+    # Rank the worst channels for a quick console readout.
+    if node_scores.shape[0] and np.isfinite(channel_mean_error).any():
+        order = np.argsort(np.nan_to_num(channel_mean_error, nan=-np.inf))[::-1]
+        top = [c for c in order if np.isfinite(channel_mean_error[c])][:10]
+        logger.info("Top-10 channels by mean recon error: %s",
+                    ", ".join(f"{int(c)}:{channel_mean_error[c]:.3g}" for c in top))
 
     out_path = Path(output)
     if out_path.suffix != ".npz":
@@ -565,6 +586,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
             from sbn_anomaly.utils.plotting import (
                 save_score_distribution_plot,
                 save_score_over_time_plot,
+                save_node_mse_plot,
             )
             plot_dir = out_path.parent
             thr = float(threshold) if threshold is not None else None
@@ -577,7 +599,12 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
                 filename=out_path.stem + "_score_over_time.png", threshold=thr,
                 title="Window anomaly score over time",
             )
-            logger.info("Saved score plots next to %s", out_path)
+            save_node_mse_plot(
+                channel_mean_error, plot_dir,
+                filename=out_path.stem + "_channel_error.png",
+                title="Per-channel mean reconstruction error",
+            )
+            logger.info("Saved score + per-channel plots next to %s", out_path)
         except Exception as exc:
             logger.warning("Failed to save score plots: %s", exc)
 
