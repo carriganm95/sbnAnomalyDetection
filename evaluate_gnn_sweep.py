@@ -181,7 +181,7 @@ RESCALE_TRANSFORM_TO_UNIT_MAX = True
 # values and must be in [0, 1].
 # For NORMALIZATION_MODE = "none", thresholds are absolute raw score values.
 # The script evaluates every model at every threshold in this list.
-THRESHOLDS = [0.2, 0.4, 0.6, 0.8]
+THRESHOLDS = [0.5]
 
 # What to do with values exactly equal to the threshold.
 # False: value == threshold is predicted good.
