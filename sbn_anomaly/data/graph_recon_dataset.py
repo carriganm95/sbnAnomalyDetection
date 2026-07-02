@@ -44,6 +44,7 @@ class GraphReconDataset(Dataset):
         feature_mean: Optional[np.ndarray] = None,
         feature_std: Optional[np.ndarray] = None,
         standardize: bool = True,
+        log_features: Optional[list] = None,
     ) -> None:
         w = np.asarray(windows, dtype=np.float32)
         if w.ndim != 3:
@@ -56,6 +57,21 @@ class GraphReconDataset(Dataset):
         self.channel_map = channel_map
         self.edge_mode = str(edge_mode)
         self.standardize = bool(standardize)
+
+        # Sign-preserving log1p on configured heavy-tailed features (before
+        # standardization). Columns are bin-major: col = bin*n_feat + feature_idx.
+        if log_features and node_feature_names:
+            names = list(node_feature_names)
+            n_feat = len(names)
+            if self.node_feat_dim % n_feat == 0:
+                n_bins = self.node_feat_dim // n_feat
+                cols = [b * n_feat + fi for fi, nm in enumerate(names)
+                        if nm in set(log_features) for b in range(n_bins)]
+                if cols:
+                    cols = np.array(sorted(cols))
+                    sub = w[:, :, cols]
+                    w[:, :, cols] = np.sign(sub) * np.log1p(np.abs(sub))
+                    self._windows = w
 
         # Per-feature standardization from active (non-zero) rows of good data.
         if self.standardize:

@@ -50,8 +50,15 @@ data:
   # Rate/occupancy:   occupancy (fraction of events with a hit), hit_rate (hits/event)
   # Timing:           time_mean, time_spread  (require a per-hit time branch)
   # A stronger, less redundant mix than six integral moments:
-  node_features: [sum, mean, stdev, occupancy, time_mean, time_spread]
-  # node_features: [sum, min, max, mean, stdev, count]   # original integral-only set
+  node_features: [sum, min, max, mean, stdev, count]   # integral set (best so far)
+  # node_features: [sum, mean, stdev, occupancy, time_mean, time_spread]  # rate/timing mix
+
+  # Sign-preserving log1p applied to these features BEFORE standardization.
+  # Integral magnitude (sum/min/max/mean) is heavy-tailed even after z-scoring,
+  # which makes the VAE reconstruct them as a flat mean; log-compressing the tail
+  # lets the model actually track them. occupancy/timing are already well-behaved.
+  # Must be a subset of node_features. Use the SAME list for train and inference.
+  log_features: [sum, min, max, mean]
 
 model:
   latent_dim: 12          # per-node bottleneck

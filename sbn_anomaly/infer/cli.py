@@ -442,7 +442,21 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
     else:
         logger.warning("No standardization.npz at %s; standardizing from input.", std_path)
 
-    arch = np.load(input_path, allow_pickle=True)
+    if not str(input_path).endswith((".npz", ".npy")):
+        raise ValueError(
+            f"--input must be a materialized events/windows .npz, got '{input_path}'. "
+            "A ROOT-file list is not scored directly — first materialize it:\n"
+            "  python -m sbn_anomaly.data.materialize_windows "
+            f"--config <config> --root-file-list {input_path} --output <events.npz>\n"
+            "then pass that .npz to --input."
+        )
+    try:
+        arch = np.load(input_path, allow_pickle=True)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not read '{input_path}' as an .npz/.npy. If this is a ROOT-file "
+            "list, materialize it first with sbn_anomaly.data.materialize_windows."
+        ) from exc
     is_sparse = isinstance(arch, np.lib.npyio.NpzFile) and "channels_flat" in arch
     provenance = None
 
@@ -463,6 +477,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
             reconstruction=True,
             standardize=bool(data_cfg.get("standardize", True)),
             feature_mean=feat_mean, feature_std=feat_std,
+            log_features=data_cfg.get("log_features") or None,
         )
     else:
         windows = arch["windows"] if (isinstance(arch, np.lib.npyio.NpzFile) and "windows" in arch) \
@@ -482,6 +497,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
             edge_mode=str(data_cfg.get("edge_mode", "sequential")),
             feature_mean=feat_mean, feature_std=feat_std,
             standardize=bool(data_cfg.get("standardize", True)),
+            log_features=data_cfg.get("log_features") or None,
         )
     num_channels = dataset.num_nodes
 

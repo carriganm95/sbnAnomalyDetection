@@ -130,6 +130,7 @@ class SparseWindowDatasetPyG(Dataset):
         standardize: bool = False,
         feature_mean: Optional[np.ndarray] = None,
         feature_std: Optional[np.ndarray] = None,
+        log_features: Optional[List[str]] = None,
     ) -> None:
         self._channels_flat = np.asarray(channels_flat, dtype=np.int64)
         self._integrals_flat = np.asarray(integrals_flat, dtype=np.float32)
@@ -169,6 +170,17 @@ class SparseWindowDatasetPyG(Dataset):
         self.n_node_features = len(self.node_features)
         self.node_feat_dim = n_bins * self.n_node_features
         self.hit_branches = self.node_features
+
+        # Optional sign-preserving log1p on heavy-tailed features (applied before
+        # standardization so z-scoring works and the model can actually track them).
+        self.log_features = list(log_features) if log_features else []
+        invalid_log = set(self.log_features) - set(self.node_features)
+        if invalid_log:
+            raise ValueError(f"log_features must be a subset of node_features: {invalid_log}")
+        self._log_mask = (
+            np.array([f in set(self.log_features) for f in self.node_features], dtype=bool)
+            if self.log_features else None
+        )
 
         # Reconstruction mode: each sample is ONE window (frame), target = itself
         # (graph autoencoder). Forecasting mode: history past frames + 1 target.
@@ -724,6 +736,12 @@ class SparseWindowDatasetPyG(Dataset):
                     tmean = np.where(counts > 0, time_sum / np.maximum(counts, 1), 0.0)
                     tvar = np.where(counts > 0, time_sum_sq / np.maximum(counts, 1) - tmean ** 2, 0.0)
                     frame[:, b_idx, fi] = np.sqrt(np.maximum(tvar, 0.0))
+
+        # Sign-preserving log1p on the configured heavy-tailed features so
+        # standardization behaves and the model can reconstruct them.
+        if self._log_mask is not None and self._log_mask.any():
+            sub = frame[:, :, self._log_mask]
+            frame[:, :, self._log_mask] = np.sign(sub) * np.log1p(np.abs(sub))
 
         return frame
 

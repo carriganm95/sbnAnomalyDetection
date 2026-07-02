@@ -527,6 +527,7 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
         edge_mode=str(data_cfg.get("edge_mode", "sequential")),
         reconstruction=True,
         standardize=bool(data_cfg.get("standardize", True)),
+        log_features=data_cfg.get("log_features") or None,
     )
 
     if root_files:
@@ -561,6 +562,7 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
             channel_map=sparse_kwargs["channel_map"],
             edge_mode=sparse_kwargs["edge_mode"],
             standardize=sparse_kwargs["standardize"],
+            log_features=sparse_kwargs["log_features"],
         )
 
     # Persist standardization so inference normalizes identically.
