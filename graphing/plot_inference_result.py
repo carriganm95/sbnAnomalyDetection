@@ -1,5 +1,11 @@
 import os
+os.environ["MPLBACKEND"] = "Agg"
+
 import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 
 
@@ -7,20 +13,20 @@ import matplotlib.pyplot as plt
 # Input / output
 # ============================================================
 
-npz_path = "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/checkpoints/gnn/2_2_gnn_gru/inference_scores.npz"
-out_dir = "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/inference_result_plots/2_2_gnn_gru"
+npz_path = "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/checkpoints/gnn/0018_win100_stride100_hist5_bs64_lr0p003/inference_scores.npz"
+out_dir = "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/inference_result_plots/0018_win100_stride100_hist5_bs64_lr0p003"
 os.makedirs(out_dir, exist_ok=True)
 
 # ============================================================
 # Plot settings
 # ============================================================
 
-bins = 60
+bins = 70
 
 # x-axis cutoff. Only show up to this percentile of the selected runs.
 # The visible cutoff is still based on this percentile, but the x-axis
 # is normalized by the true maximum value in the whole array, not by this percentile.
-percentile = 80
+percentile = 60
 
 # X-axis transform mode.
 #
@@ -33,7 +39,7 @@ percentile = 80
 #
 # For your current case, "tanh" or "sigmoid" is better than "global_max", because
 # the true max is a huge outlier and global_max squeezes ordinary values to x ~ 0.
-x_axis_transform = "tanh"
+x_axis_transform = "none"
 
 # Scale for tanh/sigmoid x-axis transforms, in raw score units.
 # If None, the script uses the current visible cutoff x_max, i.e. the selected
@@ -409,48 +415,82 @@ def plot_hist_by_run(
     Plot per-run histograms as ROOT-style line histograms.
 
     If normalize_to_windows=True:
-        y = bin_count / total_number_of_windows_for_that_run
+        y = bin_count / total_number_of_windows_for_that run
 
     This makes runs with many windows and few windows comparable in shape.
+
+    This debug version prints progress messages so you can see whether the script
+    is slow during:
+      - finite filtering
+      - percentile/bin-edge creation
+      - histogramming each run
+      - tight_layout / savefig
     """
 
+    print("\n" + "=" * 80, flush=True)
+    print(f"Entered plot_hist_by_run: {title}", flush=True)
+    print("=" * 80, flush=True)
+
+    # Convert first, so shapes/finite checks are reliable.
+    values = np.asarray(values)
+    runs = np.asarray(runs)
+
+    print(f"Initial values.shape = {values.shape}", flush=True)
+    print(f"Initial runs.shape   = {runs.shape}", flush=True)
+
     # Keep only finite entries
+    print("Making finite mask...", flush=True)
     finite_mask = np.isfinite(values) & np.isfinite(runs)
-    values = np.asarray(values)[finite_mask]
-    runs = np.asarray(runs)[finite_mask].astype(int)
+    print("Finished finite mask.", flush=True)
+
+    values = values[finite_mask]
+    runs = runs[finite_mask].astype(int)
+
+    print(f"After finite filtering: values.size = {values.size}", flush=True)
 
     if values.size == 0:
-        print(f"No valid values found for {title}")
+        print(f"No valid values found for {title}", flush=True)
         return
 
     # True maximum over the whole finite array, not the visible percentile.
     # Used by global_max/tanh/sigmoid transforms so the whole-data maximum maps to 1.
+    print("Computing global_x_max...", flush=True)
     global_x_max = np.nanmax(values)
+    print(f"global_x_max = {global_x_max}", flush=True)
+
     x_axis_transform = str(x_axis_transform).lower()
 
     if x_axis_transform != "none":
         if not np.isfinite(global_x_max) or global_x_max <= 0.0:
             print(
                 f"WARNING: cannot transform x-axis for {title}; "
-                f"bad global_x_max={global_x_max}; skipping."
+                f"bad global_x_max={global_x_max}; skipping.",
+                flush=True,
             )
             return
 
+    print("Finding available runs...", flush=True)
     all_runs = sorted(np.unique(runs))
+    print(f"all_runs = {all_runs}", flush=True)
+
     selected_runs = resolve_runs_to_plot(all_runs, runs_to_plot)
+    print(f"selected_runs = {selected_runs}", flush=True)
 
     if len(selected_runs) == 0:
-        print(f"No runs to plot for {title}")
+        print(f"No runs to plot for {title}", flush=True)
         return
 
     # Use selected runs only when computing percentile x range
+    print("Selecting values for selected runs...", flush=True)
     selected_mask = np.isin(runs, selected_runs)
     selected_values = values[selected_mask]
+    print(f"selected_values.size = {selected_values.size}", flush=True)
 
     if selected_values.size == 0:
-        print(f"No values found for selected runs in {title}")
+        print(f"No values found for selected runs in {title}", flush=True)
         return
 
+    print("Making bin edges...", flush=True)
     bin_edges, x_min, x_max = make_bin_edges(
         selected_values=selected_values,
         bins=bins,
@@ -459,10 +499,15 @@ def plot_hist_by_run(
         tail_start_percentile=tail_start_percentile,
         low_score_bin_fraction=low_score_bin_fraction,
     )
+    print("Finished making bin edges.", flush=True)
 
     if bin_edges is None:
-        print(f"WARNING: cannot determine valid bin edges for {title}; skipping.")
+        print(f"WARNING: cannot determine valid bin edges for {title}; skipping.", flush=True)
         return
+
+    print(f"x_min = {x_min}", flush=True)
+    print(f"x_max = {x_max}", flush=True)
+    print(f"number of bins = {len(bin_edges) - 1}", flush=True)
 
     # For tanh/sigmoid, None means use the visible raw cutoff as the transform scale.
     # This makes the visible percentile region readable even when the true max is huge.
@@ -470,28 +515,67 @@ def plot_hist_by_run(
     if x_axis_transform in {"tanh", "sigmoid"} and transform_scale_used is None:
         transform_scale_used = x_max
 
+    print(f"x_axis_transform = {x_axis_transform}", flush=True)
+    print(f"transform_scale_used = {transform_scale_used}", flush=True)
+
+    print("Computing transformed x-axis limits...", flush=True)
     try:
-        x_min_plot = float(transform_x_axis(x_min, x_axis_transform, global_x_max, transform_scale_used))
-        x_max_plot = float(transform_x_axis(global_x_max, x_axis_transform, global_x_max, transform_scale_used))
-        x_visible_cutoff_plot = float(transform_x_axis(x_max, x_axis_transform, global_x_max, transform_scale_used))
+        x_min_plot = float(
+            transform_x_axis(
+                x_min,
+                x_axis_transform,
+                global_x_max,
+                transform_scale_used,
+            )
+        )
+        x_max_plot = float(
+            transform_x_axis(
+                global_x_max,
+                x_axis_transform,
+                global_x_max,
+                transform_scale_used,
+            )
+        )
+        x_visible_cutoff_plot = float(
+            transform_x_axis(
+                x_max,
+                x_axis_transform,
+                global_x_max,
+                transform_scale_used,
+            )
+        )
     except ValueError as exc:
-        print(f"WARNING: {exc}; skipping {title}.")
+        print(f"WARNING: {exc}; skipping {title}.", flush=True)
         return
 
+    print(f"x_min_plot = {x_min_plot}", flush=True)
+    print(f"x_max_plot = {x_max_plot}", flush=True)
+    print(f"x_visible_cutoff_plot = {x_visible_cutoff_plot}", flush=True)
+
+    print("Creating figure...", flush=True)
     plt.figure(figsize=(12, 7))
+    print("Created figure.", flush=True)
 
     good_idx = 0
     bad_idx = 0
     unknown_idx = 0
 
     plotted_any = False
+    ylabel = "Fraction of windows" if normalize_to_windows else "Count"
+
+    print("Starting per-run histogram loop...", flush=True)
 
     for run in selected_runs:
-        mask = (runs == run)
+        print(f"  Plotting run {run}...", flush=True)
+
+        mask = runs == run
         run_values_all = values[mask]
         n_total_windows = run_values_all.size
 
+        print(f"    n_total_windows = {n_total_windows}", flush=True)
+
         if n_total_windows == 0:
+            print(f"    Skipping run {run}: no windows.", flush=True)
             continue
 
         # Only histogram the visible range.
@@ -499,32 +583,38 @@ def plot_hist_by_run(
             (run_values_all >= x_min) & (run_values_all <= x_max)
         ]
 
+        print(f"    run_values_visible.size = {run_values_visible.size}", flush=True)
+
         if run_values_visible.size == 0:
             print(
                 f"WARNING: run {run} exists, but has no entries within "
-                f"[{x_min}, {x_max}] for {title}; skipping."
+                f"[{x_min}, {x_max}] for {title}; skipping.",
+                flush=True,
             )
             continue
 
         color, good_idx, bad_idx, unknown_idx = get_run_color(
-            run, good_idx, bad_idx, unknown_idx
+            run,
+            good_idx,
+            bad_idx,
+            unknown_idx,
         )
 
+        print(f"    Computing histogram for run {run}...", flush=True)
         raw_counts, edges = np.histogram(
             run_values_visible,
             bins=bin_edges,
             density=False,
         )
+        print(f"    Finished histogram for run {run}.", flush=True)
 
         if normalize_to_windows:
             # Normalize by total number of windows in this run, not just visible windows.
             # This means bins above x_max are simply not shown, but the normalization
             # still represents fraction of the full run.
             y_values = raw_counts / n_total_windows
-            ylabel = "Fraction of windows"
         else:
             y_values = raw_counts
-            ylabel = "Count"
 
         label = (
             f"{get_run_label(run)}  "
@@ -534,8 +624,7 @@ def plot_hist_by_run(
         # For a true step histogram, x has length nbins+1 and y is extended by one.
         y_step = np.r_[y_values, y_values[-1]]
 
-        # Histogramming is done in the original score scale.
-        # Only the displayed x coordinates are transformed.
+        print(f"    Transforming bin edges for run {run}...", flush=True)
         edges_to_plot = transform_x_axis(
             edges,
             mode=x_axis_transform,
@@ -543,6 +632,7 @@ def plot_hist_by_run(
             transform_scale=transform_scale_used,
         )
 
+        print(f"    Drawing step plot for run {run}...", flush=True)
         plt.step(
             edges_to_plot,
             y_step,
@@ -552,12 +642,17 @@ def plot_hist_by_run(
             label=label,
         )
 
+        print(f"  Finished plotting run {run}.", flush=True)
         plotted_any = True
 
+    print("Finished per-run histogram loop.", flush=True)
+
     if not plotted_any:
-        print(f"WARNING: no runs were actually plotted for {title}.")
+        print(f"WARNING: no runs were actually plotted for {title}.", flush=True)
         plt.close()
         return
+
+    print("Setting labels/title...", flush=True)
 
     if x_axis_transform == "none":
         plt.xlabel(xlabel)
@@ -585,6 +680,7 @@ def plot_hist_by_run(
         scale_text = ""
         if x_axis_transform in {"tanh", "sigmoid"}:
             scale_text = f", scale = {transform_scale_used:.4g}"
+
         plt.title(
             f"{title}\n"
             f"{title_extra}; x transform = {x_axis_transform}{scale_text} "
@@ -592,23 +688,42 @@ def plot_hist_by_run(
         )
         plt.xlim(x_min_plot, x_max_plot)
 
+    print("Adding legend...", flush=True)
     plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=9)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+
+    # Use subplots_adjust instead of tight_layout + bbox_inches='tight'.
+    # This is usually much faster and avoids hanging on some network filesystems.
+    print("Adjusting subplot layout...", flush=True)
+    plt.subplots_adjust(right=0.72)
+
+    # Make sure output directory exists.
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    # Avoid bbox_inches='tight' for debugging. It can be slow with outside legends.
+    print(f"Saving figure to: {output_path}", flush=True)
+    plt.savefig(output_path, dpi=100)
+    print(f"Finished saving figure to: {output_path}", flush=True)
+
     plt.close()
+    print("Closed figure.", flush=True)
 
-    print(f"Saved: {output_path}")
-    print(f"  plotted runs = {selected_runs}")
-    print(f"  x_max ({percentile}th percentile of selected runs, raw scale) = {x_max}")
-    print(f"  global_x_max (whole finite array) = {global_x_max}")
-    print(f"  x_axis_transform = {x_axis_transform}")
+    print(f"Saved: {output_path}", flush=True)
+    print(f"  plotted runs = {selected_runs}", flush=True)
+    print(f"  x_max ({percentile}th percentile of selected runs, raw scale) = {x_max}", flush=True)
+    print(f"  global_x_max (whole finite array) = {global_x_max}", flush=True)
+    print(f"  x_axis_transform = {x_axis_transform}", flush=True)
+
     if x_axis_transform in {"tanh", "sigmoid"}:
-        print(f"  x_transform_scale used = {transform_scale_used}")
-    if x_axis_transform != "none":
-        print(f"  transformed visible x cutoff = {x_visible_cutoff_plot}")
-    print(f"  binning_mode = {binning_mode}")
-    print(f"  number of bins = {len(bin_edges) - 1}")
+        print(f"  x_transform_scale used = {transform_scale_used}", flush=True)
 
+    if x_axis_transform != "none":
+        print(f"  transformed visible x cutoff = {x_visible_cutoff_plot}", flush=True)
+
+    print(f"  binning_mode = {binning_mode}", flush=True)
+    print(f"  number of bins = {len(bin_edges) - 1}", flush=True)
+    print("=" * 80, flush=True)
 
 # ============================================================
 # Main
