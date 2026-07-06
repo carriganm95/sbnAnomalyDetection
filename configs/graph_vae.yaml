@@ -83,7 +83,7 @@ training:
   num_workers: 4
   lr: 0.001
   weight_decay: 1.0e-4
-  max_epochs: 200
+  max_epochs: 100
   validation_split: 0.1
   use_amp: true
   save_best_only: true
