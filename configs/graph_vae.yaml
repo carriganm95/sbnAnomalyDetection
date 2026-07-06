@@ -93,6 +93,7 @@ training:
   output_path: checkpoints/graph_vae/v6/graph_vae_final.pt
   anomaly_threshold: null
   log_interval: 50
+  save_epochs: false
 
 inference:
   checkpoint_path: checkpoints/graph_vae/v6/graph_vae_final.pt
