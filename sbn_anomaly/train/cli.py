@@ -616,6 +616,11 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
     )
 
     logger.info("Model architecture:\n%s", model)
+    logger.info(
+        "Epoch checkpoint saving: %s  save_best_only=%s",
+        "enabled" if bool(train_cfg.get("save_epochs", True)) else "disabled",
+        bool(train_cfg.get("save_best_only", False)),
+    )
 
     trainer = GraphVAETrainer(
         model=model,
@@ -626,6 +631,7 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
         log_interval=int(train_cfg.get("log_interval", 50)),
         anomaly_threshold=train_cfg.get("anomaly_threshold"),
         save_best_only=bool(train_cfg.get("save_best_only", False)),
+        save_epochs=bool(train_cfg.get("save_epochs", True)),
         use_amp=bool(train_cfg.get("use_amp", False)),
         beta=float(train_cfg.get("beta", 1.0)),
         beta_warmup_epochs=int(train_cfg.get("beta_warmup_epochs", 0)),
