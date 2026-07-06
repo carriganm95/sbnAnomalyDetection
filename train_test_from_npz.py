@@ -6,8 +6,8 @@ whole-run selection and balancing rules as the original script, but writes
 separate test files for good and bad runs:
 
     events_train.npz  - selected good training runs
-    good_test.npz     - selected good test runs
-    bad_test.npz      - selected bad test runs
+    good_events_test.npz     - selected good test runs
+    bad_events_test.npz      - selected bad test runs
 """
 
 
@@ -30,14 +30,14 @@ NPZ_DIR = Path("/exp/sbnd/data/users/micarrig/DQM/tpc_data")
 # GraphVAE trains on good-only events and evaluates good/bad test samples
 # separately, so we write three files:
 #   events_train.npz : selected GOOD training runs
-#   good_test.npz    : selected GOOD test runs
-#   bad_test.npz     : selected BAD test runs
+#   good_events_test.npz    : selected GOOD test runs
+#   bad_events_test.npz     : selected BAD test runs
 #
 # These names match configs/graph_vae.yaml conventions.
 OUTPUT_PARENT_PATH = Path("/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/data")
 TRAIN_OUTPUT_PATH = OUTPUT_PARENT_PATH / "events_train.npz"
-GOOD_TEST_OUTPUT_PATH = OUTPUT_PARENT_PATH / "good_test.npz"
-BAD_TEST_OUTPUT_PATH = OUTPUT_PARENT_PATH / "bad_test.npz"
+GOOD_TEST_OUTPUT_PATH = OUTPUT_PARENT_PATH / "good_events_test.npz"
+BAD_TEST_OUTPUT_PATH = OUTPUT_PARENT_PATH / "bad_events_test.npz"
 
 # Whether to search subdirectories recursively
 RECURSIVE = True
@@ -1633,7 +1633,7 @@ def main() -> None:
     print("-" * 80)
     print("Test selection before channel filtering")
     print("-" * 80)
-    print("Test outputs are split by class: good_test.npz and bad_test.npz")
+    print("Test outputs are split by class: good_events_test.npz and bad_events_test.npz")
     print(f"Bad file/run entries selected for test: {len(selected_bad_infos)}")
     print(f"Bad total windows selected for test before filtering: {test_bad_windows}")
     print(f"Bad unique non-empty selected events for test: {test_bad_balance}")
