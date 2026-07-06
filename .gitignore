@@ -72,3 +72,7 @@ runs/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# scratch
+inspect_run.py
+leaf_names.txt
