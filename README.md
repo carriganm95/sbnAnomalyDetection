@@ -307,12 +307,32 @@ reconstruction error means "deviation from nominal in sigmas."
 **`model:`**
 - `latent_dim` — per-channel bottleneck size (smaller = tighter, harder to
   memorize anomalies).
-- `gnn_hidden`, `gnn_layers` — message-passing width and number of hops (per-node
-  embedding size, unrelated to channel count; 2–3 layers, watch over-smoothing).
-- `dec_hidden` — decoder MLP width.
+- `encoder_hidden_dims` — variable-width graph encoder dimensions. The number of
+  message-passing layers is `len(encoder_hidden_dims)`. For example,
+  `[128, 64, 32]` builds `enc_in -> 128 -> 64 -> 32 -> mu/logvar`.
+- `decoder_hidden_dims` — variable-width decoder MLP dimensions. The number of
+  decoder hidden layers is `len(decoder_hidden_dims)`. For example, `[32, 64]`
+  builds `latent -> 32 -> 64 -> reconstructed features`; use `[]` for a direct
+  `latent -> reconstructed features` decoder.
 - `dropout`, `mask_ratio` — regularization; `mask_ratio` is the denoising fraction.
 - `use_channel_idx` — feed channel id as conditioning (learn per-channel baselines).
 - `conv` — `sage` (self-preserving, recommended) or `gcn`.
+
+Example variable-layer model block:
+
+```yaml
+model:
+  latent_dim: 12
+  encoder_hidden_dims: [128, 64, 32]
+  decoder_hidden_dims: [32, 64]
+  dropout: 0.1
+  mask_ratio: 0.15
+  use_channel_idx: true
+  conv: sage
+```
+
+> (Important): Keep training and inference on the same YAML architecture, 
+               or checkpoint loading will fail with size mismatches.
 
 **`training:`**
 - `lr`, `weight_decay`, `batch_size`, `max_epochs`, `validation_split`.
@@ -331,6 +351,11 @@ Lessons from tuning this model on SBND runs:
 
 - **Measure every change with the `--compare` AUC (and `--stream` latency)** — not
   the histogram shape. Change **one thing at a time**.
+- **Tune layer widths with `encoder_hidden_dims` and `decoder_hidden_dims`.** The
+  encoder list controls both width and graph depth; deeper/wider encoders can
+  learn richer board/channel context but may over-smooth or memorize. The decoder
+  list controls reconstruction capacity; too much decoder capacity can reduce
+  anomaly separation by reconstructing bad windows too well.
 - **The anomaly signal lives in integral magnitude** (`sum`/`min`/`max`/`count`).
   Replacing those with occupancy/timing features *reduced* separation here; add
   occupancy/timing *on top* instead of replacing.
