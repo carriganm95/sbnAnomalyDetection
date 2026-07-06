@@ -590,17 +590,32 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
     model = GraphVAE(
         in_dim=dataset.node_feat_dim,
         latent_dim=int(model_cfg.get("latent_dim", 12)),
-        hidden=int(model_cfg.get("gnn_hidden", 64)),
-        enc_layers=int(model_cfg.get("gnn_layers", 2)),
-        dec_hidden=int(model_cfg.get("dec_hidden", 64)),
+        encoder_hidden_dims=model_cfg.get("encoder_hidden_dims", [128, 64]),
+        decoder_hidden_dims=model_cfg.get("decoder_hidden_dims", [32, 64]),
         dropout=float(model_cfg.get("dropout", 0.1)),
         mask_ratio=float(model_cfg.get("mask_ratio", 0.15)),
         use_channel_idx=bool(model_cfg.get("use_channel_idx", True)),
         conv=str(model_cfg.get("conv", "sage")),
     )
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("GraphVAE params=%d  in_dim=%d  latent=%d", n_params,
-                dataset.node_feat_dim, int(model_cfg.get("latent_dim", 12)))
+
+    logger.info(
+        "GraphVAE params=%d  in_dim=%d  latent_dim=%d  "
+        "encoder_hidden_dims=%s  decoder_hidden_dims=%s  "
+        "dropout=%.3f  mask_ratio=%.3f  use_channel_idx=%s  conv=%s",
+        n_params,
+        dataset.node_feat_dim,
+        int(model_cfg.get("latent_dim", 12)),
+        model.encoder_hidden_dims,
+        model.decoder_hidden_dims,
+        float(model_cfg.get("dropout", 0.1)),
+        float(model_cfg.get("mask_ratio", 0.15)),
+        bool(model_cfg.get("use_channel_idx", True)),
+        str(model_cfg.get("conv", "sage")),
+    )
+
+    logger.info("Model architecture:\n%s", model)
 
     trainer = GraphVAETrainer(
         model=model,

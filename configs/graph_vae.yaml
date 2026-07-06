@@ -23,7 +23,7 @@ model_type: graph_vae
 
 data:
   # Compact sparse events npz (preferred). Windows formed on the fly.
-  events_path: data/windows_train.npz
+  events_path: data/events_train.npz
   # windows_path: data/windows_train.npz   # alternative: dense (num_windows, num_nodes, F)
 
   # Window definition (how events are grouped into one reconstruction frame).
@@ -62,9 +62,17 @@ data:
 
 model:
   latent_dim: 12          # per-node bottleneck
-  gnn_hidden: 64
-  gnn_layers: 2
-  dec_hidden: 64
+
+  # Variable graph encoder dimensions.
+  # Number of graph encoder layers = len(encoder_hidden_dims).
+  # Example: [128, 64, 32] builds enc_in -> 128 -> 64 -> 32.
+  encoder_hidden_dims: [128, 64, 32]
+
+  # Variable decoder MLP dimensions.
+  # Example: [32, 64] builds latent -> 32 -> 64 -> reconstructed features.
+  # Use [] for a direct latent -> reconstructed features decoder.
+  decoder_hidden_dims: [32, 64]
+
   dropout: 0.1
   mask_ratio: 0.15        # denoising: fraction of nodes masked at train time
   use_channel_idx: true
@@ -81,13 +89,13 @@ training:
   save_best_only: true
   beta: 1.0               # KL weight
   beta_warmup_epochs: 10
-  checkpoint_dir: checkpoints/graph_vae/v5
-  output_path: checkpoints/graph_vae/v5/graph_vae_final.pt
+  checkpoint_dir: checkpoints/graph_vae/v6
+  output_path: checkpoints/graph_vae/v6/graph_vae_final.pt
   anomaly_threshold: null
   log_interval: 50
 
 inference:
-  checkpoint_path: checkpoints/graph_vae/v1/graph_vae_final.pt
+  checkpoint_path: checkpoints/graph_vae/v6/graph_vae_final.pt
   input_path: data/events_test.npz       # sparse events npz (or a dense windows npz)
   batch_size: 8
   # Window aggregator: mean | max | topk_mean | group_max_mean

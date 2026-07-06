@@ -502,17 +502,36 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
     num_channels = dataset.num_nodes
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     model = GraphVAE(
         in_dim=dataset.node_feat_dim,
         latent_dim=int(model_cfg.get("latent_dim", 12)),
-        hidden=int(model_cfg.get("gnn_hidden", 64)),
-        enc_layers=int(model_cfg.get("gnn_layers", 2)),
-        dec_hidden=int(model_cfg.get("dec_hidden", 64)),
+        encoder_hidden_dims=model_cfg.get("encoder_hidden_dims", [128, 64]),
+        decoder_hidden_dims=model_cfg.get("decoder_hidden_dims", [32, 64]),
         dropout=float(model_cfg.get("dropout", 0.1)),
         mask_ratio=0.0,  # no masking at inference
         use_channel_idx=bool(model_cfg.get("use_channel_idx", True)),
         conv=str(model_cfg.get("conv", "sage")),
     )
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    logger.info(
+        "GraphVAE inference model params=%d  in_dim=%d  latent_dim=%d  "
+        "encoder_hidden_dims=%s  decoder_hidden_dims=%s  "
+        "dropout=%.3f  mask_ratio=%.3f  use_channel_idx=%s  conv=%s",
+        n_params,
+        dataset.node_feat_dim,
+        int(model_cfg.get("latent_dim", 12)),
+        model.encoder_hidden_dims,
+        model.decoder_hidden_dims,
+        float(model_cfg.get("dropout", 0.1)),
+        0.0,
+        bool(model_cfg.get("use_channel_idx", True)),
+        str(model_cfg.get("conv", "sage")),
+    )
+
+    logger.info("Inference model architecture:\n%s", model)
+
     state = torch.load(checkpoint, map_location="cpu")
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
