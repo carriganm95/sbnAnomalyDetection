@@ -38,10 +38,17 @@ DEFAULT_RUNS_ROOT = DEFAULT_MODEL_ROOT
 # Store database/export summaries directly in the main project directory.
 DEFAULT_DB_PATH = PROJECT_DIR / "graph_vae_sweep.sqlite3"
 
-# Default separate GraphVAE evaluation inputs.
+# Default separate GraphVAE inference/evaluation inputs.
 # --input in sbn-infer overrides inference.input_path in the YAML.
 DEFAULT_GOOD_INPUT = PROJECT_DIR / "data" / "good_events_test.npz"
 DEFAULT_BAD_INPUT = PROJECT_DIR / "data" / "bad_events_test.npz"
+
+# Default good-vs-bad evaluation settings.
+DEFAULT_CHANNEL_MAP = PROJECT_DIR / "configs" / "SBNDTPCChannelMap_v2_with_positions.csv"
+DEFAULT_EVAL_AGGREGATOR = "group_max_mean"
+DEFAULT_EVAL_PLOT_NAME = "goodvsbad.png"
+DEFAULT_EVAL_LOG_NAME = "goodvsbad_eval.txt"
+DEFAULT_EVAL_JSON_NAME = "goodvsbad_eval.json"
 
 
 # ============================================================
@@ -138,9 +145,14 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             train_cmd TEXT,
             infer_good_cmd TEXT,
             infer_bad_cmd TEXT,
+            eval_cmd TEXT,
             train_returncode INTEGER,
             infer_good_returncode INTEGER,
             infer_bad_returncode INTEGER,
+            eval_returncode INTEGER,
+            eval_plot_path TEXT,
+            eval_log_path TEXT,
+            eval_json_path TEXT,
             error TEXT,
             config_json TEXT,
             metrics_json TEXT
@@ -172,6 +184,20 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         );
         """
     )
+
+    # Existing databases created by older versions of this script will not pick up
+    # new columns from CREATE TABLE IF NOT EXISTS, so add them explicitly.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(experiments)").fetchall()}
+    needed_cols = {
+        "eval_cmd": "TEXT",
+        "eval_returncode": "INTEGER",
+        "eval_plot_path": "TEXT",
+        "eval_log_path": "TEXT",
+        "eval_json_path": "TEXT",
+    }
+    for col, col_type in needed_cols.items():
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE experiments ADD COLUMN {col} {col_type}")
 
     conn.commit()
     return conn
@@ -286,6 +312,10 @@ def insert_experiment(
     train_cmd: list[str],
     infer_good_cmd: list[str],
     infer_bad_cmd: list[str],
+    eval_cmd: list[str],
+    eval_plot_path: Path,
+    eval_log_path: Path,
+    eval_json_path: Path,
     patched_cfg: dict[str, Any],
 ) -> int:
     cur = conn.execute(
@@ -306,9 +336,13 @@ def insert_experiment(
             train_cmd,
             infer_good_cmd,
             infer_bad_cmd,
+            eval_cmd,
+            eval_plot_path,
+            eval_log_path,
+            eval_json_path,
             config_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_name,
@@ -326,6 +360,10 @@ def insert_experiment(
             " ".join(shlex.quote(x) for x in train_cmd),
             " ".join(shlex.quote(x) for x in infer_good_cmd),
             " ".join(shlex.quote(x) for x in infer_bad_cmd),
+            " ".join(shlex.quote(x) for x in eval_cmd),
+            str(eval_plot_path),
+            str(eval_log_path),
+            str(eval_json_path),
             json.dumps(patched_cfg, default=jsonable),
         ),
     )
@@ -381,6 +419,7 @@ def update_experiment_done(
     train_returncode: int | None,
     infer_good_returncode: int | None,
     infer_bad_returncode: int | None,
+    eval_returncode: int | None,
     good_score_npz_path: Path | None,
     bad_score_npz_path: Path | None,
     error: str | None,
@@ -396,6 +435,7 @@ def update_experiment_done(
             train_returncode = ?,
             infer_good_returncode = ?,
             infer_bad_returncode = ?,
+            eval_returncode = ?,
             good_score_npz_path = ?,
             bad_score_npz_path = ?,
             error = ?,
@@ -409,6 +449,7 @@ def update_experiment_done(
             train_returncode,
             infer_good_returncode,
             infer_bad_returncode,
+            eval_returncode,
             str(good_score_npz_path) if good_score_npz_path else None,
             str(bad_score_npz_path) if bad_score_npz_path else None,
             error,
@@ -557,8 +598,14 @@ def run_command(
     timeout: int | None = None,
     monitor_interval: int = 30,
     batch: bool = False,
+    log_path: Path | None = None,
 ) -> int:
-    """Run command, show its output, and periodically inject resource usage."""
+    """Run command, show its output, and periodically inject resource usage.
+
+    If log_path is provided, stdout/stderr from the subprocess plus the
+    command header/footer are also written to that file. This is used for
+    per-model evaluation logs.
+    """
     import selectors
 
     header = (
@@ -567,6 +614,13 @@ def run_command(
         + "=" * 80
         + "\n"
     )
+    log_fh = None
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = log_path.open("w", encoding="utf-8")
+        log_fh.write(header)
+        log_fh.flush()
+
     print(header, end="", flush=True)
 
     env = os.environ.copy()
@@ -613,6 +667,9 @@ def run_command(
                     if chunk:
                         sys.stdout.buffer.write(chunk)
                         sys.stdout.buffer.flush()
+                        if log_fh is not None:
+                            log_fh.write(chunk.decode("utf-8", errors="replace"))
+                            log_fh.flush()
                     else:
                         try:
                             selector.unregister(key.fileobj)
@@ -624,7 +681,11 @@ def run_command(
             now = time.perf_counter()
 
             if monitor_interval > 0 and returncode is None and now - last_monitor >= monitor_interval:
-                print(get_process_usage_text(proc, "during command"), end="", flush=True)
+                usage_text = get_process_usage_text(proc, "during command")
+                print(usage_text, end="", flush=True)
+                if log_fh is not None:
+                    log_fh.write(usage_text)
+                    log_fh.flush()
                 last_monitor = time.perf_counter()
 
             if returncode is not None and not stdout_open:
@@ -645,6 +706,9 @@ def run_command(
 
     footer = "\n" + "=" * 80 + "\n" + f"returncode={returncode}\n"
     print(footer, end="", flush=True)
+    if log_fh is not None:
+        log_fh.write(footer)
+        log_fh.close()
 
     return int(returncode)
 
@@ -821,6 +885,63 @@ def mann_whitney_auc(good_scores: np.ndarray, bad_scores: np.ndarray) -> float:
     return float(u_bad / (n_good * n_bad))
 
 
+def parse_window_score_eval_log(eval_log_path: Path) -> dict[str, Any]:
+    """Best-effort parser for window_score textual output.
+
+    The exact print format may change, so this stores the full log separately and
+    only extracts common scalar fields when their names appear in the output.
+    """
+    metrics: dict[str, Any] = {}
+    if not eval_log_path.exists():
+        return metrics
+
+    text = eval_log_path.read_text(errors="replace")
+    patterns = {
+        "eval.auc": r"(?i)\bAUC\b[^0-9+\-.eE]*(?P<value>[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)",
+        "eval.threshold": r"(?i)\bthreshold\b[^0-9+\-.eE]*(?P<value>[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)",
+        "eval.precision": r"(?i)\bprecision\b[^0-9+\-.eE]*(?P<value>[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)",
+        "eval.recall": r"(?i)\brecall\b[^0-9+\-.eE]*(?P<value>[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)",
+        "eval.f1": r"(?i)\bF1\b[^0-9+\-.eE]*(?P<value>[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)",
+        "eval.fpr": r"(?i)\bFPR\b[^0-9+\-.eE]*(?P<value>[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text)
+        if match:
+            try:
+                metrics[key] = float(match.group("value"))
+            except ValueError:
+                pass
+
+    return metrics
+
+
+def save_eval_summary_json(
+    eval_json_path: Path,
+    *,
+    eval_cmd: list[str],
+    eval_returncode: int | None,
+    eval_plot_path: Path,
+    eval_log_path: Path,
+    good_score_npz_path: Path,
+    bad_score_npz_path: Path,
+    metrics: dict[str, Any],
+) -> None:
+    eval_json_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "created_at": now_str(),
+        "command": " ".join(shlex.quote(x) for x in eval_cmd),
+        "returncode": eval_returncode,
+        "plot_path": str(eval_plot_path),
+        "log_path": str(eval_log_path),
+        "good_score_npz_path": str(good_score_npz_path),
+        "bad_score_npz_path": str(bad_score_npz_path),
+        "metrics": metrics,
+    }
+    with eval_json_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=jsonable)
+        fh.write("\n")
+
+
 def collect_run_metrics(
     checkpoint_dir: Path,
     good_score_npz_path: Path,
@@ -925,6 +1046,7 @@ def run_sweep(args: argparse.Namespace) -> int:
     db_path = Path(args.db_path)
     good_input = Path(args.good_input)
     bad_input = Path(args.bad_input)
+    channel_map = Path(args.channel_map)
 
     if not config_dir.exists():
         raise FileNotFoundError(f"Config directory does not exist: {config_dir}")
@@ -935,6 +1057,9 @@ def run_sweep(args: argparse.Namespace) -> int:
         if not bad_input.exists():
             raise FileNotFoundError(f"Bad inference input does not exist: {bad_input}")
 
+    if not args.skip_infer and not args.skip_eval and not channel_map.exists():
+        raise FileNotFoundError(f"Channel map for evaluation does not exist: {channel_map}")
+
     config_paths = sorted(config_dir.glob(args.pattern))
     if not config_paths:
         raise FileNotFoundError(f"No configs matching {args.pattern!r} found in {config_dir}")
@@ -943,6 +1068,7 @@ def run_sweep(args: argparse.Namespace) -> int:
 
     train_base_cmd = shlex.split(args.train_cmd)
     infer_base_cmd = shlex.split(args.infer_cmd)
+    eval_base_cmd = shlex.split(args.eval_cmd)
 
     if args.missing_infer_only:
         args.infer_only = True
@@ -962,6 +1088,11 @@ def run_sweep(args: argparse.Namespace) -> int:
     print(f"Batch mode: {args.batch}")
     print(f"Infer-only mode: {args.infer_only}")
     print(f"Missing-infer-only mode: {args.missing_infer_only}")
+    print(f"Skip evaluation: {args.skip_eval}")
+    if not args.skip_eval:
+        print(f"Evaluation command: {args.eval_cmd}")
+        print(f"Evaluation aggregator: {args.eval_aggregator}")
+        print(f"Evaluation channel map: {channel_map}")
     if args.batch:
         print("Progress-bar suppression env enabled: SBN_BATCH=1, TQDM_DISABLE=1")
     print("=" * 80)
@@ -975,13 +1106,26 @@ def run_sweep(args: argparse.Namespace) -> int:
         inference_dir = run_dir / "inference_result"
         good_score_npz_path = inference_dir / "scores_good.npz"
         bad_score_npz_path = inference_dir / "scores_bad.npz"
+        eval_plot_path = inference_dir / args.eval_plot_name
+        eval_log_path = inference_dir / args.eval_log_name
+        eval_json_path = inference_dir / args.eval_json_name
 
-        if args.missing_infer_only and good_score_npz_path.exists() and bad_score_npz_path.exists():
+        if (
+            args.missing_infer_only
+            and good_score_npz_path.exists()
+            and bad_score_npz_path.exists()
+            and (args.skip_eval or eval_json_path.exists())
+        ):
             print("\n" + "=" * 80)
             print(f"[{idx}/{len(config_paths)}] {config_path}")
-            print("Skipping because --missing-infer-only was set and both inference outputs already exist.")
+            print(
+                "Skipping because --missing-infer-only was set, both inference outputs "
+                "already exist, and evaluation is not requested or already exists."
+            )
             print(f"Existing good inference output: {good_score_npz_path}")
             print(f"Existing bad inference output:  {bad_score_npz_path}")
+            if not args.skip_eval:
+                print(f"Existing evaluation summary: {eval_json_path}")
             print("=" * 80)
             continue
 
@@ -1061,6 +1205,7 @@ def run_sweep(args: argparse.Namespace) -> int:
         train_returncode: int | None = None
         infer_good_returncode: int | None = None
         infer_bad_returncode: int | None = None
+        eval_returncode: int | None = None
         experiment_id: int | None = None
         metrics: dict[str, Any] = {}
         error: str | None = None
@@ -1097,6 +1242,25 @@ def run_sweep(args: argparse.Namespace) -> int:
                 "--output",
                 str(bad_score_npz_path),
             ]
+            eval_cmd = eval_base_cmd + [
+                "--scores",
+                str(good_score_npz_path),
+                "--compare",
+                str(bad_score_npz_path),
+                "--labels",
+                args.good_label,
+                args.bad_label,
+                "--aggregator",
+                args.eval_aggregator,
+                "--channel-map",
+                str(channel_map),
+                "--plot",
+                str(eval_plot_path),
+            ]
+            if args.eval_threshold is not None:
+                eval_cmd += ["--threshold", str(args.eval_threshold)]
+            if args.eval_per_run:
+                eval_cmd += ["--per-run"]
 
             experiment_id = insert_experiment(
                 conn,
@@ -1113,6 +1277,10 @@ def run_sweep(args: argparse.Namespace) -> int:
                 train_cmd=train_cmd,
                 infer_good_cmd=infer_good_cmd,
                 infer_bad_cmd=infer_bad_cmd,
+                eval_cmd=eval_cmd,
+                eval_plot_path=eval_plot_path,
+                eval_log_path=eval_log_path,
+                eval_json_path=eval_json_path,
                 patched_cfg=patched_cfg,
             )
             insert_params(conn, experiment_id, patched_cfg)
@@ -1154,6 +1322,22 @@ def run_sweep(args: argparse.Namespace) -> int:
                     if infer_bad_returncode != 0:
                         raise RuntimeError(f"Bad inference failed with return code {infer_bad_returncode}")
 
+
+                    if args.skip_eval:
+                        print("Skipping good-vs-bad evaluation because --skip-eval was set.")
+                    else:
+                        print("Good-vs-bad evaluation...")
+                        eval_returncode = run_command(
+                            eval_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                            log_path=eval_log_path,
+                        )
+                        if eval_returncode != 0:
+                            raise RuntimeError(f"Evaluation failed with return code {eval_returncode}")
+
                     status = "success"
 
             else:
@@ -1194,6 +1378,22 @@ def run_sweep(args: argparse.Namespace) -> int:
                     if infer_bad_returncode != 0:
                         raise RuntimeError(f"Bad inference failed with return code {infer_bad_returncode}")
 
+
+                    if args.skip_eval:
+                        print("Skipping good-vs-bad evaluation because --skip-eval was set.")
+                    else:
+                        print("Good-vs-bad evaluation...")
+                        eval_returncode = run_command(
+                            eval_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                            log_path=eval_log_path,
+                        )
+                        if eval_returncode != 0:
+                            raise RuntimeError(f"Evaluation failed with return code {eval_returncode}")
+
                     status = "success"
 
             if status == "missing_weights":
@@ -1209,6 +1409,25 @@ def run_sweep(args: argparse.Namespace) -> int:
                     good_score_npz_path=good_score_npz_path,
                     bad_score_npz_path=bad_score_npz_path,
                 )
+                metrics["eval.skipped"] = int(args.skip_eval)
+                if not args.skip_eval:
+                    metrics["eval.returncode"] = eval_returncode if eval_returncode is not None else -1
+                    metrics["eval.plot_path"] = str(eval_plot_path)
+                    metrics["eval.log_path"] = str(eval_log_path)
+                    metrics["eval.json_path"] = str(eval_json_path)
+                    metrics["eval.plot.exists"] = int(eval_plot_path.exists())
+                    metrics["eval.log.exists"] = int(eval_log_path.exists())
+                    metrics.update(parse_window_score_eval_log(eval_log_path))
+                    save_eval_summary_json(
+                        eval_json_path,
+                        eval_cmd=eval_cmd,
+                        eval_returncode=eval_returncode,
+                        eval_plot_path=eval_plot_path,
+                        eval_log_path=eval_log_path,
+                        good_score_npz_path=good_score_npz_path,
+                        bad_score_npz_path=bad_score_npz_path,
+                        metrics=metrics,
+                    )
 
             insert_metrics(conn, experiment_id, metrics)
 
@@ -1228,6 +1447,7 @@ def run_sweep(args: argparse.Namespace) -> int:
                     train_returncode=train_returncode,
                     infer_good_returncode=infer_good_returncode,
                     infer_bad_returncode=infer_bad_returncode,
+                    eval_returncode=eval_returncode,
                     good_score_npz_path=good_score_npz_path,
                     bad_score_npz_path=bad_score_npz_path,
                     error=error,
@@ -1298,6 +1518,85 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--infer-cmd",
         default="sbn-infer",
         help='Inference command, e.g. "sbn-infer" or "python -m sbn_anomaly.infer.cli".',
+    )
+    parser.add_argument(
+        "--eval-cmd",
+        default="python -m sbn_anomaly.infer.window_score",
+        help=(
+            "Evaluation command run after good/bad inference. The script appends "
+            "--scores, --compare, --labels, --aggregator, --channel-map, and --plot."
+        ),
+    )
+    parser.add_argument(
+        "--skip-eval",
+        "--skip_eval",
+        dest="skip_eval",
+        action="store_true",
+        help="Run train/inference only; do not run good-vs-bad window_score evaluation.",
+    )
+    parser.add_argument(
+        "--eval-aggregator",
+        "--eval_aggregator",
+        dest="eval_aggregator",
+        default=DEFAULT_EVAL_AGGREGATOR,
+        help="Aggregator passed to sbn_anomaly.infer.window_score.",
+    )
+    parser.add_argument(
+        "--channel-map",
+        "--channel_map",
+        dest="channel_map",
+        default=str(DEFAULT_CHANNEL_MAP),
+        help="Channel map CSV passed to sbn_anomaly.infer.window_score --channel-map.",
+    )
+    parser.add_argument(
+        "--eval-threshold",
+        "--eval_threshold",
+        dest="eval_threshold",
+        type=float,
+        default=None,
+        help="Optional operating threshold passed to window_score. Default uses good-set p99.",
+    )
+    parser.add_argument(
+        "--eval-per-run",
+        "--eval_per_run",
+        dest="eval_per_run",
+        action="store_true",
+        help="Also pass --per-run to window_score.",
+    )
+    parser.add_argument(
+        "--good-label",
+        "--good_label",
+        dest="good_label",
+        default="good",
+        help="First label passed to window_score --labels.",
+    )
+    parser.add_argument(
+        "--bad-label",
+        "--bad_label",
+        dest="bad_label",
+        default="bad",
+        help="Second label passed to window_score --labels.",
+    )
+    parser.add_argument(
+        "--eval-plot-name",
+        "--eval_plot_name",
+        dest="eval_plot_name",
+        default=DEFAULT_EVAL_PLOT_NAME,
+        help="Evaluation plot filename inside each inference_result directory.",
+    )
+    parser.add_argument(
+        "--eval-log-name",
+        "--eval_log_name",
+        dest="eval_log_name",
+        default=DEFAULT_EVAL_LOG_NAME,
+        help="Evaluation stdout/stderr log filename inside each inference_result directory.",
+    )
+    parser.add_argument(
+        "--eval-json-name",
+        "--eval_json_name",
+        dest="eval_json_name",
+        default=DEFAULT_EVAL_JSON_NAME,
+        help="Evaluation JSON summary filename inside each inference_result directory.",
     )
     parser.add_argument(
         "--timeout",
