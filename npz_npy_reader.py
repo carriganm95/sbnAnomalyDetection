@@ -153,6 +153,76 @@ def scalar_to_csv_text(x):
     return repr(x) if isinstance(x, (bytes, str, list, tuple, dict, set)) else x
 
 
+def count_nan_in_array(arr):
+    """
+    Count NaN values in one array.
+
+    Integer, boolean, string, and byte-string arrays cannot contain real NaN
+    values, so they return 0. Floating and complex arrays are counted directly.
+    Object arrays are checked element-by-element because they may contain Python
+    float('nan') values mixed with strings, lists, or other objects.
+    """
+    arr = np.asarray(arr)
+
+    if arr.size == 0:
+        return 0
+
+    if arr.dtype.kind in {"f", "c"}:
+        return int(np.count_nonzero(np.isnan(arr)))
+
+    if arr.dtype == object:
+        n_nan = 0
+        for value in arr.ravel():
+            try:
+                is_nan = np.isnan(value)
+            except (TypeError, ValueError):
+                continue
+
+            if np.asarray(is_nan).shape == () and bool(is_nan):
+                n_nan += 1
+
+        return int(n_nan)
+
+    return 0
+
+
+def print_nan_summary(array_items, title="NaN summary"):
+    """
+    Print the number of NaN values in each array and the total across arrays.
+
+    Parameters
+    ----------
+    array_items:
+        Iterable of (name, array) pairs.
+    title:
+        Header printed above the summary.
+    """
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+    total_nan = 0
+    total_values = 0
+
+    for name, arr in array_items:
+        arr = np.asarray(arr)
+        n_nan = count_nan_in_array(arr)
+        total_nan += n_nan
+        total_values += int(arr.size)
+
+        print(
+            f"  {name}: nan={n_nan}, size={arr.size}, "
+            f"dtype={arr.dtype}, shape={arr.shape}"
+        )
+
+    print("-" * 80)
+    print(f"  TOTAL NaN values across all arrays: {total_nan}")
+    print(f"  TOTAL values across all arrays:     {total_values}")
+    print("=" * 80)
+
+    return total_nan
+
+
 def write_npz_full_csv(npz_path, csv_path=None):
     """
     Write every value stored in an NPZ file to one long-format CSV.
@@ -249,6 +319,11 @@ def print_npz(npz_path, full=False, max_items=50):
         print(f"  size:  {arr.size}")
 
         print_array_values(arr, full=full, max_items=max_items)
+
+    print_nan_summary(
+        ((key, meta[key]) for key in meta.files),
+        title="NaN summary for NPZ arrays",
+    )
 
     # Extra sparse-mode interpretation, if possible
     print_sparse_npz_interpretation(meta, full=full, max_items=max_items)
@@ -466,6 +541,11 @@ def print_npy(npy_path, npz_path=None):
     print(f"  n_bins:     {n_bins}")
     print(f"  n_features: {n_features}")
     print(f"  features:   {meta['node_features']}")
+
+    print_nan_summary(
+        [("windows", windows)],
+        title="NaN summary for NPY array",
+    )
 
     if n_windows > 0 and n_channels > 0:
         first_window = windows[0]

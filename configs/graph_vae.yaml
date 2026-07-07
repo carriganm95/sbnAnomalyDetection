@@ -29,7 +29,7 @@ data:
   # Window definition (how events are grouped into one reconstruction frame).
   window_size: 100
   n_temporal_bins: 4
-  stride: 100
+  stride: 50
 
   adjacency_radius: 4
   prune_inactive: true
@@ -39,7 +39,7 @@ data:
   tree_name: caloskim/TrackCaloSkim
   # hit_branches: [hits0.h.integral, hits0.h.channel, ...]
   # tpc_branches: [meta.run, meta.subrun, meta.evt]
-  n_channels: 11276
+  n_channels: 200
 
   # Geometry-aware graph (see configs/gnn.yaml). electronics recommended.
   channel_map: configs/SBNDTPCChannelMap_v2_with_positions.csv
@@ -83,20 +83,20 @@ training:
   num_workers: 4
   lr: 0.001
   weight_decay: 1.0e-4
-  max_epochs: 100
+  max_epochs: 200
   validation_split: 0.1
   use_amp: true
   save_best_only: true
-  beta: 1.0               # KL weight
+  beta: 0.8               # KL weight
   beta_warmup_epochs: 10
-  checkpoint_dir: checkpoints/graph_vae/v6
-  output_path: checkpoints/graph_vae/v6/graph_vae_final.pt
+  checkpoint_dir: checkpoints/graph_vae/v7
+  output_path: checkpoints/graph_vae/v7/graph_vae_final.pt
   anomaly_threshold: null
   log_interval: 50
   save_epochs: false
 
 inference:
-  checkpoint_path: checkpoints/graph_vae/v6/graph_vae_final.pt
+  checkpoint_path: checkpoints/graph_vae/v7/graph_vae_final.pt
   input_path: data/events_test.npz       # sparse events npz (or a dense windows npz)
   batch_size: 8
   # Window aggregator: mean | max | topk_mean | group_max_mean
