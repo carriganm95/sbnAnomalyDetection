@@ -49,6 +49,7 @@ DEFAULT_EVAL_AGGREGATOR = "group_max_mean"
 DEFAULT_EVAL_PLOT_NAME = "goodvsbad.png"
 DEFAULT_EVAL_LOG_NAME = "goodvsbad_eval.txt"
 DEFAULT_EVAL_JSON_NAME = "goodvsbad_eval.json"
+DEFAULT_EVAL_PERCENTILE = 90.0
 
 
 # ============================================================
@@ -294,6 +295,23 @@ def run_directory_needs_rewrite(run_dir: Path) -> tuple[bool, str]:
         return True, f"run directory only contains one YAML file: {entries[0].name}"
 
     return False, f"run directory looks non-empty enough: {run_dir}"
+
+
+def evaluation_outputs_missing(
+    *,
+    eval_plot_path: Path,
+    eval_log_path: Path,
+    eval_json_path: Path,
+) -> list[Path]:
+    """Return evaluation output files that are missing.
+
+    These are the files produced by this sweep script's evaluation stage:
+    the window_score plot, the captured evaluation log, and the JSON summary.
+    The good/bad score NPZ files are inference outputs, so they are checked
+    separately only when evaluation actually needs to run.
+    """
+    expected_paths = [eval_plot_path, eval_log_path, eval_json_path]
+    return [path for path in expected_paths if not path.exists()]
 
 
 def insert_experiment(
@@ -1051,13 +1069,27 @@ def run_sweep(args: argparse.Namespace) -> int:
     if not config_dir.exists():
         raise FileNotFoundError(f"Config directory does not exist: {config_dir}")
 
-    if not args.skip_infer:
+    if args.missing_evaluate_only:
+        args.evaluate_only = True
+
+    if args.evaluate_only and args.skip_eval:
+        raise ValueError(
+            "--evaluate-only/--missing-evaluate-only and --skip-eval cannot be used together."
+        )
+
+    if args.evaluate_only and (args.infer_only or args.missing_infer_only):
+        raise ValueError(
+            "--evaluate-only/--missing-evaluate-only cannot be combined with "
+            "--infer-only or --missing-infer-only."
+        )
+
+    if not args.evaluate_only and not args.skip_infer:
         if not good_input.exists():
             raise FileNotFoundError(f"Good inference input does not exist: {good_input}")
         if not bad_input.exists():
             raise FileNotFoundError(f"Bad inference input does not exist: {bad_input}")
 
-    if not args.skip_infer and not args.skip_eval and not channel_map.exists():
+    if not args.skip_eval and not channel_map.exists():
         raise FileNotFoundError(f"Channel map for evaluation does not exist: {channel_map}")
 
     config_paths = sorted(config_dir.glob(args.pattern))
@@ -1086,6 +1118,8 @@ def run_sweep(args: argparse.Namespace) -> int:
     print(f"Good inference input: {good_input}")
     print(f"Bad inference input:  {bad_input}")
     print(f"Batch mode: {args.batch}")
+    print(f"Evaluate-only mode: {args.evaluate_only}")
+    print(f"Missing-evaluate-only mode: {args.missing_evaluate_only}")
     print(f"Infer-only mode: {args.infer_only}")
     print(f"Missing-infer-only mode: {args.missing_infer_only}")
     print(f"Skip evaluation: {args.skip_eval}")
@@ -1093,6 +1127,10 @@ def run_sweep(args: argparse.Namespace) -> int:
         print(f"Evaluation command: {args.eval_cmd}")
         print(f"Evaluation aggregator: {args.eval_aggregator}")
         print(f"Evaluation channel map: {channel_map}")
+        if args.eval_threshold is not None:
+            print(f"Evaluation threshold: {args.eval_threshold} (explicit; percentile ignored by window_score)")
+        else:
+            print(f"Evaluation percentile: {args.eval_percentile}")
     if args.batch:
         print("Progress-bar suppression env enabled: SBN_BATCH=1, TQDM_DISABLE=1")
     print("=" * 80)
@@ -1129,6 +1167,37 @@ def run_sweep(args: argparse.Namespace) -> int:
             print("=" * 80)
             continue
 
+        missing_eval_output_paths = evaluation_outputs_missing(
+            eval_plot_path=eval_plot_path,
+            eval_log_path=eval_log_path,
+            eval_json_path=eval_json_path,
+        )
+
+        if args.missing_evaluate_only and not missing_eval_output_paths:
+            print("\n" + "=" * 80)
+            print(f"[{idx}/{len(config_paths)}] {config_path}")
+            print(
+                "Skipping because --missing-evaluate-only was set and all evaluation "
+                "outputs already exist."
+            )
+            print(f"Existing evaluation plot: {eval_plot_path}")
+            print(f"Existing evaluation log:  {eval_log_path}")
+            print(f"Existing evaluation JSON: {eval_json_path}")
+            print("=" * 80)
+            continue
+
+        if args.missing_evaluate_only:
+            print("\n" + "=" * 80)
+            print(f"[{idx}/{len(config_paths)}] {config_path}")
+            print(
+                "--missing-evaluate-only was set and at least one evaluation output "
+                "is missing, so evaluation will be rerun from the saved scores."
+            )
+            print("Missing evaluation output(s):")
+            for path in missing_eval_output_paths:
+                print(f"  - {path}")
+            print("=" * 80)
+
         existing_experiment = get_existing_experiment(conn, run_name)
         existing_status = None
         if existing_experiment is not None:
@@ -1140,7 +1209,35 @@ def run_sweep(args: argparse.Namespace) -> int:
             if args.missing_rewrite:
                 missing_rewrite_needed, missing_rewrite_reason = run_directory_needs_rewrite(run_dir)
 
-            if args.infer_only:
+            if args.evaluate_only:
+                print("\n" + "=" * 80)
+                print(f"[{idx}/{len(config_paths)}] {config_path}")
+                print(f"Run name conflict: {run_name!r}")
+                if args.missing_evaluate_only:
+                    print(
+                        "missing_evaluate_only=True and evaluation output(s) are missing, "
+                        "so the old database record will be replaced and only the saved "
+                        "good/bad score files will be re-evaluated."
+                    )
+                else:
+                    print(
+                        "evaluate_only=True, so the old database record will be replaced "
+                        "and only the saved good/bad score files will be re-evaluated."
+                    )
+                print(f"Existing status: {existing_experiment.get('status')}")
+                print(f"Existing good scores: {existing_experiment.get('good_score_npz_path')}")
+                print(f"Existing bad scores:  {existing_experiment.get('bad_score_npz_path')}")
+                print("=" * 80)
+                delete_existing_experiment(
+                    conn,
+                    run_name,
+                    reason=(
+                        "missing_evaluate_only=True"
+                        if args.missing_evaluate_only
+                        else "evaluate_only=True"
+                    ),
+                )
+            elif args.infer_only:
                 print("\n" + "=" * 80)
                 print(f"[{idx}/{len(config_paths)}] {config_path}")
                 print(f"Run name conflict: {run_name!r}")
@@ -1154,7 +1251,7 @@ def run_sweep(args: argparse.Namespace) -> int:
                 delete_existing_experiment(conn, run_name, reason="infer_only=True")
             elif args.force_rewrite:
                 delete_existing_experiment(conn, run_name, reason="force_rewrite=True")
-            elif existing_status in {"failed", "running", "missing_weights"}:
+            elif existing_status in {"failed", "running", "missing_weights", "missing_scores"}:
                 print("\n" + "=" * 80)
                 print(f"[{idx}/{len(config_paths)}] {config_path}")
                 print(f"Run name conflict: {run_name!r}")
@@ -1259,6 +1356,8 @@ def run_sweep(args: argparse.Namespace) -> int:
             ]
             if args.eval_threshold is not None:
                 eval_cmd += ["--threshold", str(args.eval_threshold)]
+            elif args.eval_percentile is not None:
+                eval_cmd += ["--percentile", str(args.eval_percentile)]
             if args.eval_per_run:
                 eval_cmd += ["--per-run"]
 
@@ -1285,7 +1384,60 @@ def run_sweep(args: argparse.Namespace) -> int:
             )
             insert_params(conn, experiment_id, patched_cfg)
 
-            if args.infer_only:
+            if args.evaluate_only:
+                if args.missing_evaluate_only:
+                    print(
+                        "Skipping training and inference because --missing-evaluate-only "
+                        "reruns only missing evaluation outputs."
+                    )
+                else:
+                    print("Skipping training and inference because --evaluate-only was set.")
+                print(f"Using existing good score file: {good_score_npz_path}")
+                print(f"Using existing bad score file:  {bad_score_npz_path}")
+
+                missing_score_paths = [
+                    path
+                    for path in (good_score_npz_path, bad_score_npz_path)
+                    if not path.exists()
+                ]
+                if missing_score_paths:
+                    error = (
+                        "Saved score file(s) missing for evaluate-only mode: "
+                        + ", ".join(str(path) for path in missing_score_paths)
+                    )
+                    print(f"ERROR: {error}")
+                    status = "missing_scores"
+                    metrics = {
+                        "checkpoint.exists": int(final_model_path.exists()),
+                        "checkpoint.expected_path": str(final_model_path),
+                        "good.score_npz.exists": int(good_score_npz_path.exists()),
+                        "good.score_npz.path": str(good_score_npz_path),
+                        "bad.score_npz.exists": int(bad_score_npz_path.exists()),
+                        "bad.score_npz.path": str(bad_score_npz_path),
+                    }
+                else:
+                    if not final_model_path.exists():
+                        print(
+                            "WARNING: expected checkpoint is missing, but evaluation only "
+                            "uses saved score files, so evaluation will still run."
+                        )
+                        print(f"Expected checkpoint: {final_model_path}")
+
+                    print("Good-vs-bad evaluation...")
+                    eval_returncode = run_command(
+                        eval_cmd,
+                        cwd=PROJECT_DIR,
+                        timeout=args.timeout,
+                        monitor_interval=args.monitor_interval,
+                        batch=args.batch,
+                        log_path=eval_log_path,
+                    )
+                    if eval_returncode != 0:
+                        raise RuntimeError(f"Evaluation failed with return code {eval_returncode}")
+
+                    status = "success"
+
+            elif args.infer_only:
                 if not final_model_path.exists():
                     error = (
                         f"Expected trained weight file is missing for run_name={run_name!r}: "
@@ -1403,6 +1555,8 @@ def run_sweep(args: argparse.Namespace) -> int:
                     "good.score_npz.exists": 0,
                     "bad.score_npz.exists": 0,
                 }
+            elif status == "missing_scores":
+                pass
             else:
                 metrics = collect_run_metrics(
                     checkpoint_dir=checkpoint_dir,
@@ -1410,6 +1564,8 @@ def run_sweep(args: argparse.Namespace) -> int:
                     bad_score_npz_path=bad_score_npz_path,
                 )
                 metrics["eval.skipped"] = int(args.skip_eval)
+                metrics["eval.evaluate_only"] = int(args.evaluate_only)
+                metrics["eval.missing_evaluate_only"] = int(args.missing_evaluate_only)
                 if not args.skip_eval:
                     metrics["eval.returncode"] = eval_returncode if eval_returncode is not None else -1
                     metrics["eval.plot_path"] = str(eval_plot_path)
@@ -1528,6 +1684,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--evaluate-only",
+        "--evaluate_only",
+        "--eval-only",
+        "--eval_only",
+        dest="evaluate_only",
+        action="store_true",
+        help=(
+            "Do not train and do not rerun inference. For each YAML, use the existing "
+            "<runs-root>/<config_stem>/inference_result/scores_good.npz and "
+            "scores_bad.npz files and rerun only the good-vs-bad window_score evaluation. "
+            "This lets you re-aggregate and re-threshold saved scores."
+        ),
+    )
+    parser.add_argument(
+        "--missing-evaluate-only",
+        "--missing_evaluate_only",
+        "--missing-eval-only",
+        "--missing_eval_only",
+        dest="missing_evaluate_only",
+        action="store_true",
+        help=(
+            "Only rerun evaluation for runs missing at least one evaluation output file: "
+            "the evaluation plot, evaluation log, or evaluation JSON summary. This implies "
+            "--evaluate-only and uses existing scores_good.npz and scores_bad.npz files."
+        ),
+    )
+    parser.add_argument(
         "--skip-eval",
         "--skip_eval",
         dest="skip_eval",
@@ -1554,7 +1737,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="eval_threshold",
         type=float,
         default=None,
-        help="Optional operating threshold passed to window_score. Default uses good-set p99.",
+        help="Optional explicit operating threshold passed to window_score. If set, this overrides --eval-percentile.",
+    )
+    parser.add_argument(
+        "--eval-percentile",
+        "--eval_percentile",
+        dest="eval_percentile",
+        type=float,
+        default=DEFAULT_EVAL_PERCENTILE,
+        help="Good-set percentile passed to window_score --percentile when --eval-threshold is not set. Default: %(default)s.",
     )
     parser.add_argument(
         "--eval-per-run",
