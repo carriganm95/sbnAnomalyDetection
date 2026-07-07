@@ -29,7 +29,7 @@ data:
   # Window definition (how events are grouped into one reconstruction frame).
   window_size: 100
   n_temporal_bins: 4
-  stride: 50
+  stride: 100
 
   adjacency_radius: 4
   prune_inactive: true
