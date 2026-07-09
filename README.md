@@ -9,10 +9,233 @@ detector activity at a time. Windows that reconstruct poorly are anomalous, so
 problems can be flagged from a small amount of data — no waiting for a whole run.
 
 - Model type: `graph_vae`
-- Config: [`configs/graph_vae.yaml`](configs/graph_vae.yaml)
-- Train: `sbn-train --config configs/graph_vae.yaml`
-- Score: `sbn-infer --config configs/graph_vae.yaml --input <events.npz> --output scores.npz`
-- Evaluate: `python -m sbn_anomaly.infer.window_score ...`
+- Base config: [`configs/graph_vae.yaml`](configs/graph_vae.yaml)
+- Sweep config generator: [`config_maker.py`](config_maker.py)
+- Sweep runner / evaluator: [`run_graph_vae_sweep.py`](run_graph_vae_sweep.py)
+- Single-model train: `sbn-train --config configs/graph_vae.yaml`
+- Single-model score: `sbn-infer --config configs/graph_vae.yaml --input <events.npz> --output scores.npz`
+- Single-model evaluate: `python -m sbn_anomaly.infer.window_score ...`
+
+> The main maintained workflow is now based on `config_maker.py` and
+> `run_graph_vae_sweep.py`. Older helper scripts such as `npz_npy_reader.py` and
+> `train_test_from_npz.py` are not part of the recommended workflow and are not
+> documented here.
+
+---
+
+## Recommended workflow
+
+For tuning, the intended path is:
+
+```text
+configs/graph_vae.yaml
+        │
+        ▼
+config_maker.py
+        │  writes many YAML files
+        ▼
+tuning_configs/graph_vae_sweep/*.yaml
+        │
+        ▼
+run_graph_vae_sweep.py
+        │  train each config
+        │  infer on good test events
+        │  infer on bad test events
+        │  evaluate good-vs-bad separation
+        ▼
+checkpoints/graph_vae/<run_name>/
+graph_vae_sweep.sqlite3
+```
+
+### Step 1: Prepare sparse event NPZ files
+
+The GraphVAE workflow expects sparse-events `.npz` files. The default sweep
+runner paths assume:
+
+```text
+data/good_events_test.npz
+data/bad_events_test.npz
+```
+
+The training input is set in each generated YAML through the copied base config,
+usually from `data.events_path` in `configs/graph_vae.yaml`.
+
+### Step 2: Edit the base GraphVAE YAML
+
+Start from:
+
+```bash
+configs/graph_vae.yaml
+```
+
+This base file defines the common dataset, graph, feature, model, training, and
+inference settings. `config_maker.py` copies this file and overrides only the
+sweep parameters, so anything not listed in `config_maker.py` still comes from
+`configs/graph_vae.yaml`.
+
+Make sure the base YAML has the correct:
+
+- `data.events_path` for good-run training events.
+- `data.channel_map` and graph settings.
+- `data.node_features` and `data.log_features`.
+- `model.encoder_hidden_dims`, `model.decoder_hidden_dims`, and `model.latent_dim`.
+- `training.beta_warmup_epochs`, `training.validation_split`, and other fixed training settings.
+
+### Step 3: Generate sweep YAMLs with `config_maker.py`
+
+`config_maker.py` is the sweep-config generator. Edit the constants near the top
+of the file to define the parameter grid:
+
+```python
+BASE_YAML_PATH = Path("configs/graph_vae.yaml")
+OUTPUT_YAML_DIR = Path("tuning_configs/graph_vae_sweep")
+START_INDEX = 0
+
+WINDOW_SIZES = [50, 100, 200]
+STRIDES = [50, 100, 200]
+ADJACENCY_RADII = [4]
+BATCH_SIZES = [64]
+LEARNING_RATES = [0.001]
+BETAS = [0.8]
+
+DEFAULT_WEIGHT_DECAY = 1.0e-4
+DEFAULT_MAX_EPOCHS = 200
+CHECKPOINT_BASE_DIR = Path("checkpoints/graph_vae")
+```
+
+Then generate the YAMLs:
+
+```bash
+python config_maker.py
+```
+
+Common options:
+
+```bash
+# Force stride = window_size for every window size
+python config_maker.py --same-stride
+
+# Start numbering from a chosen index
+python config_maker.py --start 12
+```
+
+Each generated YAML gets a run name like:
+
+```text
+0000_win50_stride50_rad4_bs64_lr0p001_beta0p8.yaml
+```
+
+The run name encodes:
+
+```text
+index, window_size, stride, adjacency_radius, batch_size, learning rate, beta
+```
+
+`config_maker.py` skips invalid combinations such as `stride > window_size`,
+negative adjacency radius, invalid batch size, or negative beta.
+
+### Step 4: Run the sweep with `run_graph_vae_sweep.py`
+
+`run_graph_vae_sweep.py` is the main automation script. For every YAML in the
+sweep directory, it:
+
+1. Creates a per-run output directory.
+2. Writes a patched `config_run.yaml` so runs do not overwrite each other.
+3. Trains the GraphVAE.
+4. Runs inference separately on good and bad test NPZ files.
+5. Runs `window_score` to compare good vs. bad score distributions.
+6. Records parameters, commands, statuses, paths, and metrics in SQLite.
+
+Basic sweep:
+
+```bash
+python run_graph_vae_sweep.py --batch --export-summary
+```
+
+Useful explicit version:
+
+```bash
+python run_graph_vae_sweep.py \
+  --config-dir tuning_configs/graph_vae_sweep \
+  --runs-root checkpoints/graph_vae \
+  --db-path graph_vae_sweep.sqlite3 \
+  --good-input data/good_events_test.npz \
+  --bad-input data/bad_events_test.npz \
+  --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
+  --eval-aggregator group_max_mean \
+  --eval-percentile 90 \
+  --batch \
+  --export-summary
+```
+
+By default, outputs for one config go to:
+
+```text
+checkpoints/graph_vae/<run_name>/
+├── config_run.yaml
+├── graph_vae_final.pt
+├── standardization.npz
+├── training_history.csv
+├── training_curves.png
+└── inference_result/
+    ├── scores_good.npz
+    ├── scores_bad.npz
+    ├── goodvsbad.png
+    ├── goodvsbad_eval.txt
+    └── goodvsbad_eval.json
+```
+
+The sweep database is:
+
+```text
+graph_vae_sweep.sqlite3
+```
+
+When `--export-summary` is set, the script also writes:
+
+```text
+graph_vae_sweep_summary.csv
+graph_vae_sweep_summary.xlsx
+```
+
+### Important sweep-runner modes
+
+Use these when you already have partial results and do not want to rerun every
+stage.
+
+```bash
+# Train only; skip both good/bad inference jobs
+python run_graph_vae_sweep.py --skip-infer
+
+# Use existing checkpoints and rerun good/bad inference, then evaluation
+python run_graph_vae_sweep.py --infer-only
+
+# Only rerun inference for runs missing scores_good.npz or scores_bad.npz
+python run_graph_vae_sweep.py --missing-infer-only
+
+# Use existing scores_good.npz and scores_bad.npz; rerun only evaluation
+python run_graph_vae_sweep.py --evaluate-only
+
+# Only rerun evaluation when goodvsbad.png, goodvsbad_eval.txt, or
+# goodvsbad_eval.json is missing
+python run_graph_vae_sweep.py --missing-evaluate-only
+
+# Train and infer, but skip good-vs-bad evaluation
+python run_graph_vae_sweep.py --skip-eval
+```
+
+Notes:
+
+- `--missing-infer-only` implies `--infer-only`.
+- `--missing-evaluate-only` implies `--evaluate-only`.
+- `--evaluate-only` cannot be combined with `--infer-only` or `--missing-infer-only`.
+- `--evaluate-only` / `--missing-evaluate-only` cannot be combined with `--skip-eval`.
+- `--eval-threshold` passes an explicit threshold to `window_score` and overrides `--eval-percentile`.
+- `--eval-percentile` passes `--percentile` to `window_score`; the current sweep default is `90.0`.
+- `--batch` sets batch/log-friendly environment variables so progress bars are suppressed.
+- `--monitor-interval 0` disables periodic CPU/RAM usage logging.
+- `--force-rewrite` deletes existing database records for matching run names and reruns them.
+- `--missing-rewrite` reruns a run only when its output directory is missing or incomplete.
 
 ---
 
@@ -23,58 +246,62 @@ problems can be flagged from a small amount of data — no waiting for a whole r
 A window of events is summarized as a **graph**: nodes are TPC channels, node
 features are per-channel aggregates of the reconstructed hits in that window, and
 edges connect channels that share readout electronics. The autoencoder learns to
-reconstruct the nominal (good-run) feature graph; on anomalous data the
+reconstruct the nominal good-run feature graph; on anomalous data the
 reconstruction error rises. Because it compares each window to the **absolute
-learned nominal** (not to a forecast of recent history), a persistently-bad
+learned nominal** rather than to a forecast of recent history, a persistently bad
 condition stays flagged and there is no warm-up latency.
 
 ### It is a single model, not two stages
 
-The encoder and decoder **are** graph-neural-network layers — message passing on
-the electronics graph happens *inside* the autoencoder, trained end-to-end as a
-β-VAE. It is **not** "a GNN followed by an autoencoder."
+The encoder and decoder **are** graph-neural-network layers. Message passing on
+the detector/electronics graph happens inside the autoencoder, trained end to end
+as a beta-VAE. It is **not** “a GNN followed by an autoencoder.”
 
-```
+```text
 one window  ->  per-channel feature graph
-                 nodes   = channels
-                 features= [sum, min, max, mean, stdev, count, ...] per sub-window bin
-                 edges   = electronics graph (ASIC cliques + FEMB readout chain)
+                 nodes    = channels
+                 features = [sum, min, max, mean, stdev, count, ...] per temporal bin
+                 edges    = electronics / wire / sequential graph
         │
         ▼
-  SAGEConv encoder        message passing keeps a self-term, so a single bad
-        │                 channel is not smoothed away by its board-mates
+  graph encoder
+        │
         ▼
-  per-node variational bottleneck   (mu, logvar -> z)   ← masking: a fraction of
-        │                                                 nodes are rebuilt from
-        ▼                                                 neighbours (denoising)
-  decoder -> reconstruct node features
+  per-node variational bottleneck: mu, logvar -> z
+        │
+        ▼
+  decoder -> reconstructed node features
         │
         ▼
   per-channel reconstruction error
-        │  aggregate over channels (group_max_mean, ...)
+        │
         ▼
-  per-window anomaly score  ->  streaming M-of-N rule  ->  real-time flag
+  per-window anomaly score
+        │
+        ▼
+  good-vs-bad evaluation / streaming flag
 ```
 
-### Why a *variational* autoencoder
+### Why a variational autoencoder
 
-The bottleneck, the KL term, and the masking all constrain the model to the
-nominal manifold, so it reconstructs good windows well but **fails on
-anomalies** — which is exactly the signal you want. A plain, high-capacity
-autoencoder tends to reconstruct anomalies too, giving no separation. The KL
-regularization (β) and a tight `latent_dim` are the main knobs that keep the
-model from memorizing anomalies (see [Tuning](#tuning-notes)).
+The bottleneck, KL term, and masking constrain the model to the nominal manifold,
+so it reconstructs good windows well but fails on anomalies. A plain high-capacity
+autoencoder can learn to reconstruct bad windows too, reducing anomaly
+separation. The main regularization knobs are:
 
-### Scoring, from channel to real-time alarm
+- `model.latent_dim`
+- `training.beta`
+- `training.beta_warmup_epochs`
+- `model.mask_ratio`
+- `model.dropout`
+- encoder/decoder width and depth
 
-1. **Per-channel error** — reconstruction MSE per channel per window
-   (`node_scores`). Localizes *which* channels/boards are off.
-2. **Per-window score** — aggregate the channel errors (default
-   `group_max_mean`: pool error within each ASIC/FEMB group and take the worst
-   group, which is ideal for coherent board/ASIC faults).
-3. **Real-time decision** — a streaming *M-of-N* persistence rule over the last
-   few windows flags a developing problem within a few windows (not a whole
-   run), trading a little latency for far fewer false alarms.
+### Scoring
+
+1. **Per-channel error**: reconstruction MSE per channel per window, stored as `node_scores`.
+2. **Per-window score**: aggregation over channel errors, usually `group_max_mean`.
+3. **Evaluation threshold**: usually a high percentile of good-run scores, controlled by `--eval-percentile` in the sweep runner or `--percentile` in `window_score`.
+4. **Optional streaming rule**: `window_score --stream --persist-n N --persist-m M` can evaluate persistent M-of-N alarms.
 
 ---
 
@@ -83,242 +310,264 @@ model from memorizing anomalies (see [Tuning](#tuning-notes)).
 ```bash
 pixi install
 pixi shell
-# or:  pip install -e ".[dev]"
+# or:
+pip install -e ".[dev]"
 ```
 
-Requires Python ≥ 3.9, PyTorch, PyTorch-Geometric, uproot, awkward, numpy,
-pandas, matplotlib.
+Requires Python >= 3.9, PyTorch, PyTorch-Geometric, uproot, awkward, numpy,
+pandas, matplotlib, and PyYAML.
 
 ---
 
 ## Data processing
 
-Inference and training consume a **compact sparse-events `.npz`** (not a dense
-array). You build it once from reconstructed ROOT files; windows are then formed
-on the fly. You never need to materialize dense windows.
+Training and inference consume a compact sparse-events `.npz`, not a dense array.
+Build it once from reconstructed ROOT files; windows are then formed on the fly.
 
-### 1. Point at your ROOT files
+### ROOT file lists
 
-A file list is a text file with one ROOT path per line (`#` comments allowed;
-`.txt`/`.lst`/`.list`/`.csv` recognized):
+A file list is a text file with one ROOT path per line. Comments with `#` are
+allowed.
 
-```
+```text
 # data/good_train.txt
 /pnfs/icarus/persistent/users/micarrig/DQM/19305/reco/run19305_evt0.root
 /pnfs/.../reco/run19305_evt1.root
 ```
 
-### 2. Materialize the events npz
-
-`materialize_windows` (default, no `--windows` flag) writes the compact sparse
-events file. Use the **same config** you train/score with so the hit branches,
-window definition, and channel count match:
+### Materialize sparse events
 
 ```bash
-python -m sbn_anomaly.data.materialize_windows --config configs/graph_vae.yaml \
-    --root-file-list data/good_train.txt --output data/good_events_train.npz
+python -m sbn_anomaly.data.materialize_windows \
+  --config configs/graph_vae.yaml \
+  --root-file-list data/good_train.txt \
+  --output data/good_events_train.npz
 ```
 
-Do this separately for your good-training, good-test, and bad-test sets:
+Do this separately for good-training, good-test, and bad-test sets:
 
 ```bash
-python -m sbn_anomaly.data.materialize_windows --config configs/graph_vae.yaml \
-    --root-file-list data/good_test.txt --output data/good_events_test.npz
-python -m sbn_anomaly.data.materialize_windows --config configs/graph_vae.yaml \
-    --root-file-list data/bad_test.txt  --output data/bad_events_test.npz
+python -m sbn_anomaly.data.materialize_windows \
+  --config configs/graph_vae.yaml \
+  --root-file-list data/good_test.txt \
+  --output data/good_events_test.npz
+
+python -m sbn_anomaly.data.materialize_windows \
+  --config configs/graph_vae.yaml \
+  --root-file-list data/bad_test.txt \
+  --output data/bad_events_test.npz
 ```
 
-> `--root-file-list` takes a manifest of ROOT paths; `--input` (on `sbn-infer`)
-> takes the resulting `.npz`. They are different stages — don't pass a file list
-> to `--input`.
+`--root-file-list` takes ROOT paths. `sbn-infer --input` takes the resulting
+`.npz`. Do not pass a ROOT file list to `sbn-infer --input`.
 
 ### Sparse event format
 
-The events npz stores hits in CSR form (only channels with hits are kept, ~1000×
-smaller than dense):
+The events NPZ stores hits in CSR-like form, keeping only channels with hits.
 
-| Key | Dtype | Meaning |
-|-----|-------|---------|
-| `channels_flat` | int64 | channel ids of all hits, concatenated over events |
-| `integrals_flat` | float32 | hit integrals (same order) |
-| `times_flat` | float32 | hit times (enables timing features) |
-| `offsets` | int64 | event `i` = hits `channels_flat[offsets[i]:offsets[i+1]]` |
-| `n_channels` | int64 | detector channel count |
-| `evt_run/subrun/num` | int32 | per-event provenance (run, subrun, event) |
+| Key | Meaning |
+|---|---|
+| `channels_flat` | Channel IDs of all hits, concatenated over events. |
+| `integrals_flat` | Hit integrals in the same order. |
+| `times_flat` | Hit times, used by timing features when available. |
+| `offsets` | Event `i` uses hits `channels_flat[offsets[i]:offsets[i+1]]`. |
+| `n_channels` | Detector channel count. |
+| `evt_run`, `evt_subrun`, `evt_num` | Per-event provenance. |
+| `filenames` / file indices | File provenance, when saved. |
 
-Merge several events npz correctly (offsets must be shifted — a plain
-`np.concatenate` corrupts them):
+Merge sparse event files with the project merge tool rather than plain
+`np.concatenate`, because offsets must be shifted correctly:
 
 ```bash
-python -m sbn_anomaly.data.merge_events --output data/all_good.npz --glob 'data/good_*.npz'
+python -m sbn_anomaly.data.merge_events \
+  --output data/all_good.npz \
+  --glob 'data/good_*.npz'
 ```
-
-See [`data/README.md`](data/README.md) for storage locations and known
-good/bad run lists.
 
 ---
 
-## Training
+## Single-model training
 
-Trains on good runs only; from an events npz (`data.events_path`), from ROOT
-directly (`--root-file-list`), or from a dense windows array (`data.windows_path`).
+The sweep workflow is recommended, but a single YAML can still be trained
+directly.
 
 ```bash
-# from a cached events npz (data.events_path in the config)
 sbn-train --config configs/graph_vae.yaml
+```
 
-# or stream straight from ROOT
+or stream from ROOT:
+
+```bash
 sbn-train --config configs/graph_vae.yaml --root-file-list data/good_train.txt
 ```
 
-Outputs (under `training.checkpoint_dir`):
+Typical training outputs under `training.checkpoint_dir`:
 
-- `graph_vae_final.pt` — model weights.
-- `standardization.npz` — per-feature mean/std used at inference (must match).
-- `training_curves.png` — four panels: **loss**, **recon / KL (with β on a twin
-  axis)**, **score percentiles**, **throughput**. The recon/KL panel is how you
-  diagnose posterior collapse (KL → 0 while recon plateaus).
-- `plots/reconstruction_hist2d*.png` — per-feature original-vs-reconstruction
-  histograms. On a healthy model these track the `y=x` diagonal; a flat band
-  means the model is predicting the mean (see [Tuning](#tuning-notes)).
+| Output | Meaning |
+|---|---|
+| `graph_vae_final.pt` | Final model weights. |
+| `standardization.npz` | Good-run feature mean/std used again at inference. |
+| `training_history.csv` | Per-epoch metrics. |
+| `training_curves.png` | Loss, reconstruction/KL, score percentiles, throughput. |
+| `plots/reconstruction_hist2d*.png` | Original-vs-reconstructed feature plots. |
 
 ---
 
-## Inference / scoring
+## Single-model inference
 
 ```bash
-sbn-infer --config configs/graph_vae.yaml --input data/good_events_test.npz --output scores_good.npz
-sbn-infer --config configs/graph_vae.yaml --input data/bad_events_test.npz  --output scores_bad.npz
+sbn-infer \
+  --config configs/graph_vae.yaml \
+  --input data/good_events_test.npz \
+  --output scores_good.npz
+
+sbn-infer \
+  --config configs/graph_vae.yaml \
+  --input data/bad_events_test.npz \
+  --output scores_bad.npz
 ```
 
-`--input` overrides `inference.input_path`. Output npz:
+Typical output arrays:
 
 | Array | Shape | Description |
-|-------|-------|-------------|
-| `node_scores` | `(W, C)` | per-window per-channel reconstruction error (NaN = inactive) |
-| `scores` | `(W,)` | per-window aggregated score (default `group_max_mean`) |
-| `channel_mean_error` / `channel_max_error` | `(C,)` | per-channel summary over all windows (which channels are worst) |
-| `channel_active_frac` | `(C,)` | fraction of windows each channel was active |
-| `provenance` | `(W, 3)` | `(run, subrun, event)` of each window |
-| `is_anomaly` | `(W,)` | present only when `inference.threshold` is set |
-
-It also writes score-distribution, score-over-time, and per-channel-error PNGs
-next to the output, and logs the top-10 worst channels.
+|---|---:|---|
+| `node_scores` | `(W, C)` | Per-window per-channel reconstruction error; inactive channels may be `NaN`. |
+| `scores` | `(W,)` | Per-window aggregated score. |
+| `scores_max` | `(W,)` | Max-style score when saved by the inferrer. |
+| `channel_mean_error` | `(C,)` | Mean per-channel error over windows. |
+| `channel_max_error` | `(C,)` | Max per-channel error over windows. |
+| `channel_active_frac` | `(C,)` | Fraction of windows where each channel was active. |
+| `provenance` | `(W, 3)` | Usually `(run, subrun, event)` for each window. |
+| `is_anomaly` | `(W,)` | Present when an inference threshold is set. |
 
 ---
 
-## Evaluation
+## Single-model evaluation
 
-All evaluation runs on the saved scores, so you can re-aggregate and re-threshold
-without re-running the model.
-
-### Good-vs-bad separation
+All evaluation runs on saved score NPZ files, so you can change the aggregator or
+threshold without rerunning the model.
 
 ```bash
 python -m sbn_anomaly.infer.window_score \
-    --scores scores_good.npz --compare scores_bad.npz --labels good bad \
-    --aggregator group_max_mean --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
-    --plot goodvsbad.png
+  --scores scores_good.npz \
+  --compare scores_bad.npz \
+  --labels good bad \
+  --aggregator group_max_mean \
+  --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
+  --percentile 90 \
+  --plot goodvsbad.png
 ```
 
-Prints per-set score stats, a threshold-free **separation AUC** (Mann-Whitney,
-tie-correct), the **confusion matrix + precision / recall / F1 / FPR** at the
-operating threshold (good-set p99 unless `--threshold`), and an overlaid
-histogram with the threshold line.
+This reports score statistics, threshold-free separation AUC, and thresholded
+classification metrics such as precision, recall, F1, and false-positive rate.
 
-### Real-time detection (the operational metric)
-
-DQM anomalies are usually *intermittent* at the window level, so window-level
-recall looks low even when runs are clearly separable. Judge the model by
-**streaming detection latency** instead:
+For streaming/persistence evaluation:
 
 ```bash
 python -m sbn_anomaly.infer.window_score \
-    --scores scores_good.npz --compare scores_bad.npz --labels good bad \
-    --aggregator group_max_mean --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
-    --stream --persist-n 3 --persist-m 2
+  --scores scores_good.npz \
+  --compare scores_bad.npz \
+  --labels good bad \
+  --aggregator group_max_mean \
+  --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
+  --percentile 90 \
+  --stream --persist-n 3 --persist-m 2
 ```
 
-A window fires when `M` of the last `N` windows are over threshold (or a single
-window exceeds `--instant-threshold`). It reports **false-alarm rate on good
-runs** and **detection rate + latency (in windows) on bad runs** — i.e. how few
-windows until a problem is flagged, with no full-run wait.
+Common aggregators:
 
-Aggregators (swap with `--aggregator`): `mean`, `max`, `topk_mean`,
-`group_max_mean` (default). Requires `provenance` in the scores npz (inference
-saves it). `--per-run` gives a whole-run rollup if you also want that.
+- `mean`
+- `max`
+- `topk_mean`
+- `group_max_mean`
+
+`group_max_mean` is usually the default for coherent electronics groups because
+it pools channel errors by electronics group and takes the worst group.
 
 ---
 
 ## Node features
 
-Node features are per-channel aggregates, computed per temporal bin
-(`F = n_temporal_bins × len(node_features)`). Set them in `data.node_features`:
+Node features are per-channel aggregates computed per temporal bin. If
+`n_temporal_bins = B` and `len(node_features) = F`, the node feature dimension is
+approximately `B × F`, plus any optional conditioning features used by the model.
 
 | Feature | Meaning |
-|---------|---------|
-| `sum`, `min`, `max`, `mean`, `stdev`, `count` | moments of the hit integral |
-| `occupancy` | fraction of events in the bin with ≥1 hit (dead/hot channels) |
-| `hit_rate` | average hits per event |
-| `time_mean`, `time_spread` | mean / spread of hit time (needs a time branch) |
+|---|---|
+| `sum` | Sum of hit integrals. |
+| `min` | Minimum hit integral. |
+| `max` | Maximum hit integral. |
+| `mean` | Mean hit integral. |
+| `stdev` | Standard deviation of hit integrals. |
+| `count` | Number of hits. |
+| `occupancy` | Fraction of events in the bin with at least one hit. |
+| `hit_rate` | Average hits per event. |
+| `time_mean` | Mean hit time, when time data are available. |
+| `time_spread` | Spread of hit time, when time data are available. |
 
-### `log_features` (heavy-tail transform)
+### `log_features`
 
-Integral-magnitude features (`sum`/`min`/`max`/`mean`) are heavy-tailed even
-after z-scoring, which makes the VAE reconstruct them as a flat mean. List them
-in `data.log_features` to apply a **sign-preserving `log1p`** (`sign(x)·log1p(|x|)`,
-so negative induction-plane integrals are handled) **before** standardization, so
-the model can actually track them. Must be a subset of `node_features`, and must
-be the **same for training and inference**.
+Integral-magnitude features are often heavy-tailed. Put features such as `sum`,
+`min`, `max`, and `mean` in `data.log_features` to apply a sign-preserving
+`log1p` transform before standardization:
 
-Features are then **z-scored** on good-run statistics (`standardize: true`), so
-reconstruction error means "deviation from nominal in sigmas."
+```text
+sign(x) * log1p(abs(x))
+```
+
+Training and inference must use the same `log_features` list.
 
 ---
 
 ## Graph construction
 
-`data.edge_mode` selects how channels are connected (built from
-`data.channel_map`, the SBND channel map with electronics + geometry):
+`data.edge_mode` controls graph construction from the channel map.
 
-- `electronics` (recommended) — ASIC cliques (16-channel) + per-FEMB readout-chain
-  adjacency. This is where coherent noise and board/ASIC failures correlate; it
-  deliberately crosses wire planes because a FEMB spans planes.
-- `wire` — adjacent wires within each (plane, TPC, side).
-- `both` — union of the two.
-- `sequential` — connect channels within `±adjacency_radius` of each other in
-  offline-channel id (no channel map needed).
+| Mode | Meaning |
+|---|---|
+| `electronics` | ASIC/FEMB-style electronics connections; recommended for coherent board faults. |
+| `wire` | Adjacent wires within plane/TPC/side groups. |
+| `both` | Union of electronics and wire edges. |
+| `sequential` | Connect nearby offline channel IDs using `adjacency_radius`. |
+
+`config_maker.py` currently sweeps `data.adjacency_radius`, which matters most
+for `sequential` graph construction and any graph builder mode that uses radius.
 
 ---
 
-## Configuration reference (`configs/graph_vae.yaml`)
+## Configuration reference
 
-**`data:`**
-- `events_path` / `windows_path` — cached input (events npz preferred).
-- `window_size`, `n_temporal_bins`, `stride` — a window = `window_size` events in
-  `n_temporal_bins` bins; a new window every `stride` events. Sets decision
-  granularity / latency.
-- `n_channels` — detector channel count (SBND ≈ 11276).
-- `channel_map`, `edge_mode` — graph construction (above).
-- `node_features`, `log_features` — features (above).
-- `standardize` — z-score features on good-run stats.
-- `prune_inactive` — drop channels with no hits from each window's graph.
+### `data`
 
-**`model:`**
-- `latent_dim` — per-channel bottleneck size (smaller = tighter, harder to
-  memorize anomalies).
-- `encoder_hidden_dims` — variable-width graph encoder dimensions. The number of
-  message-passing layers is `len(encoder_hidden_dims)`. For example,
-  `[128, 64, 32]` builds `enc_in -> 128 -> 64 -> 32 -> mu/logvar`.
-- `decoder_hidden_dims` — variable-width decoder MLP dimensions. The number of
-  decoder hidden layers is `len(decoder_hidden_dims)`. For example, `[32, 64]`
-  builds `latent -> 32 -> 64 -> reconstructed features`; use `[]` for a direct
-  `latent -> reconstructed features` decoder.
-- `dropout`, `mask_ratio` — regularization; `mask_ratio` is the denoising fraction.
-- `use_channel_idx` — feed channel id as conditioning (learn per-channel baselines).
-- `conv` — `sage` (self-preserving, recommended) or `gcn`.
+| Key | Meaning |
+|---|---|
+| `events_path` | Training sparse-events NPZ. |
+| `windows_path` | Optional dense-window input; sparse events are preferred. |
+| `window_size` | Number of events per window. |
+| `stride` | Number of events between consecutive windows. |
+| `n_temporal_bins` | Number of time/event bins inside one window. |
+| `n_channels` | Detector channel count. |
+| `channel_map` | Channel-map CSV. |
+| `edge_mode` | Graph construction mode. |
+| `adjacency_radius` | Radius for sequential/radius-based graph edges. |
+| `node_features` | Per-channel aggregate feature list. |
+| `log_features` | Features transformed before standardization. |
+| `standardize` | Whether to z-score features using training statistics. |
+| `prune_inactive` | Whether inactive channels are removed from per-window graphs. |
 
-Example variable-layer model block:
+### `model`
+
+| Key | Meaning |
+|---|---|
+| `latent_dim` | Per-node bottleneck dimension. Smaller is tighter. |
+| `encoder_hidden_dims` | Encoder graph-layer widths. Length controls encoder depth. |
+| `decoder_hidden_dims` | Decoder MLP widths. Length controls decoder depth. |
+| `dropout` | Dropout regularization. |
+| `mask_ratio` | Denoising mask fraction. |
+| `use_channel_idx` | Whether to condition on channel identity. |
+| `conv` | Graph convolution type, such as `sage` or `gcn`. |
+
+Example:
 
 ```yaml
 model:
@@ -331,44 +580,50 @@ model:
   conv: sage
 ```
 
-> (Important): Keep training and inference on the same YAML architecture, 
-               or checkpoint loading will fail with size mismatches.
+Keep the training and inference architecture identical. If the YAML architecture
+changes after training, checkpoint loading can fail with size mismatches.
 
-**`training:`**
-- `lr`, `weight_decay`, `batch_size`, `max_epochs`, `validation_split`.
-- `beta` — KL weight (β-VAE); `beta_warmup_epochs` — linear ramp 0→β.
-- `use_amp`, `save_best_only`, `checkpoint_dir`, `output_path`.
+### `training`
 
-**`inference:`**
-- `checkpoint_path`, `input_path`, `batch_size`.
-- `window_aggregator`, `group_level`, `topk`, `threshold`, `plot`.
+| Key | Meaning |
+|---|---|
+| `lr` | Learning rate. |
+| `weight_decay` | Weight decay. |
+| `batch_size` | Training batch size. |
+| `max_epochs` | Maximum training epochs. |
+| `validation_split` | Fraction of training windows used for validation. |
+| `beta` | KL weight for beta-VAE training. |
+| `beta_warmup_epochs` | Linear warmup period for beta. |
+| `checkpoint_dir` | Output directory for weights and training artifacts. |
+| `output_path` | Final checkpoint path. |
+
+### `inference`
+
+| Key | Meaning |
+|---|---|
+| `checkpoint_path` | Model checkpoint to load. |
+| `input_path` | Default input NPZ, overridden by `sbn-infer --input`. |
+| `output_path` | Default output NPZ, overridden by `sbn-infer --output`. |
+| `batch_size` | Inference batch size. |
+| `window_aggregator` | Per-window score aggregator. |
+| `group_level` | Grouping level for group-based aggregators. |
+| `topk` | `topk_mean` parameter. |
+| `threshold` | Optional inference-time threshold. |
+| `plot` | Whether to write inference plots. |
 
 ---
 
 ## Tuning notes
 
-Lessons from tuning this model on SBND runs:
-
-- **Measure every change with the `--compare` AUC (and `--stream` latency)** — not
-  the histogram shape. Change **one thing at a time**.
-- **Tune layer widths with `encoder_hidden_dims` and `decoder_hidden_dims`.** The
-  encoder list controls both width and graph depth; deeper/wider encoders can
-  learn richer board/channel context but may over-smooth or memorize. The decoder
-  list controls reconstruction capacity; too much decoder capacity can reduce
-  anomaly separation by reconstructing bad windows too well.
-- **The anomaly signal lives in integral magnitude** (`sum`/`min`/`max`/`count`).
-  Replacing those with occupancy/timing features *reduced* separation here; add
-  occupancy/timing *on top* instead of replacing.
-- **This model wants *more* regularization, not less.** Lowering `beta` or
-  `mask_ratio` let the model reconstruct anomalies too and hurt separation. If
-  the recon/KL panel shows no collapse, push `beta` up (1.5–3), `mask_ratio` up
-  (0.2–0.3), and/or `latent_dim` down (8, 6).
-- **Watch the reconstruction hist2d.** A flat horizontal band = the model is
-  predicting the mean (heavy-tailed features); fix with `log_features`. After
-  log-transforming, the `sum`/`min`/`max` panels should climb the `y=x` diagonal.
-- **Evaluate for real time.** Window-level recall understates performance because
-  bad runs are intermittently bad; use the streaming M-of-N detector's latency +
-  false-alarm rate.
+- Tune with saved-score evaluation, not just histogram appearance.
+- Start by sweeping `window_size`, `stride`, `adjacency_radius`, `batch_size`, `lr`, and `beta` through `config_maker.py`.
+- Use `--evaluate-only` to re-threshold or re-aggregate without retraining or rerunning inference.
+- Use `--missing-evaluate-only` after interrupted sweeps when only some evaluation products are missing.
+- Use `--missing-infer-only` after interrupted sweeps when some models trained but did not produce both good and bad score files.
+- Increasing model capacity can improve reconstruction but may reduce anomaly separation if bad windows are reconstructed too well.
+- If reconstruction plots become flat bands, check whether heavy-tailed integral features need `log_features`.
+- If KL collapses to zero while reconstruction stalls, inspect `beta`, `beta_warmup_epochs`, latent dimension, and decoder capacity.
+- For real-time DQM, streaming latency and false-alarm rate are often more meaningful than raw window-level recall.
 
 ---
 
@@ -376,10 +631,9 @@ Lessons from tuning this model on SBND runs:
 
 ```bash
 pytest tests/
-# or point at the pixi python
+# or:
 .pixi/envs/default/bin/python -m pytest tests/
 ```
 
-Relevant suites: `test_node_features.py` (occupancy/timing/log features),
-`test_window_score.py` (aggregators, AUC, confusion), `test_channel_graph.py`
-(electronics graph), plus the data/model/train tests.
+Relevant suites include node-feature tests, window-score/evaluation tests,
+channel-graph tests, and GraphVAE data/model/training tests.
