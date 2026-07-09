@@ -394,15 +394,23 @@ changes after training, checkpoint loading can fail with size mismatches.
 
 ## Tuning notes
 
-- Tune with saved-score evaluation, not just histogram appearance.
-- Start by sweeping `window_size`, `stride`, `adjacency_radius`, `batch_size`, `lr`, and `beta` through `config_maker.py`.
-- Use `--evaluate-only` to re-threshold or re-aggregate without retraining or rerunning inference.
-- Use `--missing-evaluate-only` after interrupted sweeps when only some evaluation products are missing.
-- Use `--missing-infer-only` after interrupted sweeps when some models trained but did not produce both good and bad score files.
-- Increasing model capacity can improve reconstruction but may reduce anomaly separation if bad windows are reconstructed too well.
-- If reconstruction plots become flat bands, check whether heavy-tailed integral features need `log_features`.
-- If KL collapses to zero while reconstruction stalls, inspect `beta`, `beta_warmup_epochs`, latent dimension, and decoder capacity.
-- For real-time DQM, streaming latency and false-alarm rate are often more meaningful than raw window-level recall.
+Lessons from tuning this model on SBND runs:
+
+- **Measure every change with the `--compare` AUC (and `--stream` latency)** — not
+  the histogram shape. Change **one thing at a time**.
+- **The anomaly signal lives in integral magnitude** (`sum`/`min`/`max`/`count`).
+  Replacing those with occupancy/timing features *reduced* separation here; add
+  occupancy/timing *on top* instead of replacing.
+- **This model wants *more* regularization, not less.** Lowering `beta` or
+  `mask_ratio` let the model reconstruct anomalies too and hurt separation. If
+  the recon/KL panel shows no collapse, push `beta` up (1.5–3), `mask_ratio` up
+  (0.2–0.3), and/or `latent_dim` down (8, 6).
+- **Watch the reconstruction hist2d.** A flat horizontal band = the model is
+  predicting the mean (heavy-tailed features); fix with `log_features`. After
+  log-transforming, the `sum`/`min`/`max` panels should climb the `y=x` diagonal.
+- **Evaluate for real time.** Window-level recall understates performance because
+  bad runs are intermittently bad; use the streaming M-of-N detector's latency +
+  false-alarm rate.
 
 ---
 
