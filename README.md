@@ -18,222 +18,6 @@ problems can be flagged from a small amount of data — no waiting for a whole r
 
 ---
 
-## Recommended workflow
-
-For tuning, the intended path is:
-
-```text
-configs/graph_vae.yaml
-        │
-        ▼
-config_maker.py
-        │  writes many YAML files
-        ▼
-tuning_configs/graph_vae_sweep/*.yaml
-        │
-        ▼
-run_graph_vae_sweep.py
-        │  train each config
-        │  infer on good test events
-        │  infer on bad test events
-        │  evaluate good-vs-bad separation
-        ▼
-checkpoints/graph_vae/<run_name>/
-graph_vae_sweep.sqlite3
-```
-
-### Step 1: Prepare sparse event NPZ files
-
-The GraphVAE workflow expects sparse-events `.npz` files. The default sweep
-runner paths assume:
-
-```text
-data/good_events_test.npz
-data/bad_events_test.npz
-```
-
-The training input is set in each generated YAML through the copied base config,
-usually from `data.events_path` in `configs/graph_vae.yaml`.
-
-### Step 2: Edit the base GraphVAE YAML
-
-Start from:
-
-```bash
-configs/graph_vae.yaml
-```
-
-This base file defines the common dataset, graph, feature, model, training, and
-inference settings. `config_maker.py` copies this file and overrides only the
-sweep parameters, so anything not listed in `config_maker.py` still comes from
-`configs/graph_vae.yaml`.
-
-Make sure the base YAML has the correct:
-
-- `data.events_path` for good-run training events.
-- `data.channel_map` and graph settings.
-- `data.node_features` and `data.log_features`.
-- `model.encoder_hidden_dims`, `model.decoder_hidden_dims`, and `model.latent_dim`.
-- `training.beta_warmup_epochs`, `training.validation_split`, and other fixed training settings.
-
-### Step 3: Generate sweep YAMLs with `config_maker.py`
-
-`config_maker.py` is the sweep-config generator. Edit the constants near the top
-of the file to define the parameter grid:
-
-```python
-BASE_YAML_PATH = Path("configs/graph_vae.yaml")
-OUTPUT_YAML_DIR = Path("tuning_configs/graph_vae_sweep")
-START_INDEX = 0
-
-WINDOW_SIZES = [50, 100, 200]
-STRIDES = [50, 100, 200]
-ADJACENCY_RADII = [4]
-BATCH_SIZES = [64]
-LEARNING_RATES = [0.001]
-BETAS = [0.8]
-
-DEFAULT_WEIGHT_DECAY = 1.0e-4
-DEFAULT_MAX_EPOCHS = 200
-CHECKPOINT_BASE_DIR = Path("checkpoints/graph_vae")
-```
-
-Then generate the YAMLs:
-
-```bash
-python config_maker.py
-```
-
-Common options:
-
-```bash
-# Force stride = window_size for every window size
-python config_maker.py --same-stride
-
-# Start numbering from a chosen index
-python config_maker.py --start 12
-```
-
-Each generated YAML gets a run name like:
-
-```text
-0000_win50_stride50_rad4_bs64_lr0p001_beta0p8.yaml
-```
-
-The run name encodes:
-
-```text
-index, window_size, stride, adjacency_radius, batch_size, learning rate, beta
-```
-
-`config_maker.py` skips invalid combinations such as `stride > window_size`,
-negative adjacency radius, invalid batch size, or negative beta.
-
-### Step 4: Run the sweep with `run_graph_vae_sweep.py`
-
-`run_graph_vae_sweep.py` is the main automation script. For every YAML in the
-sweep directory, it:
-
-1. Creates a per-run output directory.
-2. Writes a patched `config_run.yaml` so runs do not overwrite each other.
-3. Trains the GraphVAE.
-4. Runs inference separately on good and bad test NPZ files.
-5. Runs `window_score` to compare good vs. bad score distributions.
-6. Records parameters, commands, statuses, paths, and metrics in SQLite.
-
-Basic sweep:
-
-```bash
-python run_graph_vae_sweep.py --batch --export-summary
-```
-
-Useful explicit version:
-
-```bash
-python run_graph_vae_sweep.py \
-  --config-dir tuning_configs/graph_vae_sweep \
-  --runs-root checkpoints/graph_vae \
-  --db-path graph_vae_sweep.sqlite3 \
-  --good-input data/good_events_test.npz \
-  --bad-input data/bad_events_test.npz \
-  --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
-  --eval-aggregator group_max_mean \
-  --eval-percentile 90 \
-  --batch \
-  --export-summary
-```
-
-By default, outputs for one config go to:
-
-```text
-checkpoints/graph_vae/<run_name>/
-├── config_run.yaml
-├── graph_vae_final.pt
-├── standardization.npz
-├── training_history.csv
-├── training_curves.png
-└── inference_result/
-    ├── scores_good.npz
-    ├── scores_bad.npz
-    ├── goodvsbad.png
-    ├── goodvsbad_eval.txt
-    └── goodvsbad_eval.json
-```
-
-The sweep database is:
-
-```text
-graph_vae_sweep.sqlite3
-```
-
-When `--export-summary` is set, the script also writes:
-
-```text
-graph_vae_sweep_summary.csv
-graph_vae_sweep_summary.xlsx
-```
-
-### Important sweep-runner modes
-
-Use these when you already have partial results and do not want to rerun every
-stage.
-
-```bash
-# Train only; skip both good/bad inference jobs
-python run_graph_vae_sweep.py --skip-infer
-
-# Use existing checkpoints and rerun good/bad inference, then evaluation
-python run_graph_vae_sweep.py --infer-only
-
-# Only rerun inference for runs missing scores_good.npz or scores_bad.npz
-python run_graph_vae_sweep.py --missing-infer-only
-
-# Use existing scores_good.npz and scores_bad.npz; rerun only evaluation
-python run_graph_vae_sweep.py --evaluate-only
-
-# Only rerun evaluation when goodvsbad.png, goodvsbad_eval.txt, or
-# goodvsbad_eval.json is missing
-python run_graph_vae_sweep.py --missing-evaluate-only
-
-# Train and infer, but skip good-vs-bad evaluation
-python run_graph_vae_sweep.py --skip-eval
-```
-
-Notes:
-
-- `--missing-infer-only` implies `--infer-only`.
-- `--missing-evaluate-only` implies `--evaluate-only`.
-- `--evaluate-only` cannot be combined with `--infer-only` or `--missing-infer-only`.
-- `--evaluate-only` / `--missing-evaluate-only` cannot be combined with `--skip-eval`.
-- `--eval-threshold` passes an explicit threshold to `window_score` and overrides `--eval-percentile`.
-- `--eval-percentile` passes `--percentile` to `window_score`; the current sweep default is `90.0`.
-- `--batch` sets batch/log-friendly environment variables so progress bars are suppressed.
-- `--monitor-interval 0` disables periodic CPU/RAM usage logging.
-- `--force-rewrite` deletes existing database records for matching run names and reruns them.
-- `--missing-rewrite` reruns a run only when its output directory is missing or incomplete.
-
----
-
 ## How the network works
 
 ### The problem
@@ -632,3 +416,221 @@ pytest tests/
 
 Relevant suites include node-feature tests, window-score/evaluation tests,
 channel-graph tests, and GraphVAE data/model/training tests.
+
+---
+
+## Recommended workflow
+
+For tuning, the intended path is:
+
+```text
+configs/graph_vae.yaml
+        │
+        ▼
+config_maker.py
+        │  writes many YAML files
+        ▼
+tuning_configs/graph_vae_sweep/*.yaml
+        │
+        ▼
+run_graph_vae_sweep.py
+        │  train each config
+        │  infer on good test events
+        │  infer on bad test events
+        │  evaluate good-vs-bad separation
+        ▼
+checkpoints/graph_vae/<run_name>/
+graph_vae_sweep.sqlite3
+```
+
+### Step 1: Prepare sparse event NPZ files
+
+The GraphVAE workflow expects sparse-events `.npz` files. The default sweep
+runner paths assume:
+
+```text
+data/good_events_test.npz
+data/bad_events_test.npz
+```
+
+The training input is set in each generated YAML through the copied base config,
+usually from `data.events_path` in `configs/graph_vae.yaml`.
+
+### Step 2: Edit the base GraphVAE YAML
+
+Start from:
+
+```bash
+configs/graph_vae.yaml
+```
+
+This base file defines the common dataset, graph, feature, model, training, and
+inference settings. `config_maker.py` copies this file and overrides only the
+sweep parameters, so anything not listed in `config_maker.py` still comes from
+`configs/graph_vae.yaml`.
+
+Make sure the base YAML has the correct:
+
+- `data.events_path` for good-run training events.
+- `data.channel_map` and graph settings.
+- `data.node_features` and `data.log_features`.
+- `model.encoder_hidden_dims`, `model.decoder_hidden_dims`, and `model.latent_dim`.
+- `training.beta_warmup_epochs`, `training.validation_split`, and other fixed training settings.
+
+### Step 3: Generate sweep YAMLs with `config_maker.py`
+
+`config_maker.py` is the sweep-config generator. Edit the constants near the top
+of the file to define the parameter grid:
+
+```python
+BASE_YAML_PATH = Path("configs/graph_vae.yaml")
+OUTPUT_YAML_DIR = Path("tuning_configs/graph_vae_sweep")
+START_INDEX = 0
+
+WINDOW_SIZES = [50, 100, 200]
+STRIDES = [50, 100, 200]
+ADJACENCY_RADII = [4]
+BATCH_SIZES = [64]
+LEARNING_RATES = [0.001]
+BETAS = [0.8]
+
+DEFAULT_WEIGHT_DECAY = 1.0e-4
+DEFAULT_MAX_EPOCHS = 200
+CHECKPOINT_BASE_DIR = Path("checkpoints/graph_vae")
+```
+
+Then generate the YAMLs:
+
+```bash
+python config_maker.py
+```
+
+Common options:
+
+```bash
+# Force stride = window_size for every window size
+python config_maker.py --same-stride
+
+# Start numbering from a chosen index
+python config_maker.py --start 12
+```
+
+Each generated YAML gets a run name like:
+
+```text
+0000_win50_stride50_rad4_bs64_lr0p001_beta0p8.yaml
+```
+
+The run name encodes:
+
+```text
+index, window_size, stride, adjacency_radius, batch_size, learning rate, beta
+```
+
+`config_maker.py` skips invalid combinations such as `stride > window_size`,
+negative adjacency radius, invalid batch size, or negative beta.
+
+### Step 4: Run the sweep with `run_graph_vae_sweep.py`
+
+`run_graph_vae_sweep.py` is the main automation script. For every YAML in the
+sweep directory, it:
+
+1. Creates a per-run output directory.
+2. Writes a patched `config_run.yaml` so runs do not overwrite each other.
+3. Trains the GraphVAE.
+4. Runs inference separately on good and bad test NPZ files.
+5. Runs `window_score` to compare good vs. bad score distributions.
+6. Records parameters, commands, statuses, paths, and metrics in SQLite.
+
+Basic sweep:
+
+```bash
+python run_graph_vae_sweep.py --batch --export-summary
+```
+
+Useful explicit version:
+
+```bash
+python run_graph_vae_sweep.py \
+  --config-dir tuning_configs/graph_vae_sweep \
+  --runs-root checkpoints/graph_vae \
+  --db-path graph_vae_sweep.sqlite3 \
+  --good-input data/good_events_test.npz \
+  --bad-input data/bad_events_test.npz \
+  --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
+  --eval-aggregator group_max_mean \
+  --eval-percentile 90 \
+  --batch \
+  --export-summary
+```
+
+By default, outputs for one config go to:
+
+```text
+checkpoints/graph_vae/<run_name>/
+├── config_run.yaml
+├── graph_vae_final.pt
+├── standardization.npz
+├── training_history.csv
+├── training_curves.png
+└── inference_result/
+    ├── scores_good.npz
+    ├── scores_bad.npz
+    ├── goodvsbad.png
+    ├── goodvsbad_eval.txt
+    └── goodvsbad_eval.json
+```
+
+The sweep database is:
+
+```text
+graph_vae_sweep.sqlite3
+```
+
+When `--export-summary` is set, the script also writes:
+
+```text
+graph_vae_sweep_summary.csv
+graph_vae_sweep_summary.xlsx
+```
+
+### Important sweep-runner modes
+
+Use these when you already have partial results and do not want to rerun every
+stage.
+
+```bash
+# Train only; skip both good/bad inference jobs
+python run_graph_vae_sweep.py --skip-infer
+
+# Use existing checkpoints and rerun good/bad inference, then evaluation
+python run_graph_vae_sweep.py --infer-only
+
+# Only rerun inference for runs missing scores_good.npz or scores_bad.npz
+python run_graph_vae_sweep.py --missing-infer-only
+
+# Use existing scores_good.npz and scores_bad.npz; rerun only evaluation
+python run_graph_vae_sweep.py --evaluate-only
+
+# Only rerun evaluation when goodvsbad.png, goodvsbad_eval.txt, or
+# goodvsbad_eval.json is missing
+python run_graph_vae_sweep.py --missing-evaluate-only
+
+# Train and infer, but skip good-vs-bad evaluation
+python run_graph_vae_sweep.py --skip-eval
+```
+
+Notes:
+
+- `--missing-infer-only` implies `--infer-only`.
+- `--missing-evaluate-only` implies `--evaluate-only`.
+- `--evaluate-only` cannot be combined with `--infer-only` or `--missing-infer-only`.
+- `--evaluate-only` / `--missing-evaluate-only` cannot be combined with `--skip-eval`.
+- `--eval-threshold` passes an explicit threshold to `window_score` and overrides `--eval-percentile`.
+- `--eval-percentile` passes `--percentile` to `window_score`; the current sweep default is `90.0`.
+- `--batch` sets batch/log-friendly environment variables so progress bars are suppressed.
+- `--monitor-interval 0` disables periodic CPU/RAM usage logging.
+- `--force-rewrite` deletes existing database records for matching run names and reruns them.
+- `--missing-rewrite` reruns a run only when its output directory is missing or incomplete.
+
+---
