@@ -16,11 +16,6 @@ problems can be flagged from a small amount of data — no waiting for a whole r
 - Single-model score: `sbn-infer --config configs/graph_vae.yaml --input <events.npz> --output scores.npz`
 - Single-model evaluate: `python -m sbn_anomaly.infer.window_score ...`
 
-> The main maintained workflow is now based on `config_maker.py` and
-> `run_graph_vae_sweep.py`. Older helper scripts such as `npz_npy_reader.py` and
-> `train_test_from_npz.py` are not part of the recommended workflow and are not
-> documented here.
-
 ---
 
 ## Recommended workflow
