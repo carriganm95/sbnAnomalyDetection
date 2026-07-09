@@ -45,12 +45,15 @@ class GraphVAE(nn.Module):
         Node feature dimension ``F`` (excluding the channel-index column).
     latent_dim:
         Per-node latent size.
-    hidden:
-        Hidden width of the message-passing layers.
-    enc_layers:
-        Number of encoder message-passing layers.
-    dec_hidden:
-        Hidden width of the (MLP) decoder.
+    encoder_hidden_dims:
+        Hidden dimensions for the graph encoder.
+        Number of encoder graph layers = len(encoder_hidden_dims).
+        Example: [128, 64, 32] builds enc_in -> 128 -> 64 -> 32.
+    decoder_hidden_dims:
+        Hidden dimensions for the decoder MLP.
+        Number of decoder hidden layers = len(decoder_hidden_dims).
+        Example: [64, 32] builds latent -> 64 -> 32 -> output.
+        Use [] for a direct linear decoder from latent to output.
     dropout:
         Dropout in encoder layers.
     mask_ratio:
@@ -67,9 +70,8 @@ class GraphVAE(nn.Module):
         self,
         in_dim: int,
         latent_dim: int = 12,
-        hidden: int = 64,
-        enc_layers: int = 2,
-        dec_hidden: int = 64,
+        encoder_hidden_dims: list[int] | tuple[int, ...] = (64, 64),
+        decoder_hidden_dims: list[int] | tuple[int, ...] = (64,),
         dropout: float = 0.1,
         mask_ratio: float = 0.15,
         use_channel_idx: bool = True,
@@ -84,25 +86,66 @@ class GraphVAE(nn.Module):
         self.mask_ratio = float(mask_ratio)
         self.use_channel_idx = bool(use_channel_idx)
 
-        Conv = SAGEConv if conv == "sage" else GCNConv
-        enc_in = self.in_dim + (1 if use_channel_idx else 0)
+        if conv == "sage":
+            Conv = SAGEConv
+        elif conv == "gcn":
+            Conv = GCNConv
+        else:
+            raise ValueError(f"conv must be 'sage' or 'gcn', got {conv!r}")
 
-        convs = []
+        def _positive_int_list(
+            name: str,
+            values: list[int] | tuple[int, ...],
+            *,
+            allow_empty: bool = False,
+        ) -> list[int]:
+            dims = [int(v) for v in values]
+            if not allow_empty and len(dims) == 0:
+                raise ValueError(f"{name} must be non-empty")
+            if any(d <= 0 for d in dims):
+                raise ValueError(f"{name} must contain positive integers, got {dims}")
+            return dims
+
+        self.encoder_hidden_dims = _positive_int_list(
+            "encoder_hidden_dims",
+            encoder_hidden_dims,
+            allow_empty=False,
+        )
+        self.decoder_hidden_dims = _positive_int_list(
+            "decoder_hidden_dims",
+            decoder_hidden_dims,
+            allow_empty=True,
+        )
+
+        enc_in = self.in_dim + (1 if self.use_channel_idx else 0)
+
+        # Variable-width graph encoder.
+        # Example: encoder_hidden_dims = [128, 64, 32]
+        # Encoder: enc_in -> 128 -> 64 -> 32
+        convs: list[nn.Module] = []
         c_in = enc_in
-        for _ in range(max(1, enc_layers)):
-            convs.append(Conv(c_in, hidden))
-            c_in = hidden
+        for hidden_dim in self.encoder_hidden_dims:
+            convs.append(Conv(c_in, hidden_dim))
+            c_in = hidden_dim
         self.convs = nn.ModuleList(convs)
 
-        self.fc_mu = nn.Linear(hidden, latent_dim)
-        self.fc_logvar = nn.Linear(hidden, latent_dim)
+        encoder_out_dim = self.encoder_hidden_dims[-1]
+        self.fc_mu = nn.Linear(encoder_out_dim, self.latent_dim)
+        self.fc_logvar = nn.Linear(encoder_out_dim, self.latent_dim)
 
-        dec_in = latent_dim + (1 if use_channel_idx else 0)
-        self.decoder = nn.Sequential(
-            nn.Linear(dec_in, dec_hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(dec_hidden, self.in_dim),
-        )
+        dec_in = self.latent_dim + (1 if self.use_channel_idx else 0)
+
+        # Variable-width decoder MLP.
+        # Example: decoder_hidden_dims = [64, 32]
+        # Decoder: dec_in -> 64 -> 32 -> in_dim
+        decoder_layers: list[nn.Module] = []
+        c_in = dec_in
+        for hidden_dim in self.decoder_hidden_dims:
+            decoder_layers.append(nn.Linear(c_in, hidden_dim))
+            decoder_layers.append(nn.ReLU(inplace=True))
+            c_in = hidden_dim
+        decoder_layers.append(nn.Linear(c_in, self.in_dim))
+        self.decoder = nn.Sequential(*decoder_layers)
 
     # ------------------------------------------------------------------
     def _split(self, x: torch.Tensor):

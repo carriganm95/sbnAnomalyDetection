@@ -295,7 +295,9 @@ def main(argv=None) -> int:
                    help="second scores npz (e.g. bad runs) to overlay + compute AUC vs --scores")
     p.add_argument("--labels", nargs=2, default=["good", "bad"], metavar=("A", "B"))
     p.add_argument("--threshold", type=float, default=None,
-                   help="window operating threshold (else good-set p99)")
+                   help="explicit window operating threshold; overrides --percentile")
+    p.add_argument("--percentile", type=float, default=99.0,
+                   help="good-set percentile used as the window operating threshold when --threshold is not set")
     p.add_argument("--per-run", action="store_true",
                    help="also roll windows up to one score per run and report run-level metrics")
     p.add_argument("--run-stat", default="frac_above",
@@ -312,6 +314,9 @@ def main(argv=None) -> int:
     p.add_argument("--instant-threshold", type=float, default=None,
                    help="single-window score that fires immediately (default: none)")
     args = p.parse_args(argv)
+
+    if not (0.0 <= float(args.percentile) <= 100.0):
+        p.error("--percentile must be between 0 and 100")
 
     arch = np.load(args.scores, allow_pickle=False)
     node_scores = arch["node_scores"] if "node_scores" in arch else arch["scores"]
@@ -330,8 +335,12 @@ def main(argv=None) -> int:
           f"mean={np.nanmean(win):.4g} p95={np.nanpercentile(finite,95):.4g} "
           f"p99={np.nanpercentile(finite,99):.4g} max={np.nanmax(win):.4g}")
 
-    # Operating threshold: explicit --threshold, else the good-set 99th pct (~1% FPR).
-    thr = args.threshold if args.threshold is not None else float(np.nanpercentile(finite, 99))
+    # Operating threshold: explicit --threshold, else the requested good-set percentile.
+    thr = (
+        float(args.threshold)
+        if args.threshold is not None
+        else float(np.nanpercentile(finite, float(args.percentile)))
+    )
 
     win_cmp = prov_bad = None
     if args.compare:
@@ -342,7 +351,7 @@ def main(argv=None) -> int:
 
         # ---- window-level ----
         auc = separation_auc(win, win_cmp)
-        thr_src = "user" if args.threshold is not None else "good p99"
+        thr_src = "user" if args.threshold is not None else f"good p{float(args.percentile):g}"
         print(f"# [window-level] AUC({args.labels[1]} vs {args.labels[0]})={auc:.4f}  "
               f"threshold={thr:.4g} ({thr_src})")
         print(f"# confusion (rows=actual, cols=predicted; positive={args.labels[1]}):")

@@ -30,6 +30,7 @@ class GraphVAETrainer(BaseTrainer):
         log_interval: int = 50,
         anomaly_threshold: Optional[float] = None,
         save_best_only: bool = False,
+        save_epochs: bool = True,
         use_amp: bool = False,
         score_mode: str = "mean",
         beta: float = 1.0,
@@ -45,6 +46,7 @@ class GraphVAETrainer(BaseTrainer):
             log_interval=log_interval,
             anomaly_threshold=anomaly_threshold,
             save_best_only=save_best_only,
+            save_epochs=save_epochs,
             use_amp=use_amp,
             score_mode=score_mode,
         )

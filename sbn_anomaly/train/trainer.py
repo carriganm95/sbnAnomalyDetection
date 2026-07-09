@@ -40,6 +40,15 @@ class BaseTrainer(ABC):
         Number of training epochs.
     checkpoint_dir:
         Directory to save model checkpoints.  ``None`` disables saving.
+    save_epochs:
+        If ``True``, save per-epoch weight checkpoints under
+        ``checkpoint_dir/weights/epoch_XXXX.pt``. If ``False``, do not save
+        any per-epoch weight checkpoints. The final model can still be saved
+        separately by the caller via :meth:`save`.
+    save_best_only:
+        Only used when ``save_epochs=True``. If ``True``, save only epochs
+        that improve the training loss, plus the final epoch. If ``False``,
+        save every epoch.
     log_interval:
         Log training loss every N batches.
     """
@@ -57,6 +66,7 @@ class BaseTrainer(ABC):
         anomaly_threshold: Optional[float] = None,
         reconstruction_plot_max_values: int = 50000,
         save_best_only: bool = False,
+        save_epochs: bool = True,
         use_amp: bool = False,
         score_mode: str = "mean",
     ) -> None:
@@ -74,6 +84,7 @@ class BaseTrainer(ABC):
         self.anomaly_threshold = anomaly_threshold
         self.reconstruction_plot_max_values = max(int(reconstruction_plot_max_values), 0)
         self.save_best_only = bool(save_best_only)
+        self.save_epochs = bool(save_epochs)
         self.best_loss: Optional[float] = None
         self.use_amp = bool(use_amp) and self.device.type == "cuda"
         self.score_mode = str(score_mode).lower()
@@ -536,18 +547,23 @@ class BaseTrainer(ABC):
                     self.history["val_loss"][-1],
                 )
 
-            # Determine if we should save checkpoint and plots this epoch.
+            # Track the best training loss independently of whether
+            # per-epoch checkpoints are being written.
             is_best = self.best_loss is None or mean_loss < self.best_loss
             is_final = epoch == self.max_epochs
-            should_save_epoch_artifacts = (not self.save_best_only) or is_best or is_final
 
             if is_best and self.best_loss is not None:
                 logger.info("New best loss: %.6f (was %.6f)", mean_loss, self.best_loss)
             if is_best:
                 self.best_loss = mean_loss
 
-            if self.checkpoint_dir:
-                if should_save_epoch_artifacts:
+            # Per-epoch weight checkpoints are controlled only by save_epochs.
+            # If save_epochs=False, do not write checkpoint_dir/weights/epoch_XXXX.pt
+            # at all; save_best_only is ignored in that case. The caller can
+            # still save the final model through output_path after train().
+            if self.checkpoint_dir and self.save_epochs:
+                should_save_epoch_checkpoint = (not self.save_best_only) or is_best or is_final
+                if should_save_epoch_checkpoint:
                     weights_dir = self.checkpoint_dir / "weights"
                     weights_dir.mkdir(parents=True, exist_ok=True)
                     ckpt_path = weights_dir / f"epoch_{epoch:04d}.pt"

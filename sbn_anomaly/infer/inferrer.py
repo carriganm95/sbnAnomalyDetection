@@ -46,6 +46,7 @@ class GNNScorer:
         num_channels: int,
         device: str = "auto",
         threshold: Optional[float] = None,
+        threshold_percentile: Optional[float] = None,
     ) -> None:
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -53,6 +54,7 @@ class GNNScorer:
         self.model = model.to(self.device).eval()
         self.num_channels = int(num_channels)
         self.threshold = threshold
+        self.threshold_percentile = threshold_percentile
 
     @classmethod
     def from_checkpoint(
@@ -62,6 +64,7 @@ class GNNScorer:
         num_channels: int,
         device: str = "auto",
         threshold: Optional[float] = None,
+        threshold_percentile: Optional[float] = None,
     ) -> "GNNScorer":
         """Load model weights from a checkpoint and return a GNNScorer."""
         if device == "auto":
@@ -71,7 +74,7 @@ class GNNScorer:
             state = state["model_state_dict"]
         model.load_state_dict(state)
         logger.info("Loaded GNN weights from %s", checkpoint_path)
-        return cls(model=model, num_channels=num_channels, device=device, threshold=threshold)
+        return cls(model=model, num_channels=num_channels, device=device, threshold=threshold, threshold_percentile=threshold_percentile)
 
     @torch.no_grad()
     def score_loader(
@@ -154,6 +157,7 @@ class AnomalyScorer:
         model_type: str,
         device: str = "auto",
         threshold: Optional[float] = None,
+        threshold_percentile: Optional[float] = None,
         normalize: bool = False,
     ) -> None:
         if model_type not in ("tpc", "pmt", "fusion", "window", "gnn"):
@@ -166,6 +170,7 @@ class AnomalyScorer:
         self.model = model.to(self.device).eval()
         self.model_type = model_type
         self.threshold = threshold
+        self.threshold_percentile = threshold_percentile
         self.normalize = bool(normalize)
 
     # ------------------------------------------------------------------
@@ -180,6 +185,7 @@ class AnomalyScorer:
         model_type: str,
         device: str = "auto",
         threshold: Optional[float] = None,
+        threshold_percentile: Optional[float] = None,
         normalize: bool = False,
     ) -> "AnomalyScorer":
         """Load model weights from a checkpoint and return an ``AnomalyScorer``."""
@@ -191,7 +197,7 @@ class AnomalyScorer:
             state = state["model_state_dict"]
         model.load_state_dict(state)
         logger.info("Loaded weights from %s", checkpoint_path)
-        return cls(model=model, model_type=model_type, device=device, threshold=threshold, normalize=normalize)
+        return cls(model=model, model_type=model_type, device=device, threshold=threshold, threshold_percentile=threshold_percentile, normalize=normalize)
 
     # ------------------------------------------------------------------
     # Scoring
@@ -275,14 +281,25 @@ class AnomalyScorer:
 
         return scores
 
-    def is_anomaly(self, *arrays: np.ndarray) -> np.ndarray:
-        """Return boolean array; ``True`` where score exceeds ``threshold``.
+    def resolved_threshold(self, scores: np.ndarray) -> float:
+        """Return the explicit threshold or compute it from ``threshold_percentile``."""
+        if self.threshold is not None:
+            return float(self.threshold)
+        if self.threshold_percentile is None:
+            raise ValueError("Set threshold or threshold_percentile at construction to use is_anomaly().")
+        percentile = float(self.threshold_percentile)
+        if not 0.0 <= percentile <= 100.0:
+            raise ValueError(f"threshold_percentile must be between 0 and 100, got {percentile}")
+        finite = np.asarray(scores, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            raise ValueError("Cannot compute percentile threshold because there are no finite scores.")
+        return float(np.nanpercentile(finite, percentile))
 
-        Raises ``ValueError`` if ``threshold`` was not set at construction.
-        """
-        if self.threshold is None:
-            raise ValueError("Set a threshold at construction to use is_anomaly().")
-        return self.score(*arrays) > self.threshold
+    def is_anomaly(self, *arrays: np.ndarray) -> np.ndarray:
+        """Return boolean array; ``True`` where score exceeds the resolved threshold."""
+        scores = self.score(*arrays)
+        return scores > self.resolved_threshold(scores)
 
     def score_stream(
         self,
