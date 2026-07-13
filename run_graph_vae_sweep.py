@@ -73,7 +73,7 @@ DEFAULT_PER_CHANNEL_PLOT_NAME = "per_channel_scores.png"
 # sweep activity, including training, inference, evaluation, plotting, and
 # rewrite/repair modes. Add full model directory paths here.
 IGNORED: list[Path] = [
-    DEFAULT_RUNS_ROOT / "All_data",
+    # DEFAULT_RUNS_ROOT / "All_data",
 ]
 
 
@@ -897,7 +897,16 @@ def run_per_channel_score_plot(
             f"Plotting script does not define a callable main(): {plot_script_path}"
         )
 
-    namespace["main"]()
+    old_argv = sys.argv.copy()
+
+    try:
+        sys.argv = [
+            str(plot_script_path),
+            str(inference_dir),
+        ]
+        namespace["main"]()
+    finally:
+        sys.argv = old_argv
 
     print("Per-channel node-score plot finished.")
 
@@ -1243,12 +1252,18 @@ def run_sweep(args: argparse.Namespace) -> int:
     if args.missing_evaluate_only:
         args.evaluate_only = True
 
-    # --missing-plot is a plot-only repair mode. It scans each model directory
-    # and runs the per-channel plotter only when the expected plot is absent.
-    if args.missing_plot:
+    # --missing-plot and --force-replot are standalone plot-only modes.
+    # --missing-plot plots only when the expected plot is absent.
+    # --force-replot always reruns plotting, even when the plot already exists.
+    if args.missing_plot or args.force_replot:
         args.per_channel_plot = True
 
-    if args.missing_plot and (
+    if args.missing_plot and args.force_replot:
+        raise ValueError(
+            "--missing-plot and --force-replot cannot be used together."
+        )
+
+    if (args.missing_plot or args.force_replot) and (
         args.evaluate_only
         or args.missing_evaluate_only
         or args.infer_only
@@ -1258,8 +1273,8 @@ def run_sweep(args: argparse.Namespace) -> int:
         or args.missing_rewrite
     ):
         raise ValueError(
-            "--missing-plot is a standalone plot-repair mode and cannot be combined "
-            "with training/inference/evaluation-only rewrite modes."
+            "--missing-plot/--force-replot are standalone plot-only modes and cannot "
+            "be combined with training/inference/evaluation-only rewrite modes."
         )
 
     if args.evaluate_only and args.skip_eval:
@@ -1314,6 +1329,7 @@ def run_sweep(args: argparse.Namespace) -> int:
     print(f"Missing-infer-only mode: {args.missing_infer_only}")
     print(f"Per-channel plotting: {args.per_channel_plot}")
     print(f"Missing-plot mode: {args.missing_plot}")
+    print(f"Force-replot mode: {args.force_replot}")
     print(f"Skip evaluation: {args.skip_eval}")
     if not args.skip_eval:
         print(f"Evaluation command: {args.eval_cmd}")
@@ -1351,10 +1367,13 @@ def run_sweep(args: argparse.Namespace) -> int:
         eval_log_path = inference_dir / args.eval_log_name
         eval_json_path = inference_dir / args.eval_json_name
 
-        if args.missing_plot:
+        if args.missing_plot or args.force_replot:
             print("\n" + "=" * 80)
             print(f"[{idx}/{len(config_paths)}] {config_path}")
-            print(f"Checking per-channel plot for model directory: {run_dir}")
+            if args.force_replot:
+                print(f"Force-replotting per-channel plot for model directory: {run_dir}")
+            else:
+                print(f"Checking per-channel plot for model directory: {run_dir}")
 
             good_score_path = inference_dir / "scores_good.npz"
             bad_score_path = inference_dir / "scores_bad.npz"
@@ -1379,14 +1398,22 @@ def run_sweep(args: argparse.Namespace) -> int:
                 inference_dir=inference_dir,
             )
 
-            if per_channel_plot_path.exists():
+            if args.missing_plot and per_channel_plot_path.exists():
                 print("Skipping: per-channel plot already exists.")
                 print(f"Existing plot: {per_channel_plot_path}")
                 print("=" * 80)
                 continue
 
-            print("Per-channel plot is missing; generating it now.")
-            print(f"Expected plot: {per_channel_plot_path}")
+            if args.force_replot:
+                if per_channel_plot_path.exists():
+                    print("Existing per-channel plot found; rerunning because --force-replot was set.")
+                    print(f"Existing plot: {per_channel_plot_path}")
+                else:
+                    print("No existing per-channel plot found; generating it because --force-replot was set.")
+                print(f"Expected plot: {per_channel_plot_path}")
+            else:
+                print("Per-channel plot is missing; generating it now.")
+                print(f"Expected plot: {per_channel_plot_path}")
             run_per_channel_score_plot(
                 plot_script_path=PER_CHANNEL_PLOT_SCRIPT,
                 inference_dir=inference_dir,
@@ -2114,6 +2141,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "and both scores_good.npz and scores_bad.npz exist, run the per-channel "
             "plotter. No training, inference, or good-vs-bad evaluation is run. "
             "This implies per-channel plotting."
+        ),
+    )
+    parser.add_argument(
+        "--force-replot",
+        "--force_replot",
+        dest="force_replot",
+        action="store_true",
+        help=(
+            "Standalone plot-only mode. For each model directory under --runs-root, "
+            "rerun the per-channel plotter whenever scores_good.npz and scores_bad.npz "
+            "exist, even if the expected plot file already exists. No training, "
+            "inference, or good-vs-bad evaluation is run. This implies per-channel plotting."
         ),
     )
     parser.add_argument(

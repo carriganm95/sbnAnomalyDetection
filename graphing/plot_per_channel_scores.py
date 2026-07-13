@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 
+import argparse
 from pathlib import Path
+from typing import Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
 # ============================================================
-# User settings
+# Default settings
 # ============================================================
 
-INFERENCE_RESULT_DIR = Path(
+DEFAULT_INFERENCE_RESULT_DIR = Path(
     "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/"
     "checkpoints/graph_vae/All_data/inference_result"
 )
@@ -23,9 +25,10 @@ BAD_FILENAME = "scores_bad.npz"
 CHANNEL_START = 0
 CHANNEL_END = 11276
 
-# ------------------------------------------------------------
+
+# ============================================================
 # Spike removal
-# ------------------------------------------------------------
+# ============================================================
 
 # If True, automatically remove isolated extreme spikes.
 SMOOTHING = True
@@ -35,65 +38,137 @@ SMOOTHING = True
 SMOOTHING_WINDOW = 1001
 
 # Larger value = less aggressive spike removal.
-# A point is removed when its distance from the local median is more
-# than this many local robust standard deviations.
 SMOOTHING_THRESHOLD = 40.0
 
-# Output plot filename
+
+# ============================================================
+# Output settings
+# ============================================================
+
 OUTPUT_FILENAME = "channel_mean_node_scores.png"
 
-# Plot settings
 FIGSIZE = (16, 7)
 DPI = 200
+
+
+# ============================================================
+# Command-line arguments
+# ============================================================
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Plot mean node scores per channel from one model's "
+            "scores_good.npz and scores_bad.npz files."
+        )
+    )
+
+    parser.add_argument(
+        "inference_result_dir",
+        nargs="?",
+        default=str(DEFAULT_INFERENCE_RESULT_DIR),
+        help=(
+            "Directory containing scores_good.npz and scores_bad.npz. "
+            "If omitted, DEFAULT_INFERENCE_RESULT_DIR is used."
+        ),
+    )
+
+    return parser
 
 
 # ============================================================
 # Helper functions
 # ============================================================
 
-def load_mean_node_scores(npz_path: Path) -> tuple[np.ndarray, int]:
+def load_mean_node_scores(
+    npz_path: Path,
+) -> Tuple[np.ndarray, int]:
     """
     Load node_scores and calculate the mean score for each channel
     over all events/windows.
 
-    Expected shape:
+    Expected node_scores shape:
         (num_events, num_channels)
 
     Individual NaN values are ignored.
     """
-    if not npz_path.exists():
-        raise FileNotFoundError(f"File does not exist: {npz_path}")
 
-    print(f"Loading: {npz_path}")
+    npz_path = npz_path.expanduser().resolve()
+
+    if not npz_path.exists():
+        raise FileNotFoundError(
+            "File does not exist: {}".format(npz_path)
+        )
+
+    if not npz_path.is_file():
+        raise FileNotFoundError(
+            "Path is not a file: {}".format(npz_path)
+        )
+
+    print("Loading: {}".format(npz_path))
 
     with np.load(npz_path, allow_pickle=True) as data:
         if "node_scores" not in data:
             raise KeyError(
-                f"'node_scores' not found in {npz_path}\n"
-                f"Available keys: {list(data.keys())}"
+                "'node_scores' not found in {}\n"
+                "Available keys: {}".format(
+                    npz_path,
+                    list(data.keys()),
+                )
             )
 
-        node_scores = np.asarray(data["node_scores"], dtype=np.float64)
+        node_scores = np.asarray(
+            data["node_scores"],
+            dtype=np.float64,
+        )
 
     if node_scores.ndim != 2:
         raise ValueError(
-            f"Expected node_scores to be 2D, but got shape {node_scores.shape}"
+            "Expected node_scores to be 2D, but got shape {}".format(
+                node_scores.shape
+            )
         )
 
-    num_events, num_channels = node_scores.shape
+    num_events = node_scores.shape[0]
+    num_channels = node_scores.shape[1]
 
-    print(f"  node_scores shape: {node_scores.shape}")
-    print(f"  number of events:  {num_events:,}")
-    print(f"  detected channels: {num_channels:,}")
-    print(f"  total NaN values:  {np.isnan(node_scores).sum():,}")
+    print("  node_scores shape: {}".format(node_scores.shape))
+    print("  number of events:  {:,}".format(num_events))
+    print("  detected channels: {:,}".format(num_channels))
+    print(
+        "  total NaN values:  {:,}".format(
+            int(np.isnan(node_scores).sum())
+        )
+    )
 
-    # Ignore individual NaN values.
-    with np.errstate(invalid="ignore"):
-        mean_node_scores = np.nanmean(node_scores, axis=0)
+    # Avoid RuntimeWarning from np.nanmean on channels that are all NaN.
+    finite_counts = np.sum(
+        np.isfinite(node_scores),
+        axis=0,
+    )
+
+    score_sums = np.nansum(
+        node_scores,
+        axis=0,
+    )
+
+    mean_node_scores = np.full(
+        num_channels,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    valid_channels = finite_counts > 0
+
+    mean_node_scores[valid_channels] = (
+        score_sums[valid_channels]
+        / finite_counts[valid_channels]
+    )
 
     print(
-        f"  all-NaN channels:  "
-        f"{np.isnan(mean_node_scores).sum():,}"
+        "  all-NaN channels:  {:,}".format(
+            int(np.count_nonzero(~valid_channels))
+        )
     )
 
     return mean_node_scores, num_channels
@@ -103,15 +178,22 @@ def resolve_channel_range(
     channel_start: int,
     channel_end: int,
     num_channels: int,
-) -> tuple[int, int]:
+) -> Tuple[int, int]:
     """
-    Resolve requested channel bounds independently.
+    Resolve requested channel bounds.
     """
+
+    if num_channels <= 0:
+        raise ValueError(
+            "num_channels must be positive."
+        )
 
     if channel_start < 0 or channel_start >= num_channels:
         print(
-            f"Invalid CHANNEL_START={channel_start}. "
-            "Using minimum channel 0."
+            "Invalid CHANNEL_START={}. "
+            "Using minimum channel 0.".format(
+                channel_start
+            )
         )
         start = 0
     else:
@@ -119,8 +201,11 @@ def resolve_channel_range(
 
     if channel_end <= 0 or channel_end > num_channels:
         print(
-            f"Invalid CHANNEL_END={channel_end}. "
-            f"Using maximum bound {num_channels}."
+            "Invalid CHANNEL_END={}. "
+            "Using maximum bound {}.".format(
+                channel_end,
+                num_channels,
+            )
         )
         end = num_channels
     else:
@@ -128,21 +213,27 @@ def resolve_channel_range(
 
     if start >= end:
         raise ValueError(
-            f"Invalid channel range: start={start}, end={end}"
+            "Invalid channel range: start={}, end={}".format(
+                start,
+                end,
+            )
         )
 
     print()
     print("Resolved channel range:")
-    print(f"  start: {start}")
-    print(f"  end:   {end} (exclusive)")
-    print(f"  plotting {end - start:,} channels")
+    print("  start: {}".format(start))
+    print("  end:   {} (exclusive)".format(end))
+    print(
+        "  plotting {:,} channels".format(
+            end - start
+        )
+    )
 
     return start, end
 
 
 def remove_large_spikes(
     scores: np.ndarray,
-    *,
     window_size: int,
     threshold: float,
     label: str,
@@ -150,99 +241,239 @@ def remove_large_spikes(
     """
     Remove isolated extreme spikes using a local median and local MAD.
 
-    Removed points are replaced with NaN, so matplotlib skips only
-    those individual points.
+    Removed points are replaced with NaN.
 
-    This does not smooth or average the normal data.
+    This does not smooth or average normal data.
     """
 
-    scores = np.asarray(scores, dtype=np.float64).copy()
+    scores = np.asarray(
+        scores,
+        dtype=np.float64,
+    ).copy()
+
+    if scores.ndim != 1:
+        raise ValueError(
+            "Expected a 1D score array, but got shape {}".format(
+                scores.shape
+            )
+        )
 
     if window_size < 3:
-        raise ValueError("SMOOTHING_WINDOW must be at least 3.")
+        raise ValueError(
+            "SMOOTHING_WINDOW must be at least 3."
+        )
+
+    if threshold <= 0:
+        raise ValueError(
+            "SMOOTHING_THRESHOLD must be positive."
+        )
 
     if window_size % 2 == 0:
         window_size += 1
+
         print(
-            f"SMOOTHING_WINDOW must be odd. "
-            f"Using {window_size} instead."
+            "SMOOTHING_WINDOW must be odd. "
+            "Using {} instead.".format(
+                window_size
+            )
         )
 
     half_window = window_size // 2
 
-    spike_mask = np.zeros(scores.shape, dtype=bool)
+    spike_mask = np.zeros(
+        scores.shape,
+        dtype=bool,
+    )
 
     for i in range(scores.size):
-        if not np.isfinite(scores[i]):
+        current_value = scores[i]
+
+        if not np.isfinite(current_value):
             continue
 
-        start = max(0, i - half_window)
-        end = min(scores.size, i + half_window + 1)
+        local_start = max(
+            0,
+            i - half_window,
+        )
 
-        local = scores[start:end]
-        local = local[np.isfinite(local)]
+        local_end = min(
+            scores.size,
+            i + half_window + 1,
+        )
+
+        local = scores[
+            local_start:local_end
+        ]
+
+        local = local[
+            np.isfinite(local)
+        ]
 
         if local.size < 3:
             continue
 
         local_median = np.median(local)
 
-        # Median absolute deviation
-        mad = np.median(np.abs(local - local_median))
+        mad = np.median(
+            np.abs(
+                local - local_median
+            )
+        )
 
-        # Convert MAD to a robust estimate of standard deviation.
         robust_sigma = 1.4826 * mad
 
-        # Avoid division by zero in very flat regions.
-        if robust_sigma <= 0:
+        if (
+            not np.isfinite(robust_sigma)
+            or robust_sigma <= 0
+        ):
             continue
 
-        deviation = abs(scores[i] - local_median)
+        deviation = abs(
+            current_value - local_median
+        )
 
         if deviation > threshold * robust_sigma:
             spike_mask[i] = True
 
-    num_removed = int(np.count_nonzero(spike_mask))
-
-    print(
-        f"  {label}: removed {num_removed:,} "
-        f"extreme spike(s)"
+    num_removed = int(
+        np.count_nonzero(spike_mask)
     )
 
-    # Replace only detected spikes with NaN.
+    print(
+        "  {}: removed {:,} extreme spike(s)".format(
+            label,
+            num_removed,
+        )
+    )
+
     scores[spike_mask] = np.nan
 
     return scores
 
 
 # ============================================================
-# Main
+# Main plotting function
 # ============================================================
 
-def main():
-    good_path = INFERENCE_RESULT_DIR / GOOD_FILENAME
-    bad_path = INFERENCE_RESULT_DIR / BAD_FILENAME
-    output_path = INFERENCE_RESULT_DIR / OUTPUT_FILENAME
+def main(
+    inference_result_dir: Optional[
+        Union[Path, str]
+    ] = None,
+) -> None:
+    """
+    Plot one model's per-channel mean node scores.
+
+    This function can be used in two ways.
+
+    Command line:
+        python plot_per_channel_scores.py /path/to/inference_result
+
+    From another Python script:
+        main("/path/to/inference_result")
+    """
 
     # --------------------------------------------------------
-    # Load data
+    # Resolve inference directory
     # --------------------------------------------------------
 
-    good_mean_scores, good_num_channels = load_mean_node_scores(
-        good_path
+    if inference_result_dir is None:
+        parser = build_arg_parser()
+        args = parser.parse_args()
+
+        inference_result_dir = args.inference_result_dir
+
+    inference_result_dir = Path(
+        inference_result_dir
+    ).expanduser().resolve()
+
+    if not inference_result_dir.exists():
+        raise FileNotFoundError(
+            "Inference result directory does not exist: {}".format(
+                inference_result_dir
+            )
+        )
+
+    if not inference_result_dir.is_dir():
+        raise NotADirectoryError(
+            "Inference result path is not a directory: {}".format(
+                inference_result_dir
+            )
+        )
+
+    good_path = (
+        inference_result_dir
+        / GOOD_FILENAME
+    )
+
+    bad_path = (
+        inference_result_dir
+        / BAD_FILENAME
+    )
+
+    output_path = (
+        inference_result_dir
+        / OUTPUT_FILENAME
+    )
+
+    print()
+    print("=" * 80)
+    print("Per-channel node-score plotting")
+    print(
+        "Inference result directory: {}".format(
+            inference_result_dir
+        )
+    )
+    print(
+        "Good score file: {}".format(
+            good_path
+        )
+    )
+    print(
+        "Bad score file:  {}".format(
+            bad_path
+        )
+    )
+    print(
+        "Output plot:     {}".format(
+            output_path
+        )
+    )
+    print("=" * 80)
+
+    # --------------------------------------------------------
+    # Load good data
+    # --------------------------------------------------------
+
+    good_mean_scores, good_num_channels = (
+        load_mean_node_scores(
+            good_path
+        )
     )
 
     print()
 
-    bad_mean_scores, bad_num_channels = load_mean_node_scores(
-        bad_path
+    # --------------------------------------------------------
+    # Load bad data
+    # --------------------------------------------------------
+
+    bad_mean_scores, bad_num_channels = (
+        load_mean_node_scores(
+            bad_path
+        )
     )
+
+    # --------------------------------------------------------
+    # Validate channel counts
+    # --------------------------------------------------------
 
     if good_num_channels != bad_num_channels:
         raise ValueError(
             "Good and bad files have different numbers of channels:\n"
-            f"  good: {good_num_channels}\n"
-            f"  bad:  {bad_num_channels}"
+            "  good: {}\n"
+            "  bad:  {}".format(
+                good_num_channels,
+                bad_num_channels,
+            )
         )
 
     num_channels = good_num_channels
@@ -251,13 +482,19 @@ def main():
     # Resolve channel range
     # --------------------------------------------------------
 
-    channel_start, channel_end = resolve_channel_range(
-        CHANNEL_START,
-        CHANNEL_END,
-        num_channels,
+    channel_start, channel_end = (
+        resolve_channel_range(
+            CHANNEL_START,
+            CHANNEL_END,
+            num_channels,
+        )
     )
 
-    channels = np.arange(channel_start, channel_end)
+    channels = np.arange(
+        channel_start,
+        channel_end,
+        dtype=np.int64,
+    )
 
     good_selected = good_mean_scores[
         channel_start:channel_end
@@ -273,39 +510,76 @@ def main():
 
     if SMOOTHING:
         print()
-        print("Automatic spike removal enabled:")
+        print(
+            "Automatic spike removal enabled:"
+        )
 
         good_selected = remove_large_spikes(
-            good_selected,
+            scores=good_selected,
             window_size=SMOOTHING_WINDOW,
             threshold=SMOOTHING_THRESHOLD,
             label="Good",
         )
 
         bad_selected = remove_large_spikes(
-            bad_selected,
+            scores=bad_selected,
             window_size=SMOOTHING_WINDOW,
             threshold=SMOOTHING_THRESHOLD,
             label="Bad",
         )
+
     else:
         print()
-        print("Automatic spike removal disabled.")
+        print(
+            "Automatic spike removal disabled."
+        )
 
     # --------------------------------------------------------
     # Valid masks
     # --------------------------------------------------------
 
-    good_valid = np.isfinite(good_selected)
-    bad_valid = np.isfinite(bad_selected)
+    good_valid = np.isfinite(
+        good_selected
+    )
+
+    bad_valid = np.isfinite(
+        bad_selected
+    )
+
+    print()
+    print("Finite plotted channels:")
+
+    print(
+        "  Good: {:,} / {:,}".format(
+            int(
+                np.count_nonzero(
+                    good_valid
+                )
+            ),
+            good_selected.size,
+        )
+    )
+
+    print(
+        "  Bad:  {:,} / {:,}".format(
+            int(
+                np.count_nonzero(
+                    bad_valid
+                )
+            ),
+            bad_selected.size,
+        )
+    )
 
     # --------------------------------------------------------
     # Plot
     # --------------------------------------------------------
 
-    plt.figure(figsize=FIGSIZE)
+    fig, ax = plt.subplots(
+        figsize=FIGSIZE
+    )
 
-    plt.plot(
+    ax.plot(
         channels[good_valid],
         good_selected[good_valid],
         color="blue",
@@ -314,7 +588,7 @@ def main():
         label="Good",
     )
 
-    plt.plot(
+    ax.plot(
         channels[bad_valid],
         bad_selected[bad_valid],
         color="red",
@@ -323,24 +597,54 @@ def main():
         label="Bad",
     )
 
-    plt.xlabel("Channel")
-    plt.ylabel("Mean Node Score")
-    plt.title(
-        f"Mean Node Score per Channel "
-        f"({channel_start}–{channel_end - 1})"
+    ax.set_xlabel(
+        "Channel"
     )
 
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xlim(channel_start, channel_end - 1)
+    ax.set_ylabel(
+        "Mean Node Score"
+    )
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=DPI)
-    plt.close()
+    ax.set_title(
+        "Mean Node Score per Channel "
+        "({}-{})".format(
+            channel_start,
+            channel_end - 1,
+        )
+    )
+
+    ax.legend()
+
+    ax.grid(
+        True,
+        alpha=0.3,
+    )
+
+    ax.set_xlim(
+        channel_start,
+        channel_end - 1,
+    )
+
+    fig.tight_layout()
+
+    fig.savefig(
+        output_path,
+        dpi=DPI,
+    )
+
+    plt.close(fig)
 
     print()
-    print(f"Saved plot to: {output_path}")
+    print(
+        "Saved plot to: {}".format(
+            output_path
+        )
+    )
 
+
+# ============================================================
+# Entry point
+# ============================================================
 
 if __name__ == "__main__":
     main()
