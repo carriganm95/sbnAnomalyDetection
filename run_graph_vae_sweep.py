@@ -63,6 +63,20 @@ PER_CHANNEL_PLOT_SCRIPT = (
 DEFAULT_PER_CHANNEL_PLOT_NAME = "per_channel_scores.png"
 
 
+
+
+# ============================================================
+# Ignored model directories
+# ============================================================
+
+# Any model directory listed here is skipped completely before any per-model
+# sweep activity, including training, inference, evaluation, plotting, and
+# rewrite/repair modes. Add full model directory paths here.
+IGNORED: list[Path] = [
+    DEFAULT_RUNS_ROOT / "All_data",
+]
+
+
 # ============================================================
 # Good / bad classification
 # ============================================================
@@ -82,6 +96,17 @@ def now_str() -> str:
 def safe_name(name: str) -> str:
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
     return name.strip("_")
+
+
+
+
+def is_ignored_run_dir(run_dir: Path) -> bool:
+    """Return True if run_dir is listed in IGNORED."""
+    resolved_run_dir = run_dir.expanduser().resolve()
+    return any(
+        resolved_run_dir == Path(path).expanduser().resolve()
+        for path in IGNORED
+    )
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -1308,6 +1333,17 @@ def run_sweep(args: argparse.Namespace) -> int:
         config_stem = safe_name(config_path.stem)
         run_name = f"{config_stem}"
         run_dir = runs_root / run_name
+
+        # Highest-priority exclusion: ignored model directories are skipped
+        # before any training, inference, evaluation, plotting, rewrite,
+        # repair, or database activity for that model.
+        if is_ignored_run_dir(run_dir):
+            print("\n" + "=" * 80)
+            print(f"[{idx}/{len(config_paths)}] {config_path}")
+            print(f"IGNORED: skipping model directory completely: {run_dir}")
+            print("=" * 80)
+            continue
+
         inference_dir = run_dir / "inference_result"
         good_score_npz_path = inference_dir / "scores_good.npz"
         bad_score_npz_path = inference_dir / "scores_bad.npz"
