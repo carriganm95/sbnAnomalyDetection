@@ -7,6 +7,7 @@ import datetime as dt
 import json
 import os
 import re
+import runpy
 import shlex
 import sqlite3
 import subprocess
@@ -50,6 +51,16 @@ DEFAULT_EVAL_PLOT_NAME = "goodvsbad.png"
 DEFAULT_EVAL_LOG_NAME = "goodvsbad_eval.txt"
 DEFAULT_EVAL_JSON_NAME = "goodvsbad_eval.json"
 DEFAULT_EVAL_PERCENTILE = 90.0
+
+# Per-channel node-score plotting script. This is run after each successful
+# good-vs-bad evaluation, using that model's own inference_result directory.
+PER_CHANNEL_PLOT_SCRIPT = (
+    PROJECT_DIR / "graphing" / "plot_per_channel_scores.py"
+)
+
+# Fallback filename used by --missing-plot if the plotting script does not
+# expose its output filename/path as a global variable.
+DEFAULT_PER_CHANNEL_PLOT_NAME = "per_channel_scores.png"
 
 
 # ============================================================
@@ -732,6 +743,141 @@ def run_command(
 
 
 # ============================================================
+# Per-channel score plotting
+# ============================================================
+
+def load_per_channel_plot_namespace(
+    *,
+    plot_script_path: Path,
+    inference_dir: Path,
+) -> dict[str, Any]:
+    """Load the plotting script without executing its __main__ block."""
+    plot_script_path = Path(plot_script_path).expanduser().resolve()
+    inference_dir = Path(inference_dir).expanduser().resolve()
+
+    if not plot_script_path.exists():
+        raise FileNotFoundError(
+            f"Per-channel plotting script does not exist: {plot_script_path}"
+        )
+
+    if not plot_script_path.is_file():
+        raise FileNotFoundError(
+            f"Per-channel plotting script path is not a file: {plot_script_path}"
+        )
+
+    namespace = runpy.run_path(
+        str(plot_script_path),
+        run_name="plot_per_channel_scores",
+    )
+    namespace["INFERENCE_RESULT_DIR"] = inference_dir
+    return namespace
+
+
+def get_per_channel_plot_path(
+    *,
+    plot_script_path: Path,
+    inference_dir: Path,
+) -> Path:
+    """Best-effort discovery of the PNG produced by plot_per_channel_scores.py.
+
+    The plotting script is loaded without running main(). Common global output
+    variable names are checked first. If none are defined, fall back to
+    inference_result/per_channel_scores.png.
+    """
+    inference_dir = Path(inference_dir).expanduser().resolve()
+    namespace = load_per_channel_plot_namespace(
+        plot_script_path=plot_script_path,
+        inference_dir=inference_dir,
+    )
+
+    candidate_names = (
+        "OUTPUT_PATH",
+        "OUTPUT_PLOT_PATH",
+        "PLOT_PATH",
+        "OUTPUT_FILE",
+        "OUTPUT_FILENAME",
+        "PLOT_FILENAME",
+    )
+
+    for name in candidate_names:
+        value = namespace.get(name)
+        if value is None:
+            continue
+
+        path = Path(value).expanduser()
+
+        # The plotting script may construct an absolute output path at import
+        # time from its own hard-coded INFERENCE_RESULT_DIR. For sweep use, keep
+        # only the filename and always check inside the current model's
+        # inference_result directory.
+        if path.is_absolute():
+            path = inference_dir / path.name
+        else:
+            path = inference_dir / path
+
+        return path.resolve()
+
+    return (inference_dir / DEFAULT_PER_CHANNEL_PLOT_NAME).resolve()
+
+
+def run_per_channel_score_plot(
+    *,
+    plot_script_path: Path,
+    inference_dir: Path,
+) -> None:
+    """
+    Run graphing/plot_per_channel_scores.py for one model.
+
+    The plotting script currently selects its input directory through the
+    global INFERENCE_RESULT_DIR variable rather than a command-line argument.
+    To avoid editing the plotting script for every model, load it without
+    executing its __main__ block, replace INFERENCE_RESULT_DIR with this
+    model's inference_result directory, and then call its main() function.
+
+    Expected input files inside inference_dir:
+        - scores_good.npz
+        - scores_bad.npz
+    """
+    plot_script_path = Path(plot_script_path).expanduser().resolve()
+    inference_dir = Path(inference_dir).expanduser().resolve()
+
+    good_score_path = inference_dir / "scores_good.npz"
+    bad_score_path = inference_dir / "scores_bad.npz"
+
+    missing_inputs = [
+        path
+        for path in (good_score_path, bad_score_path)
+        if not path.exists()
+    ]
+    if missing_inputs:
+        raise FileNotFoundError(
+            "Cannot run per-channel score plotting because required score "
+            "file(s) are missing: "
+            + ", ".join(str(path) for path in missing_inputs)
+        )
+
+    print("Per-channel node-score plotting...")
+    print(f"  Plot script:      {plot_script_path}")
+    print(f"  Inference result: {inference_dir}")
+
+    # Load without executing the script's __main__ block, then override the
+    # model-specific inference directory before calling main().
+    namespace = load_per_channel_plot_namespace(
+        plot_script_path=plot_script_path,
+        inference_dir=inference_dir,
+    )
+
+    if "main" not in namespace or not callable(namespace["main"]):
+        raise RuntimeError(
+            f"Plotting script does not define a callable main(): {plot_script_path}"
+        )
+
+    namespace["main"]()
+
+    print("Per-channel node-score plot finished.")
+
+
+# ============================================================
 # Result parsing
 # ============================================================
 
@@ -1072,6 +1218,25 @@ def run_sweep(args: argparse.Namespace) -> int:
     if args.missing_evaluate_only:
         args.evaluate_only = True
 
+    # --missing-plot is a plot-only repair mode. It scans each model directory
+    # and runs the per-channel plotter only when the expected plot is absent.
+    if args.missing_plot:
+        args.per_channel_plot = True
+
+    if args.missing_plot and (
+        args.evaluate_only
+        or args.missing_evaluate_only
+        or args.infer_only
+        or args.missing_infer_only
+        or args.skip_infer
+        or args.force_rewrite
+        or args.missing_rewrite
+    ):
+        raise ValueError(
+            "--missing-plot is a standalone plot-repair mode and cannot be combined "
+            "with training/inference/evaluation-only rewrite modes."
+        )
+
     if args.evaluate_only and args.skip_eval:
         raise ValueError(
             "--evaluate-only/--missing-evaluate-only and --skip-eval cannot be used together."
@@ -1122,6 +1287,8 @@ def run_sweep(args: argparse.Namespace) -> int:
     print(f"Missing-evaluate-only mode: {args.missing_evaluate_only}")
     print(f"Infer-only mode: {args.infer_only}")
     print(f"Missing-infer-only mode: {args.missing_infer_only}")
+    print(f"Per-channel plotting: {args.per_channel_plot}")
+    print(f"Missing-plot mode: {args.missing_plot}")
     print(f"Skip evaluation: {args.skip_eval}")
     if not args.skip_eval:
         print(f"Evaluation command: {args.eval_cmd}")
@@ -1147,6 +1314,57 @@ def run_sweep(args: argparse.Namespace) -> int:
         eval_plot_path = inference_dir / args.eval_plot_name
         eval_log_path = inference_dir / args.eval_log_name
         eval_json_path = inference_dir / args.eval_json_name
+
+        if args.missing_plot:
+            print("\n" + "=" * 80)
+            print(f"[{idx}/{len(config_paths)}] {config_path}")
+            print(f"Checking per-channel plot for model directory: {run_dir}")
+
+            good_score_path = inference_dir / "scores_good.npz"
+            bad_score_path = inference_dir / "scores_bad.npz"
+
+            missing_score_paths = [
+                path
+                for path in (good_score_path, bad_score_path)
+                if not path.exists()
+            ]
+            if missing_score_paths:
+                print(
+                    "Skipping: required inference score file(s) are missing, so the "
+                    "per-channel plot cannot be produced."
+                )
+                for path in missing_score_paths:
+                    print(f"  - {path}")
+                print("=" * 80)
+                continue
+
+            per_channel_plot_path = get_per_channel_plot_path(
+                plot_script_path=PER_CHANNEL_PLOT_SCRIPT,
+                inference_dir=inference_dir,
+            )
+
+            if per_channel_plot_path.exists():
+                print("Skipping: per-channel plot already exists.")
+                print(f"Existing plot: {per_channel_plot_path}")
+                print("=" * 80)
+                continue
+
+            print("Per-channel plot is missing; generating it now.")
+            print(f"Expected plot: {per_channel_plot_path}")
+            run_per_channel_score_plot(
+                plot_script_path=PER_CHANNEL_PLOT_SCRIPT,
+                inference_dir=inference_dir,
+            )
+
+            if per_channel_plot_path.exists():
+                print(f"Created per-channel plot: {per_channel_plot_path}")
+            else:
+                print(
+                    "WARNING: plotting finished, but the expected plot path was not found: "
+                    f"{per_channel_plot_path}"
+                )
+            print("=" * 80)
+            continue
 
         if (
             args.missing_infer_only
@@ -1474,6 +1692,11 @@ def run_sweep(args: argparse.Namespace) -> int:
                     if infer_bad_returncode != 0:
                         raise RuntimeError(f"Bad inference failed with return code {infer_bad_returncode}")
 
+                    if args.per_channel_plot:
+                        run_per_channel_score_plot(
+                            plot_script_path=PER_CHANNEL_PLOT_SCRIPT,
+                            inference_dir=inference_dir,
+                        )
 
                     if args.skip_eval:
                         print("Skipping good-vs-bad evaluation because --skip-eval was set.")
@@ -1530,6 +1753,11 @@ def run_sweep(args: argparse.Namespace) -> int:
                     if infer_bad_returncode != 0:
                         raise RuntimeError(f"Bad inference failed with return code {infer_bad_returncode}")
 
+                    if args.per_channel_plot:
+                        run_per_channel_score_plot(
+                            plot_script_path=PER_CHANNEL_PLOT_SCRIPT,
+                            inference_dir=inference_dir,
+                        )
 
                     if args.skip_eval:
                         print("Skipping good-vs-bad evaluation because --skip-eval was set.")
@@ -1824,6 +2052,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Only rerun inference for models whose run directory does not contain both "
             "inference_result/scores_good.npz and inference_result/scores_bad.npz. "
             "This implies --infer-only."
+        ),
+    )
+    parser.add_argument(
+        "--per-channel-plot",
+        "--per_channel_plot",
+        dest="per_channel_plot",
+        action="store_true",
+        help=(
+            "Run graphing/plot_per_channel_scores.py after every successful pair "
+            "of good/bad inference jobs. This applies whenever inference is actually "
+            "carried out, including normal train+infer, --infer-only, and "
+            "--missing-infer-only reruns. It does not run in --evaluate-only mode "
+            "because no inference is performed there."
+        ),
+    )
+    parser.add_argument(
+        "--missing-plot",
+        "--missing_plot",
+        dest="missing_plot",
+        action="store_true",
+        help=(
+            "Plot-only repair mode. For each model directory under --runs-root, "
+            "check whether the per-channel plot already exists. If it is missing "
+            "and both scores_good.npz and scores_bad.npz exist, run the per-channel "
+            "plotter. No training, inference, or good-vs-bad evaluation is run. "
+            "This implies per-channel plotting."
         ),
     )
     parser.add_argument(
