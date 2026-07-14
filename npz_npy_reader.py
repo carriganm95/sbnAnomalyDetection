@@ -186,6 +186,41 @@ def count_nan_in_array(arr):
     return 0
 
 
+def count_unique_in_array(arr):
+    """Count the number of unique values in an array."""
+    arr = np.asarray(arr)
+
+    if arr.size == 0:
+        return 0
+
+    try:
+        return int(np.unique(arr).size)
+    except (TypeError, ValueError):
+        # Robust fallback for object arrays containing mixed/unorderable types
+        unique_values = set()
+
+        for value in arr.ravel():
+            try:
+                if isinstance(value, np.ndarray):
+                    value = (
+                        str(value.dtype),
+                        value.shape,
+                        value.tobytes(),
+                    )
+                elif isinstance(value, np.generic):
+                    value = value.item()
+
+                try:
+                    unique_values.add(value)
+                except TypeError:
+                    unique_values.add(repr(value))
+
+            except Exception:
+                unique_values.add(repr(value))
+
+        return len(unique_values)
+
+
 def print_nan_summary(array_items, title="NaN summary"):
     """
     Print the number of NaN values in each array and the total across arrays.
@@ -317,6 +352,7 @@ def print_npz(npz_path, full=False, max_items=50):
         print(f"  dtype: {arr.dtype}")
         print(f"  ndim:  {arr.ndim}")
         print(f"  size:  {arr.size}")
+        print(f"  unique: {count_unique_in_array(arr)}")
 
         print_array_values(arr, full=full, max_items=max_items)
 
