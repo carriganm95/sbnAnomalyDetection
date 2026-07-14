@@ -73,7 +73,9 @@ DEFAULT_PER_CHANNEL_PLOT_NAME = "per_channel_scores.png"
 # sweep activity, including training, inference, evaluation, plotting, and
 # rewrite/repair modes. Add full model directory paths here.
 IGNORED: list[Path] = [
-    # DEFAULT_RUNS_ROOT / "All_data",
+    DEFAULT_RUNS_ROOT / "All_data",
+    DEFAULT_RUNS_ROOT / "collection_plane",
+    DEFAULT_RUNS_ROOT / "collection_plane_200",
 ]
 
 
@@ -512,6 +514,256 @@ def update_experiment_done(
         ),
     )
     conn.commit()
+
+
+def restore_completed_experiment_to_db(
+    conn: sqlite3.Connection,
+    *,
+    config_path: Path,
+    run_dir: Path,
+    channel_map: Path,
+    train_base_cmd: list[str],
+    infer_base_cmd: list[str],
+    eval_base_cmd: list[str],
+    args: argparse.Namespace,
+) -> bool:
+    """Restore a completed run directory that is missing from SQLite.
+
+    This mode never trains, infers, evaluates, or plots. It only reconstructs
+    the database row, params, and metrics from files already on disk.
+    """
+    run_name = safe_name(config_path.stem)
+
+    if get_existing_experiment(conn, run_name) is not None:
+        return False
+
+    run_config_path = run_dir / "config_run.yaml"
+    if not run_config_path.exists():
+        print(f"Cannot restore {run_name}: missing {run_config_path}", flush=True)
+        return False
+
+    stored_cfg = load_yaml(run_config_path)
+    (
+        patched_cfg,
+        checkpoint_dir,
+        inference_dir,
+        final_model_path,
+        good_score_npz_path,
+        bad_score_npz_path,
+    ) = prepare_run_config(stored_cfg, run_dir)
+
+    required_paths = [
+        final_model_path,
+        good_score_npz_path,
+        bad_score_npz_path,
+    ]
+    missing_paths = [path for path in required_paths if not path.exists()]
+    if missing_paths:
+        print(f"Cannot restore {run_name}: required file(s) are missing:", flush=True)
+        for path in missing_paths:
+            print(f"  - {path}", flush=True)
+        return False
+
+    eval_plot_path = inference_dir / args.eval_plot_name
+    eval_log_path = inference_dir / args.eval_log_name
+    eval_json_path = inference_dir / args.eval_json_name
+
+    train_cmd = train_base_cmd + ["--config", str(run_config_path)]
+    infer_good_cmd = infer_base_cmd + [
+        "--config",
+        str(run_config_path),
+        "--input",
+        str(Path(args.good_input)),
+        "--output",
+        str(good_score_npz_path),
+    ]
+    infer_bad_cmd = infer_base_cmd + [
+        "--config",
+        str(run_config_path),
+        "--input",
+        str(Path(args.bad_input)),
+        "--output",
+        str(bad_score_npz_path),
+    ]
+    eval_cmd = eval_base_cmd + [
+        "--scores",
+        str(good_score_npz_path),
+        "--compare",
+        str(bad_score_npz_path),
+        "--labels",
+        args.good_label,
+        args.bad_label,
+        "--aggregator",
+        args.eval_aggregator,
+        "--channel-map",
+        str(channel_map),
+        "--plot",
+        str(eval_plot_path),
+    ]
+    if args.eval_threshold is not None:
+        eval_cmd += ["--threshold", str(args.eval_threshold)]
+    elif args.eval_percentile is not None:
+        eval_cmd += ["--percentile", str(args.eval_percentile)]
+    if args.eval_per_run:
+        eval_cmd += ["--per-run"]
+
+    print(f"Restoring missing DB row: {run_name}", flush=True)
+
+    experiment_id = insert_experiment(
+        conn,
+        run_name=run_name,
+        config_name=config_path.name,
+        original_config_path=config_path,
+        run_config_path=run_config_path,
+        run_dir=run_dir,
+        checkpoint_dir=checkpoint_dir,
+        inference_dir=inference_dir,
+        final_model_path=final_model_path,
+        good_score_npz_path=good_score_npz_path,
+        bad_score_npz_path=bad_score_npz_path,
+        train_cmd=train_cmd,
+        infer_good_cmd=infer_good_cmd,
+        infer_bad_cmd=infer_bad_cmd,
+        eval_cmd=eval_cmd,
+        eval_plot_path=eval_plot_path,
+        eval_log_path=eval_log_path,
+        eval_json_path=eval_json_path,
+        patched_cfg=patched_cfg,
+    )
+    insert_params(conn, experiment_id, patched_cfg)
+
+    metrics = collect_run_metrics(
+        checkpoint_dir=checkpoint_dir,
+        good_score_npz_path=good_score_npz_path,
+        bad_score_npz_path=bad_score_npz_path,
+    )
+    metrics["eval.skipped"] = 0
+    metrics["eval.evaluate_only"] = 0
+    metrics["eval.missing_evaluate_only"] = 0
+    metrics["eval.returncode"] = 0 if eval_json_path.exists() else -1
+    metrics["eval.plot_path"] = str(eval_plot_path)
+    metrics["eval.log_path"] = str(eval_log_path)
+    metrics["eval.json_path"] = str(eval_json_path)
+    metrics["eval.plot.exists"] = int(eval_plot_path.exists())
+    metrics["eval.log.exists"] = int(eval_log_path.exists())
+    metrics["eval.json.exists"] = int(eval_json_path.exists())
+    metrics.update(parse_window_score_eval_log(eval_log_path))
+
+    insert_metrics(conn, experiment_id, metrics)
+    update_experiment_done(
+        conn,
+        experiment_id,
+        status="success",
+        duration_sec=0.0,
+        train_returncode=0,
+        infer_good_returncode=0,
+        infer_bad_returncode=0,
+        eval_returncode=0 if eval_json_path.exists() else None,
+        good_score_npz_path=good_score_npz_path,
+        bad_score_npz_path=bad_score_npz_path,
+        error=None,
+        metrics=metrics,
+    )
+
+    print(f"Restored database row for {run_name}", flush=True)
+    return True
+
+
+def reorder_experiment_ids(
+    conn: sqlite3.Connection,
+    config_paths: list[Path],
+) -> None:
+    """Renumber experiment IDs to match sorted YAML sweep order.
+
+    Foreign-key-like experiment_id values in params and metrics are rewritten
+    in the same transaction. Database-only rows are preserved after all
+    config-backed rows, retaining their prior ID order.
+    """
+    ordered_run_names = [safe_name(path.stem) for path in config_paths]
+
+    rows = conn.execute(
+        "SELECT id, run_name FROM experiments ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return
+
+    current_ids = {str(run_name): int(experiment_id) for experiment_id, run_name in rows}
+
+    ordered_existing_names = [
+        run_name
+        for run_name in ordered_run_names
+        if run_name in current_ids
+    ]
+    ordered_name_set = set(ordered_existing_names)
+
+    extra_names = [
+        str(run_name)
+        for experiment_id, run_name in rows
+        if str(run_name) not in ordered_name_set
+    ]
+    final_order = ordered_existing_names + extra_names
+
+    if len(final_order) != len(rows):
+        raise RuntimeError(
+            "Experiment ID reorder produced an inconsistent row count: "
+            f"final_order={len(final_order)}, rows={len(rows)}"
+        )
+
+    print("Reordering experiment IDs by sorted YAML config order...", flush=True)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Move every ID into a collision-free negative range first.
+        for old_id, _run_name in rows:
+            temporary_id = -int(old_id) - 1
+            conn.execute(
+                "UPDATE params SET experiment_id = ? WHERE experiment_id = ?",
+                (temporary_id, old_id),
+            )
+            conn.execute(
+                "UPDATE metrics SET experiment_id = ? WHERE experiment_id = ?",
+                (temporary_id, old_id),
+            )
+            conn.execute(
+                "UPDATE experiments SET id = ? WHERE id = ?",
+                (temporary_id, old_id),
+            )
+
+        for new_id, run_name in enumerate(final_order, start=1):
+            old_id = current_ids[run_name]
+            temporary_id = -old_id - 1
+            conn.execute(
+                "UPDATE experiments SET id = ? WHERE id = ?",
+                (new_id, temporary_id),
+            )
+            conn.execute(
+                "UPDATE params SET experiment_id = ? WHERE experiment_id = ?",
+                (new_id, temporary_id),
+            )
+            conn.execute(
+                "UPDATE metrics SET experiment_id = ? WHERE experiment_id = ?",
+                (new_id, temporary_id),
+            )
+
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'experiments'")
+        conn.execute(
+            """
+            INSERT INTO sqlite_sequence(name, seq)
+            VALUES(
+                'experiments',
+                (SELECT COALESCE(MAX(id), 0) FROM experiments)
+            )
+            """
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    print(
+        f"Experiment IDs reordered: 1 through {len(final_order)}",
+        flush=True,
+    )
 
 
 # ============================================================
@@ -1315,6 +1567,65 @@ def run_sweep(args: argparse.Namespace) -> int:
 
     conn = init_db(db_path)
 
+    if args.restore_missing_db:
+        print("=" * 80)
+        print("Restoring completed models missing from the database...")
+        print("Ignored model directories are included in restore mode.")
+        print("=" * 80)
+
+        restored_count = 0
+
+        try:
+            for idx, config_path in enumerate(config_paths, start=1):
+                run_name = safe_name(config_path.stem)
+                run_dir = runs_root / run_name
+
+                print(f"[{idx}/{len(config_paths)}] checking {run_name}")
+
+                if not run_dir.exists():
+                    print(f"Skipping: run directory does not exist: {run_dir}")
+                    continue
+
+                restored = restore_completed_experiment_to_db(
+                    conn,
+                    config_path=config_path,
+                    run_dir=run_dir,
+                    channel_map=channel_map,
+                    train_base_cmd=train_base_cmd,
+                    infer_base_cmd=infer_base_cmd,
+                    eval_base_cmd=eval_base_cmd,
+                    args=args,
+                )
+                if restored:
+                    restored_count += 1
+
+            reorder_experiment_ids(conn, config_paths)
+
+            print("=" * 80)
+            print(f"Restored database rows: {restored_count}")
+            print("=" * 80)
+
+            if args.export_summary:
+                export_summary(conn, db_path.parent)
+
+            conn.commit()
+            checkpoint_result = conn.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE);"
+            ).fetchone()
+
+            if checkpoint_result is not None:
+                busy, log_pages, checkpointed_pages = checkpoint_result
+                print(
+                    f"SQLite checkpoint: busy={busy}, "
+                    f"log_pages={log_pages}, "
+                    f"checkpointed_pages={checkpointed_pages}",
+                    flush=True,
+                )
+
+            return 0
+        finally:
+            conn.close()
+
     print("=" * 80)
     print(f"GraphVAE config directory: {config_dir}")
     print(f"Number of configs: {len(config_paths)}")
@@ -1913,6 +2224,24 @@ def run_sweep(args: argparse.Namespace) -> int:
     else:
         print("Skipping CSV/XLSX summary export because --export-summary was not set.")
 
+    print("Checkpointing SQLite WAL before closing...", flush=True)
+
+    conn.commit()
+
+    checkpoint_result = conn.execute(
+        "PRAGMA wal_checkpoint(TRUNCATE);"
+    ).fetchone()
+
+    if checkpoint_result is not None:
+        busy, log_pages, checkpointed_pages = checkpoint_result
+
+        print(
+            f"SQLite checkpoint: busy={busy}, "
+            f"log_pages={log_pages}, "
+            f"checkpointed_pages={checkpointed_pages}",
+            flush=True,
+        )
+
     conn.close()
     return 0
 
@@ -2195,6 +2524,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "If a config/run name already exists in the database, check whether "
             "checkpoints/graph_vae/<config_stem>/ exists and contains more than just one YAML file. "
             "If incomplete, delete the old database record and rerun."
+        ),
+    )
+    parser.add_argument(
+        "--restore-missing-db",
+        "--restore_missing_db",
+        "--restore_missing-db",
+        "--restore_missing_db",
+        "--restore-missing-database",
+        "--restore_missing_database",
+        "--restore-missing_database",
+        "--restore_missing-database",
+        dest="restore_missing_db",
+        action="store_true",
+        help=(
+            "Restore completed model directories that are missing from the SQLite "
+            "database using files already on disk. No training, inference, evaluation, "
+            "or plotting is run. Ignored model directories are still eligible for "
+            "restoration. Afterward, experiment IDs are renumbered to follow the "
+            "sorted YAML config sweep order."
         ),
     )
     parser.add_argument(
