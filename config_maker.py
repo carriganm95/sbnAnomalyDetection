@@ -99,15 +99,15 @@ OUTPUT_YAML_DIR = Path("tuning_configs/graph_vae_sweep")
 # Starting index for generated YAML names.
 # Example:
 #   START_INDEX = 0  -> 0000_win100_stride50_rad4_bs16_lr0p001_beta1.yaml
-START_INDEX = 0
+START_INDEX = 108
 
 # Parameter values to sweep.
-WINDOW_SIZES = [100, 200, 400]
-STRIDES = [100, 200, 400]
+WINDOW_SIZES = [400]
+STRIDES = [10, 20, 50, 80, 100]
 ADJACENCY_RADII = [4]
 
-BATCH_SIZES = [32, 64, 128]
-LEARNING_RATES = [0.001, 0.003]
+BATCH_SIZES = [64]
+LEARNING_RATES = [0.001]
 BETAS = [0.5, 0.8, 1]
 
 DEFAULT_WEIGHT_DECAY = 1.0e-4
