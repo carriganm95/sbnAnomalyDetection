@@ -348,10 +348,16 @@ def print_npz(npz_path, full=False, max_items=50):
         arr = meta[key]
 
         print(f"\n[{key}]")
-        print(f"  shape: {arr.shape}")
-        print(f"  dtype: {arr.dtype}")
-        print(f"  ndim:  {arr.ndim}")
-        print(f"  size:  {arr.size}")
+
+        # Scalar arrays: print only the value
+        if arr.ndim == 0:
+            print(f"  value: {arr.item()}")
+            continue
+
+        print(f"  shape:  {arr.shape}")
+        print(f"  dtype:  {arr.dtype}")
+        print(f"  ndim:   {arr.ndim}")
+        print(f"  size:   {arr.size}")
         print(f"  unique: {count_unique_in_array(arr)}")
 
         print_array_values(arr, full=full, max_items=max_items)
