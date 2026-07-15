@@ -7,47 +7,58 @@ set -euo pipefail
 # For each CI_build_lar_ci_<N> directory beneath a base path, finds the
 # DQM*.root files in its reco/ subdirectory and runs
 # sbn_anomaly.data.materialize_windows separately for that directory alone,
-# writing a tagged output file per directory (tag = the number after
-# CI_build_lar_ci_). Processing one directory at a time avoids loading every
-# file across every build directory into memory at once.
-#
-# Pass -l/--file-list to skip directory discovery entirely and instead
-# materialize an explicit list of ROOT files (one per line) into a single,
-# untagged output file.
-#
-# Default base path:
-#   /pnfs/sbnd/scratch/ci_validation/dqm/v09_93_01_02/CI_build_lar_ci_<N>/reco/DQM*.root
-#
-# Usage:
-#   ./run_materialize_windows.sh [-f] [-t] [-d DATA_DIR] [-c CONFIG] [-l FILE_LIST] [output_base]
-#
-# Flags:
-#   -f, --force           Force reprocessing: overwrite output files that
-#                         already exist. Without this flag, directories
-#                         whose output file is already present are skipped.
-#   -t, --test            Test mode: process only the first file found in
-#                         the first directory (or the first file in
-#                         --file-list), then stop. Useful for a quick smoke
-#                         test of the pipeline before a full run.
-#   -d, --data-dir DIR    Base directory to search for CI_build_lar_ci_*
-#                         subdirectories. Overrides the hardcoded default.
-#   -c, --config PATH     Network/data config YAML passed to
-#                         materialize_windows (default: configs/graph_vae.yaml).
-#   -l, --file-list PATH  A text file listing ROOT file paths (one per line,
-#                         '#' comments and blank lines ignored). When given,
-#                         directory discovery is skipped and every file in
-#                         the list is materialized together into a single
-#                         output. Combine with -t to only process the
-#                         list's first file.
-#
-# Arguments (all optional):
-#   output_base   (default: data/events_cache.npz)
-#                 In directory mode, each directory's output is written as
-#                 <output_base_without_ext>_<N><ext>, e.g. for the default,
-#                 build dir CI_build_lar_ci_42 writes data/events_cache_42.npz.
-#                 In --file-list mode, output is written to output_base as-is.
-#
+# writing a tagged output file per directory. Processing one directory at a
+# time avoids loading every file across every build directory into memory
+# at once. Run with -h/--help for full usage.
 ################################################################################
+
+print_usage() {
+    cat <<'EOF'
+Usage:
+  ./run_materialize_windows.sh [-f] [-t] [-d DATA_DIR] [-c CONFIG] [-l FILE_LIST] [output_base]
+
+For each CI_build_lar_ci_<N> directory beneath a base path, finds the
+DQM*.root files in its reco/ subdirectory and runs
+sbn_anomaly.data.materialize_windows separately for that directory alone,
+writing a tagged output file per directory (tag = the number after
+CI_build_lar_ci_). Processing one directory at a time avoids loading every
+file across every build directory into memory at once.
+
+Pass -l/--file-list to skip directory discovery entirely and instead
+materialize an explicit list of ROOT files (one per line) into a single,
+untagged output file.
+
+Default base path:
+  /pnfs/sbnd/scratch/ci_validation/dqm/v09_93_01_02/CI_build_lar_ci_<N>/reco/DQM*.root
+
+Flags:
+  -f, --force           Force reprocessing: overwrite output files that
+                        already exist. Without this flag, directories
+                        whose output file is already present are skipped.
+  -t, --test            Test mode: process only the first file found in
+                        the first directory (or the first file in
+                        --file-list), then stop. Useful for a quick smoke
+                        test of the pipeline before a full run.
+  -d, --data-dir DIR    Base directory to search for CI_build_lar_ci_*
+                        subdirectories. Overrides the hardcoded default.
+  -c, --config PATH     Network/data config YAML passed to
+                        materialize_windows (default: configs/graph_vae.yaml).
+  -l, --file-list PATH  A text file listing ROOT file paths (one per line,
+                        '#' comments and blank lines ignored). When given,
+                        directory discovery is skipped and every file in
+                        the list is materialized together into a single
+                        output. Combine with -t to only process the
+                        list's first file.
+  -h, --help            Show this help message and exit.
+
+Arguments (all optional):
+  output_base   (default: data/events_cache.npz)
+                In directory mode, each directory's output is written as
+                <output_base_without_ext>_<N><ext>, e.g. for the default,
+                build dir CI_build_lar_ci_42 writes data/events_cache_42.npz.
+                In --file-list mode, output is written to output_base as-is.
+EOF
+}
 
 force=0
 test_mode=0
@@ -58,6 +69,10 @@ args=()
 
 while (( "$#" )); do
     case "$1" in
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
         -f|--force)
             force=1
             shift
@@ -86,7 +101,7 @@ while (( "$#" )); do
             break
             ;;
         -*)
-            echo "[ERROR] Unknown option: $1" >&2
+            echo "[ERROR] Unknown option: $1 (see --help)" >&2
             exit 1
             ;;
         *)
