@@ -21,6 +21,43 @@ import yaml
 from sbn_anomaly.utils.logging import setup_logging
 
 
+def _score_threshold_from_config(
+    scores: np.ndarray,
+    infer_cfg: dict,
+    *,
+    logger: logging.Logger | None = None,
+) -> float | None:
+    """Resolve an inference threshold from either an explicit value or a percentile.
+
+    ``inference.threshold`` has priority. If it is absent and
+    ``inference.threshold_percentile`` is set, the threshold is computed from the
+    finite scores in the current inference output.
+    """
+    threshold = infer_cfg.get("threshold")
+    if threshold is not None:
+        return float(threshold)
+
+    percentile = infer_cfg.get("threshold_percentile")
+    if percentile is None:
+        return None
+
+    percentile = float(percentile)
+    if not 0.0 <= percentile <= 100.0:
+        raise ValueError(f"inference.threshold_percentile must be between 0 and 100, got {percentile}")
+
+    finite = np.asarray(scores, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        if logger is not None:
+            logger.warning("Cannot compute percentile threshold: no finite scores.")
+        return None
+
+    resolved = float(np.nanpercentile(finite, percentile))
+    if logger is not None:
+        logger.info("Resolved inference threshold from p%s of current scores: %.6g", f"{percentile:g}", resolved)
+    return resolved
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and run inference."""
     parser = argparse.ArgumentParser(description="Run SBN anomaly detection inference.")
@@ -78,6 +115,18 @@ def main(argv: list[str] | None = None) -> int:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Optional inference threshold override. If set, saved outputs include is_anomaly.",
+    )
+    parser.add_argument(
+        "--percentile",
+        type=float,
+        default=None,
+        help="Optional inference threshold percentile override. Used only when --threshold is not set.",
+    )
     args = parser.parse_args(argv)
 
     setup_logging(args.log_level)
@@ -92,7 +141,14 @@ def main(argv: list[str] | None = None) -> int:
         cfg = yaml.safe_load(fh)
 
     model_type = cfg.get("model_type", "").lower()
-    infer_cfg = cfg.get("inference", {})
+    infer_cfg = cfg.setdefault("inference", {})
+    if args.threshold is not None:
+        infer_cfg["threshold"] = float(args.threshold)
+    if args.percentile is not None:
+        if not 0.0 <= float(args.percentile) <= 100.0:
+            logger.error("--percentile must be between 0 and 100.")
+            return 1
+        infer_cfg["threshold_percentile"] = float(args.percentile)
     checkpoint = infer_cfg.get("checkpoint_path")
     if not checkpoint:
         logger.error("inference.checkpoint_path not set in config.")
@@ -187,9 +243,14 @@ def main(argv: list[str] | None = None) -> int:
             features = _truncate_or_pad(features, input_dim)
             scores = scorer.score(features)
 
+    threshold = _score_threshold_from_config(scores, infer_cfg, logger=logger)
+
     # Prepare metadata for saving alongside scores so branches can be matched.
     meta: dict[str, object] = {}
     meta["event_index"] = np.arange(len(scores), dtype=np.int64)
+    if threshold is not None:
+        meta["threshold"] = np.array(threshold, dtype=np.float32)
+        meta["is_anomaly"] = np.asarray(scores > threshold, dtype=bool)
     # Map-style input archives may contain branch metadata.
     if not root_files:
         # fusion handled separately above; for single-input mode we may have
@@ -393,9 +454,10 @@ def _infer_raw_vae(
         "scores_max": max_scores,
         "provenance": prov_arr,
     }
-    threshold = infer_cfg.get("threshold")
+    threshold = _score_threshold_from_config(mean_scores, infer_cfg, logger=logger)
     if threshold is not None:
-        out["is_anomaly"] = (mean_scores > float(threshold))
+        out["is_anomaly"] = (mean_scores > threshold)
+        out["threshold"] = np.array(threshold, dtype=np.float32)
 
     out_path = Path(output)
     if out_path.suffix != ".npz":
@@ -502,17 +564,36 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
     num_channels = dataset.num_nodes
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     model = GraphVAE(
         in_dim=dataset.node_feat_dim,
         latent_dim=int(model_cfg.get("latent_dim", 12)),
-        hidden=int(model_cfg.get("gnn_hidden", 64)),
-        enc_layers=int(model_cfg.get("gnn_layers", 2)),
-        dec_hidden=int(model_cfg.get("dec_hidden", 64)),
+        encoder_hidden_dims=model_cfg.get("encoder_hidden_dims", [128, 64]),
+        decoder_hidden_dims=model_cfg.get("decoder_hidden_dims", [32, 64]),
         dropout=float(model_cfg.get("dropout", 0.1)),
         mask_ratio=0.0,  # no masking at inference
         use_channel_idx=bool(model_cfg.get("use_channel_idx", True)),
         conv=str(model_cfg.get("conv", "sage")),
     )
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    logger.info(
+        "GraphVAE inference model params=%d  in_dim=%d  latent_dim=%d  "
+        "encoder_hidden_dims=%s  decoder_hidden_dims=%s  "
+        "dropout=%.3f  mask_ratio=%.3f  use_channel_idx=%s  conv=%s",
+        n_params,
+        dataset.node_feat_dim,
+        int(model_cfg.get("latent_dim", 12)),
+        model.encoder_hidden_dims,
+        model.decoder_hidden_dims,
+        float(model_cfg.get("dropout", 0.1)),
+        0.0,
+        bool(model_cfg.get("use_channel_idx", True)),
+        str(model_cfg.get("conv", "sage")),
+    )
+
+    logger.info("Inference model architecture:\n%s", model)
+
     state = torch.load(checkpoint, map_location="cpu")
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
@@ -579,9 +660,10 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
            "channel_active_frac": channel_active_frac}
     if provenance is not None:
         out["provenance"] = provenance
-    threshold = infer_cfg.get("threshold")
+    threshold = _score_threshold_from_config(scores, infer_cfg, logger=logger)
     if threshold is not None:
-        out["is_anomaly"] = (scores > float(threshold))
+        out["is_anomaly"] = (scores > threshold)
+        out["threshold"] = np.array(threshold, dtype=np.float32)
 
     # Rank the worst channels for a quick console readout.
     if node_scores.shape[0] and np.isfinite(channel_mean_error).any():
@@ -773,8 +855,9 @@ def _infer_gnn(cfg: dict, checkpoint: str, output: str, input_override: str | No
         "window_index": np.arange(len(scores_mean), dtype=np.int64),  # sequential window position
         "num_channels": np.array(num_channels, dtype=np.int64),
     }
+    threshold = _score_threshold_from_config(scores_mean, infer_cfg, logger=logger)
     if threshold is not None:
-        save_dict["is_anomaly"] = scores_mean > float(threshold)
+        save_dict["is_anomaly"] = scores_mean > threshold
         save_dict["threshold"] = np.array(threshold, dtype=np.float32)
     node_feat_names = data_cfg.get("node_features")
     if node_feat_names:
@@ -811,6 +894,7 @@ def _build_scorer(cfg: dict, model_type: str, checkpoint: str):
     data_cfg = cfg.get("data", {})
     infer_cfg = cfg.get("inference", {})
     threshold = infer_cfg.get("threshold")
+    threshold_percentile = infer_cfg.get("threshold_percentile")
     normalize = bool(data_cfg.get("normalize", False))
 
     if model_type == "tpc":
@@ -865,6 +949,7 @@ def _build_scorer(cfg: dict, model_type: str, checkpoint: str):
         model=model,
         model_type=model_type,
         threshold=threshold,
+        threshold_percentile=threshold_percentile,
         normalize=normalize,
     )
 
