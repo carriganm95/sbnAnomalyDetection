@@ -11,7 +11,7 @@ import numpy as np
 # ============================================================
 
 NPZ_PATH = Path(
-    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/scratch/8800_to_9000_200_channels/bad_events_test.npz"
+    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/scratch/11076_to_11276_200_channels/good_events_test.npz"
 )
 
 WINDOW_SIZE = 100
@@ -267,7 +267,7 @@ def plot_histogram(
     xlabel: str,
     output_path: Path,
 ) -> None:
-    """Plot histogram with percentile-based x-axis clipping."""
+    """Plot histogram with percentile-based x-axis clipping and color the 0-bin red."""
 
     if values.size == 0:
         raise ValueError(
@@ -358,7 +358,8 @@ def plot_histogram(
         figsize=(10, 7)
     )
 
-    plt.hist(
+    # Capture the bins and patches (bars) from the histogram
+    n, bins, patches = plt.hist(
         finite_values,
         bins=HIST_BINS,
         range=(
@@ -367,6 +368,12 @@ def plot_histogram(
         ),
     )
 
+    # Locate which bin contains 0.0 and turn its bar red
+    for i in range(len(bins) - 1):
+        if bins[i] <= 0.0 <= bins[i+1]:
+            patches[i].set_facecolor('red')
+            break
+
     plt.xlabel(
         xlabel
     )
@@ -374,6 +381,7 @@ def plot_histogram(
     plt.ylabel(
         "Entries"
     )
+    plt.yscale('log')
 
     plt.title(
         title
