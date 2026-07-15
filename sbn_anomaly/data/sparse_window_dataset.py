@@ -59,25 +59,47 @@ def _run_subrun_evt_key(meta: dict, tpc_branches: List[str]) -> tuple:
     return (run or 999999999, subrun or 999999999, evtnum or 999999999)
 
 
+def _extract_time(meta: dict, tpc_branches: List[str]) -> Optional[float]:
+    """Return the event timestamp (e.g. ``meta.time``) from a per-event meta dict.
+
+    Matches any requested tpc branch whose name contains "time" (case
+    insensitive). Distinct from per-hit pulse times (``times_flat``), which
+    come from the hit branches instead.
+    """
+    for b in tpc_branches:
+        if b in meta and "time" in b.lower():
+            return float(meta[b])
+    return None
+
+
 def _extract_provenance(
     raw_events: list,
     tpc_branches: List[str],
 ) -> tuple:
-    """Return (evt_run, evt_subrun, evt_num) int32 arrays from sorted raw_events."""
-    runs, subruns, evtnums = [], [], []
+    """Return (evt_run, evt_subrun, evt_num, evt_time) arrays from sorted raw_events.
+
+    evt_run/evt_subrun/evt_num are int32 (-1 sentinel for missing).
+    evt_time is float64 (NaN sentinel for missing), since timestamps may not
+    be plain integers.
+    """
+    runs, subruns, evtnums, times = [], [], [], []
     for e in raw_events:
         r, s, n = _run_subrun_evt_key(e["meta"], tpc_branches)
         runs.append(r if r != 999999999 else -1)
         subruns.append(s if s != 999999999 else -1)
         evtnums.append(n if n != 999999999 else -1)
+        t = _extract_time(e["meta"], tpc_branches)
+        times.append(t if t is not None else np.nan)
     dtype = np.int32
     if not raw_events:
         empty = np.empty(0, dtype=dtype)
-        return empty, empty, empty
+        empty_time = np.empty(0, dtype=np.float64)
+        return empty, empty, empty, empty_time
     return (
         np.array(runs, dtype=dtype),
         np.array(subruns, dtype=dtype),
         np.array(evtnums, dtype=dtype),
+        np.array(times, dtype=np.float64),
     )
 
 
@@ -118,6 +140,7 @@ class SparseWindowDatasetPyG(Dataset):
         evt_run: Optional[np.ndarray] = None,
         evt_subrun: Optional[np.ndarray] = None,
         evt_num: Optional[np.ndarray] = None,
+        evt_time: Optional[np.ndarray] = None,
         evt_file_idx: Optional[np.ndarray] = None,
         filenames: Optional[List[str]] = None,
         times_flat: Optional[np.ndarray] = None,
@@ -140,10 +163,11 @@ class SparseWindowDatasetPyG(Dataset):
         self._planes_flat = np.asarray(planes_flat, dtype=np.int32) if planes_flat is not None else None
         self._tpcs_flat = np.asarray(tpcs_flat, dtype=np.int32) if tpcs_flat is not None else None
 
-        # Optional per-event provenance (run, subrun, event number, source file)
+        # Optional per-event provenance (run, subrun, event number, timestamp, source file)
         self._evt_run = np.asarray(evt_run, dtype=np.int32) if evt_run is not None else None
         self._evt_subrun = np.asarray(evt_subrun, dtype=np.int32) if evt_subrun is not None else None
         self._evt_num = np.asarray(evt_num, dtype=np.int32) if evt_num is not None else None
+        self._evt_time = np.asarray(evt_time, dtype=np.float64) if evt_time is not None else None
         self._evt_file_idx = np.asarray(evt_file_idx, dtype=np.int32) if evt_file_idx is not None else None
         self._filenames: List[str] = list(filenames) if filenames is not None else []
 
@@ -408,12 +432,12 @@ class SparseWindowDatasetPyG(Dataset):
         )
 
         # Extract per-event provenance arrays from sorted raw_events
-        evt_run, evt_subrun, evt_num = _extract_provenance(raw_events, tpc_branches or [])
+        evt_run, evt_subrun, evt_num, evt_time = _extract_provenance(raw_events, tpc_branches or [])
         evt_file_idx = np.array([e["file_idx"] for e in raw_events], dtype=np.int32) if raw_events else np.empty(0, dtype=np.int32)
 
         return cls(
             ch_flat, val_flat, offsets, n_ch,
-            evt_run=evt_run, evt_subrun=evt_subrun, evt_num=evt_num,
+            evt_run=evt_run, evt_subrun=evt_subrun, evt_num=evt_num, evt_time=evt_time,
             evt_file_idx=evt_file_idx, filenames=filenames,
             times_flat=time_flat, wires_flat=wire_flat,
             planes_flat=plane_flat, tpcs_flat=tpc_flat,
@@ -456,7 +480,7 @@ class SparseWindowDatasetPyG(Dataset):
             )
 
         meta_kwargs: dict = {}
-        for key in ("evt_run", "evt_subrun", "evt_num", "evt_file_idx"):
+        for key in ("evt_run", "evt_subrun", "evt_num", "evt_time", "evt_file_idx"):
             if key in data:
                 meta_kwargs[key] = data[key]
         if "filenames" in data:
@@ -493,6 +517,8 @@ class SparseWindowDatasetPyG(Dataset):
             arrays["evt_run"] = self._evt_run
             arrays["evt_subrun"] = self._evt_subrun
             arrays["evt_num"] = self._evt_num
+        if self._evt_time is not None:
+            arrays["evt_time"] = self._evt_time
         if self._evt_file_idx is not None:
             arrays["evt_file_idx"] = self._evt_file_idx
         if self._filenames:
@@ -568,6 +594,9 @@ class SparseWindowDatasetPyG(Dataset):
             Event number of the last event in each window.
         first_file_idx, last_file_idx : (N,) int32
             Index into ``filenames`` for the first and last event.
+        first_time, last_time : (N,) float64
+            Event timestamp (e.g. ``meta.time``) of the first/last event in
+            each window, when a time-like tpc branch was provided.
         filenames : list[str]
             Ordered list of source ROOT filenames.
         """
@@ -590,6 +619,9 @@ class SparseWindowDatasetPyG(Dataset):
         if self._evt_file_idx is not None:
             result["first_file_idx"] = self._evt_file_idx[starts]
             result["last_file_idx"]  = self._evt_file_idx[ends]
+        if self._evt_time is not None:
+            result["first_time"] = self._evt_time[starts]
+            result["last_time"]  = self._evt_time[ends]
         return result
 
     # ------------------------------------------------------------------

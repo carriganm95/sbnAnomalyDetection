@@ -417,6 +417,7 @@ def materialize_windows_from_root(
         run_idx = _find_idx("run")
         subrun_idx = _find_idx("subrun")
         evt_idx = _find_idx("evt")
+        time_idx = _find_idx("time")
 
         # Safely convert branch float values (with NaN for missing) to int arrays.
         # Converting NaN directly to int can produce sentinel values like
@@ -442,6 +443,10 @@ def materialize_windows_from_root(
             if mask.any():
                 evt_int[mask] = evt_f[mask].astype(np.int64)
             meta["evt"] = evt_int
+        if time_idx is not None:
+            # Kept as float64 (NaN = missing) rather than cast to int, since
+            # event timestamps may carry a fractional component.
+            meta["time"] = tpc_vals[:, time_idx].astype(np.float64)
 
     return windows_arr, meta
 

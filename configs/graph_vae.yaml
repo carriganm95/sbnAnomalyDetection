@@ -38,7 +38,7 @@ data:
   # ROOT streaming fields (used with --root-files). Match configs/gnn.yaml.
   tree_name: caloskim/TrackCaloSkim
   # hit_branches: [hits0.h.integral, hits0.h.channel, ...]
-  # tpc_branches: [meta.run, meta.subrun, meta.evt]
+  tpc_branches: [meta.run, meta.subrun, meta.evt, meta.time]
   n_channels: 11276
 
   # Geometry-aware graph (see configs/gnn.yaml). electronics recommended.
