@@ -598,11 +598,13 @@ def main(
     )
 
     ax.set_xlabel(
-        "Channel"
+        "Channel",
+        fontsize=14,
     )
 
     ax.set_ylabel(
-        "Mean Node Score"
+        "Mean Node Score",
+        fontsize=14,
     )
 
     ax.set_title(
@@ -610,7 +612,8 @@ def main(
         "({}-{})".format(
             channel_start,
             channel_end - 1,
-        )
+        ),
+        fontsize=16,
     )
 
     ax.legend()
