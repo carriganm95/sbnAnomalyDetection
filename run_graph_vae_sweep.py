@@ -2512,6 +2512,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--per-channel-plot",
         "--per_channel_plot",
+        "--per_channel-plot",
+        "--per-channel_plot",
+        "--per-channel-plots",
+        "--per_channel_plots",
+        "--per-channel_plots",
+        "--per_channel-plots",
         dest="per_channel_plot",
         action="store_true",
         help=(
