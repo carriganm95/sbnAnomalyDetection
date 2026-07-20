@@ -280,6 +280,81 @@ def _plot_overlay(score_lists, labels, path, aggregator, threshold=None, nbins=6
     fig.savefig(path, dpi=120)
     plt.close(fig)
 
+"""
+def _plot_overlay(
+    score_lists,
+    labels,
+    path,
+    aggregator,
+    threshold=None,
+    nbins=60,
+):
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    finite = [
+        np.asarray(scores)[np.isfinite(scores)]
+        for scores in score_lists
+    ]
+
+    nonempty = [values for values in finite if values.size]
+    all_values = (
+        np.concatenate(nonempty)
+        if nonempty
+        else np.array([0.0, 1.0])
+    )
+
+    lo = float(np.min(all_values))
+    hi = float(np.max(all_values))
+
+    if hi <= lo:
+        hi = lo + 1.0
+
+    # Use the same bin edges for all distributions.
+    edges = np.linspace(lo, hi, nbins + 1)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    for values, label in zip(finite, labels):
+        ax.hist(
+            values,
+            bins=edges,
+            alpha=0.5,
+            density=True,
+            label=f"{label} (n={values.size})",
+        )
+
+    if threshold is not None:
+        ax.axvline(
+            threshold,
+            color="k",
+            linestyle="--",
+            linewidth=1.3,
+            label=f"Anomaly threshold = {threshold:.4g}",
+        )
+
+        ax.text(
+            threshold,
+            ax.get_ylim()[1],
+            f" threshold = {threshold:.4g}",
+            rotation=90,
+            verticalalignment="top",
+            horizontalalignment="left",
+            fontsize=8,
+            color="k",
+        )
+
+    ax.set_xlabel("Anomaly score")
+    ax.set_ylabel("Window density")
+    ax.set_yscale("log")
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+"""
+
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Aggregate per-channel errors -> per-window scores")

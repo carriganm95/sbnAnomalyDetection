@@ -50,7 +50,7 @@ DEFAULT_EVAL_AGGREGATOR = "group_max_mean"
 DEFAULT_EVAL_PLOT_NAME = "goodvsbad.png"
 DEFAULT_EVAL_LOG_NAME = "goodvsbad_eval.txt"
 DEFAULT_EVAL_JSON_NAME = "goodvsbad_eval.json"
-DEFAULT_EVAL_PERCENTILE = 90.0
+DEFAULT_EVAL_PERCENTILE = 100
 
 # Per-channel node-score plotting script. This is run after each successful
 # good-vs-bad evaluation, using that model's own inference_result directory.
@@ -1682,22 +1682,19 @@ def run_sweep(args: argparse.Namespace) -> int:
             print("\n" + "=" * 80)
             print(f"[{idx}/{len(config_paths)}] {config_path}")
             if args.force_replot:
-                print(f"Force-replotting per-channel plot for model directory: {run_dir}")
+                print(f"Force-replotting plots for model directory: {run_dir}")
             else:
-                print(f"Checking per-channel plot for model directory: {run_dir}")
-
-            good_score_path = inference_dir / "scores_good.npz"
-            bad_score_path = inference_dir / "scores_bad.npz"
+                print(f"Checking plots for model directory: {run_dir}")
 
             missing_score_paths = [
                 path
-                for path in (good_score_path, bad_score_path)
+                for path in (good_score_npz_path, bad_score_npz_path)
                 if not path.exists()
             ]
             if missing_score_paths:
                 print(
-                    "Skipping: required inference score file(s) are missing, so the "
-                    "per-channel plot cannot be produced."
+                    "Skipping: required inference score file(s) are missing, so "
+                    "the plots cannot be produced."
                 )
                 for path in missing_score_paths:
                     print(f"  - {path}")
@@ -1709,34 +1706,100 @@ def run_sweep(args: argparse.Namespace) -> int:
                 inference_dir=inference_dir,
             )
 
-            if args.missing_plot and per_channel_plot_path.exists():
-                print("Skipping: per-channel plot already exists.")
-                print(f"Existing plot: {per_channel_plot_path}")
-                print("=" * 80)
-                continue
-
-            if args.force_replot:
-                if per_channel_plot_path.exists():
-                    print("Existing per-channel plot found; rerunning because --force-replot was set.")
-                    print(f"Existing plot: {per_channel_plot_path}")
-                else:
-                    print("No existing per-channel plot found; generating it because --force-replot was set.")
-                print(f"Expected plot: {per_channel_plot_path}")
-            else:
-                print("Per-channel plot is missing; generating it now.")
-                print(f"Expected plot: {per_channel_plot_path}")
-            run_per_channel_score_plot(
-                plot_script_path=PER_CHANNEL_PLOT_SCRIPT,
-                inference_dir=inference_dir,
+            need_per_channel_plot = (
+                args.force_replot or not per_channel_plot_path.exists()
+            )
+            need_goodvsbad_plot = (
+                args.force_replot or not eval_plot_path.exists()
             )
 
-            if per_channel_plot_path.exists():
-                print(f"Created per-channel plot: {per_channel_plot_path}")
-            else:
-                print(
-                    "WARNING: plotting finished, but the expected plot path was not found: "
-                    f"{per_channel_plot_path}"
+            if need_per_channel_plot:
+                if args.force_replot and per_channel_plot_path.exists():
+                    print(
+                        "Existing per-channel plot found; rerunning because "
+                        "--force-replot was set."
+                    )
+                else:
+                    print("Per-channel plot is missing; generating it now.")
+                print(f"Expected per-channel plot: {per_channel_plot_path}")
+
+                run_per_channel_score_plot(
+                    plot_script_path=PER_CHANNEL_PLOT_SCRIPT,
+                    inference_dir=inference_dir,
                 )
+
+                if per_channel_plot_path.exists():
+                    print(f"Created per-channel plot: {per_channel_plot_path}")
+                else:
+                    print(
+                        "WARNING: plotting finished, but the expected per-channel "
+                        f"plot was not found: {per_channel_plot_path}"
+                    )
+            else:
+                print("Per-channel plot already exists; no replot needed.")
+                print(f"Existing per-channel plot: {per_channel_plot_path}")
+
+            if need_goodvsbad_plot:
+                if args.force_replot and eval_plot_path.exists():
+                    print(
+                        "Existing good-vs-bad plot found; rerunning because "
+                        "--force-replot was set."
+                    )
+                else:
+                    print("Good-vs-bad plot is missing; generating it now.")
+                print(f"Expected good-vs-bad plot: {eval_plot_path}")
+
+                plot_eval_cmd = eval_base_cmd + [
+                    "--scores",
+                    str(good_score_npz_path),
+                    "--compare",
+                    str(bad_score_npz_path),
+                    "--labels",
+                    args.good_label,
+                    args.bad_label,
+                    "--aggregator",
+                    args.eval_aggregator,
+                    "--channel-map",
+                    str(channel_map),
+                    "--plot",
+                    str(eval_plot_path),
+                ]
+                if args.eval_threshold is not None:
+                    plot_eval_cmd += ["--threshold", str(args.eval_threshold)]
+                elif args.eval_percentile is not None:
+                    plot_eval_cmd += ["--percentile", str(args.eval_percentile)]
+                if args.eval_per_run:
+                    plot_eval_cmd += ["--per-run"]
+
+                plot_returncode = run_command(
+                    plot_eval_cmd,
+                    cwd=PROJECT_DIR,
+                    timeout=args.timeout,
+                    monitor_interval=args.monitor_interval,
+                    batch=args.batch,
+                )
+
+                if plot_returncode != 0:
+                    print(
+                        "ERROR: good-vs-bad plotting failed with return code "
+                        f"{plot_returncode}."
+                    )
+                    print("=" * 80)
+                    if args.stop_on_error:
+                        return plot_returncode
+                    continue
+
+                if eval_plot_path.exists():
+                    print(f"Created good-vs-bad plot: {eval_plot_path}")
+                else:
+                    print(
+                        "WARNING: window_score finished successfully, but the expected "
+                        f"good-vs-bad plot was not found: {eval_plot_path}"
+                    )
+            else:
+                print("Good-vs-bad plot already exists; no replot needed.")
+                print(f"Existing good-vs-bad plot: {eval_plot_path}")
+
             print("=" * 80)
             continue
 
@@ -2466,10 +2529,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Plot-only repair mode. For each model directory under --runs-root, "
-            "check whether the per-channel plot already exists. If it is missing "
-            "and both scores_good.npz and scores_bad.npz exist, run the per-channel "
-            "plotter. No training, inference, or good-vs-bad evaluation is run. "
-            "This implies per-channel plotting."
+            "independently check whether the per-channel plot and goodvsbad.png "
+            "exist. Recreate either missing plot from scores_good.npz and "
+            "scores_bad.npz. No training or inference is run."
         ),
     )
     parser.add_argument(
@@ -2479,9 +2541,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Standalone plot-only mode. For each model directory under --runs-root, "
-            "rerun the per-channel plotter whenever scores_good.npz and scores_bad.npz "
-            "exist, even if the expected plot file already exists. No training, "
-            "inference, or good-vs-bad evaluation is run. This implies per-channel plotting."
+            "rerun both the per-channel plot and good-vs-bad plot whenever "
+            "scores_good.npz and scores_bad.npz exist, even if both plots already exist. "
+            "No training or inference is run."
         ),
     )
     parser.add_argument(
