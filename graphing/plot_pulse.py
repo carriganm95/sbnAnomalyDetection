@@ -91,10 +91,9 @@ try:
 
     for index, (canvas, label) in enumerate(zip(canvases, LABELS)):
         x, y = hist_to_arrays(canvas)
-        x_micro_seconds = x * 0.4
 
         ax.plot(
-            x_micro_seconds,
+            x,
             y,
             linewidth=1,
             label=label,
@@ -102,7 +101,7 @@ try:
             linestyle=LINESTYLES[index],
         )
 
-    ax.set_xlabel("Time (μs)")
+    ax.set_xlabel("Time Ticks")
     ax.set_ylabel("Baseline-Subtracted Signal Amplitude (ADC Counts)")
     ax.legend()
     ax.grid(alpha=0.2)
