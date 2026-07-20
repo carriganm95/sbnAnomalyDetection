@@ -50,7 +50,7 @@ DEFAULT_EVAL_AGGREGATOR = "group_max_mean"
 DEFAULT_EVAL_PLOT_NAME = "goodvsbad.png"
 DEFAULT_EVAL_LOG_NAME = "goodvsbad_eval.txt"
 DEFAULT_EVAL_JSON_NAME = "goodvsbad_eval.json"
-DEFAULT_EVAL_PERCENTILE = 100
+DEFAULT_EVAL_PERCENTILE = 95
 
 # Per-channel node-score plotting script. This is run after each successful
 # good-vs-bad evaluation, using that model's own inference_result directory.
