@@ -262,6 +262,92 @@ class TestSparseWindowDatasetPyG:
         import torch
         assert torch.allclose(item1.y, item2.y)
 
+    def test_save_load_roundtrip_extra_hit_features(self, tmp_path):
+        """widths_flat/sumadcs_flat/mults_flat/hassps_flat survive save_events/from_npz."""
+        n_channels = 16
+        rng = np.random.default_rng(1)
+        sizes = rng.integers(0, 21, size=40).astype(np.int64)
+        total = int(sizes.sum())
+        channels_flat = rng.integers(0, n_channels, size=total).astype(np.int64)
+        integrals_flat = rng.random(total).astype(np.float32)
+        offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+        widths_flat = rng.random(total).astype(np.float32)
+        sumadcs_flat = rng.random(total).astype(np.float32)
+        mults_flat = rng.integers(1, 4, size=total).astype(np.float32)
+        hassps_flat = rng.integers(0, 2, size=total).astype(np.float32)
+
+        ds = SparseWindowDatasetPyG(
+            channels_flat, integrals_flat, offsets, n_channels,
+            history=2, window_size=4, n_bins=2, stride=1, radius=2,
+            widths_flat=widths_flat, sumadcs_flat=sumadcs_flat,
+            mults_flat=mults_flat, hassps_flat=hassps_flat,
+        )
+        assert ds._widths_flat is not None
+        np.testing.assert_array_equal(ds._widths_flat, widths_flat)
+
+        path = str(tmp_path / "events_extra.npz")
+        ds.save_events(path)
+        data = np.load(path)
+        assert "widths_flat" in data
+        assert "sumadcs_flat" in data
+        assert "mults_flat" in data
+        assert "hassps_flat" in data
+
+        ds2 = SparseWindowDatasetPyG.from_npz(
+            path, history=2, window_size=4, n_bins=2, stride=1, radius=2,
+        )
+        np.testing.assert_array_equal(ds2._widths_flat, widths_flat)
+        np.testing.assert_array_equal(ds2._sumadcs_flat, sumadcs_flat)
+        np.testing.assert_array_equal(ds2._mults_flat, mults_flat)
+        np.testing.assert_array_equal(ds2._hassps_flat, hassps_flat)
+
+    def test_group_features_usable_after_roundtrip(self, tmp_path):
+        """width_*/sumadc_*/mult_*/sp_fraction node_features work after save/load."""
+        n_channels = 16
+        rng = np.random.default_rng(3)
+        sizes = rng.integers(0, 21, size=40).astype(np.int64)
+        total = int(sizes.sum())
+        channels_flat = rng.integers(0, n_channels, size=total).astype(np.int64)
+        integrals_flat = rng.random(total).astype(np.float32)
+        offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+        widths_flat = rng.random(total).astype(np.float32)
+        sumadcs_flat = rng.random(total).astype(np.float32)
+        mults_flat = rng.integers(1, 4, size=total).astype(np.float32)
+        hassps_flat = rng.integers(0, 2, size=total).astype(np.float32)
+
+        node_features = ["width_mean", "sumadc_max", "mult_stdev", "sp_fraction", "count"]
+        ds = SparseWindowDatasetPyG(
+            channels_flat, integrals_flat, offsets, n_channels,
+            history=2, window_size=4, n_bins=2, stride=1, radius=2,
+            node_features=node_features,
+            widths_flat=widths_flat, sumadcs_flat=sumadcs_flat,
+            mults_flat=mults_flat, hassps_flat=hassps_flat,
+        )
+        path = str(tmp_path / "events_group_feats.npz")
+        ds.save_events(path)
+        ds2 = SparseWindowDatasetPyG.from_npz(
+            path, history=2, window_size=4, n_bins=2, stride=1, radius=2,
+            node_features=node_features,
+        )
+        frame1 = ds._compute_frame(0, 4)
+        frame2 = ds2._compute_frame(0, 4)
+        np.testing.assert_allclose(frame1, frame2)
+
+    def test_extra_hit_features_absent_when_not_provided(self, tmp_path):
+        """Datasets built without the optional fields still round-trip fine."""
+        ds = _make_sparse_dataset(n_events=40)
+        assert ds._widths_flat is None
+        assert ds._sumadcs_flat is None
+        assert ds._mults_flat is None
+        assert ds._hassps_flat is None
+        path = str(tmp_path / "events_no_extra.npz")
+        ds.save_events(path)
+        data = np.load(path)
+        assert "widths_flat" not in data
+        assert "sumadcs_flat" not in data
+        assert "mults_flat" not in data
+        assert "hassps_flat" not in data
+
     def test_empty_events_do_not_crash(self):
         """Dataset with interleaved empty events should construct and yield items."""
         n_channels = 8
