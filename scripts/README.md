@@ -200,6 +200,44 @@ pooled fit — planes with too few samples (`data.min_plane_samples`, default
 afterwards (or just re-check good/bad separation) to confirm the offsets
 have shrunk.
 
+## check_reconstruction_by_plane.py
+
+Checks whether the model is actually *fitting* one plane worse than another
+on good data — a different question from standardization. `GraphVAETrainer`'s
+loss is `((x_hat - y) ** 2).mean()`, an unweighted mean over every active
+node/feature in a batch. If one plane has fewer active channels per window
+than another (plausible — SBND collection is a minority of total channels
+vs. the two induction planes), its share of the total gradient signal is
+smaller purely from channel count, independent of anything wrong with its
+data, and the model can end up under-fitting that plane.
+
+This loads a trained checkpoint and reuses `GraphVAETrainer.collect_channel_mse`
+(no reimplemented forward pass) to get per-channel average reconstruction MSE
+over a good-run events npz, then groups it by plane:
+
+```bash
+python scripts/check_reconstruction_by_plane.py \
+    --config configs/graph_vae.yaml \
+    --checkpoint checkpoints/graph_vae/v7/graph_vae_final.pt \
+    --events data/good_events_val.npz
+```
+
+Prefer a held-out validation events npz if you have one. It reloads the
+`standardization.npz` saved next to the checkpoint (same one training used —
+important given `standardize_by` may be `plane`) so the measured MSE reflects
+what the model actually trained against, rather than refitting from scratch.
+Plane comes from `planes_flat` in the events npz if present, otherwise
+`--channel-map` (default: `data.channel_map` from `--config`). Also requires
+torch/torch_geometric (it loads and runs the real model).
+
+The report includes a worst/best plane MSE ratio with a rule-of-thumb verdict
+(`> 1.5x` flagged as a likely real fit imbalance). If it comes back flat
+across planes, the loss isn't the bottleneck and `check_standardization_per_plane.py`
+combined with a good/bad separation re-check is a better next step than
+touching the loss function. If it does show a persistent gap, that points at
+a plane-balanced loss (mean of per-plane means instead of one global mean)
+rather than more features or a bigger model.
+
 ## Other scripts
 
 | Script | Purpose |
