@@ -42,6 +42,16 @@ data the model trained on will underestimate under-fitting on every plane
 uniformly, but a systematic *per-plane gap* should still show up either way.
 Plane comes from `planes_flat` in the events npz if present, otherwise
 --channel-map (defaults to data.channel_map in --config).
+
+Note on --config vs --checkpoint: the model's architecture (encoder/decoder
+widths, latent_dim, conv type) is inferred directly from the checkpoint's own
+tensor shapes, not from --config's `model` section. This matters because
+configs drift over training iterations (e.g. graph_vae.yaml may be on v7 while
+you're checking a v5 checkpoint trained under a smaller model section) --
+--config only needs to supply the matching `data` section (window/feature
+settings) so the events npz is read the same way the checkpoint was trained.
+A mismatch between --config's model section and the checkpoint is logged as a
+warning, not an error.
 """
 
 from __future__ import annotations
@@ -66,6 +76,74 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from compare_events_distributions import _channel_plane_lookup, _channel_to_plane_lut  # noqa: E402
 
 logger = logging.getLogger("check_reconstruction_by_plane")
+
+
+def _infer_graph_vae_arch(state: dict, in_dim: int) -> dict:
+    """Recover GraphVAE's constructor args from a checkpoint's tensor shapes.
+
+    Checkpoints are self-describing: every architecture arg GraphVAE.__init__
+    needs (encoder_hidden_dims, decoder_hidden_dims, latent_dim,
+    use_channel_idx, conv) is recoverable from parameter shapes alone.
+    Configs drift over time (e.g. this repo's configs/graph_vae.yaml has moved
+    on to v7's wider encoder/decoder while an older v5 checkpoint trained
+    under a smaller model section) -- trusting --config's model section to
+    still match a given checkpoint causes exactly the load_state_dict shape
+    mismatch this function exists to avoid.
+    """
+    is_sage = "convs.0.lin_l.weight" in state
+    is_gcn = "convs.0.lin.weight" in state
+    if not is_sage and not is_gcn:
+        raise ValueError(
+            "Could not detect conv type from checkpoint -- no convs.0.lin_l.weight "
+            "(sage) or convs.0.lin.weight (gcn) key found. Is this really a GraphVAE checkpoint?"
+        )
+    conv = "sage" if is_sage else "gcn"
+    w0_key = "convs.0.lin_l.weight" if is_sage else "convs.0.lin.weight"
+
+    encoder_hidden_dims = []
+    i = 0
+    while True:
+        key = f"convs.{i}.lin_l.weight" if is_sage else f"convs.{i}.lin.weight"
+        if key not in state:
+            break
+        encoder_hidden_dims.append(int(state[key].shape[0]))
+        i += 1
+
+    enc_in = int(state[w0_key].shape[1])
+    if enc_in == in_dim + 1:
+        use_channel_idx = True
+    elif enc_in == in_dim:
+        use_channel_idx = False
+    else:
+        raise ValueError(
+            f"Checkpoint's first conv layer expects {enc_in} input features, matching "
+            f"neither in_dim={in_dim} nor in_dim+1={in_dim + 1} from --events. That's not "
+            "just an architecture mismatch -- the node feature count doesn't match what "
+            "this checkpoint trained on (wrong events file, node_features list, or "
+            "channel count)."
+        )
+
+    latent_dim = int(state["fc_mu.weight"].shape[0])
+
+    decoder_idxs = sorted(
+        int(k.split(".")[1]) for k in state if k.startswith("decoder.") and k.endswith(".weight")
+    )
+    if not decoder_idxs:
+        raise ValueError("Could not find any decoder.N.weight in checkpoint")
+    decoder_out_dims = [int(state[f"decoder.{j}.weight"].shape[0]) for j in decoder_idxs]
+    if decoder_out_dims[-1] != in_dim:
+        raise ValueError(
+            f"Checkpoint's final decoder layer outputs {decoder_out_dims[-1]} features, "
+            f"not in_dim={in_dim} -- wrong events file/node_features for this checkpoint."
+        )
+
+    return dict(
+        conv=conv,
+        encoder_hidden_dims=encoder_hidden_dims,
+        decoder_hidden_dims=decoder_out_dims[:-1],
+        latent_dim=latent_dim,
+        use_channel_idx=use_channel_idx,
+    )
 
 
 def run(
@@ -130,19 +208,47 @@ def run(
     )
     logger.info("Dataset: %d channels, %d windows", dataset.num_nodes, len(dataset))
 
-    model = GraphVAE(
-        in_dim=dataset.node_feat_dim,
-        latent_dim=int(model_cfg.get("latent_dim", 12)),
-        encoder_hidden_dims=model_cfg.get("encoder_hidden_dims", [128, 64]),
-        decoder_hidden_dims=model_cfg.get("decoder_hidden_dims", [32, 64]),
-        dropout=float(model_cfg.get("dropout", 0.1)),
-        mask_ratio=0.0,  # no masking when evaluating
-        use_channel_idx=bool(model_cfg.get("use_channel_idx", True)),
-        conv=str(model_cfg.get("conv", "sage")),
-    )
     state = torch.load(checkpoint_path, map_location="cpu")
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
+
+    # Build the model from the CHECKPOINT's own tensor shapes rather than
+    # trusting --config's model section -- configs drift (this repo is on v7
+    # while an older checkpoint may have trained under a smaller model
+    # section), and a stale --config here would otherwise surface as a
+    # confusing load_state_dict shape-mismatch traceback instead of the real
+    # cause.
+    arch = _infer_graph_vae_arch(state, in_dim=dataset.node_feat_dim)
+    cfg_arch = dict(
+        conv=str(model_cfg.get("conv", "sage")),
+        encoder_hidden_dims=[int(d) for d in model_cfg.get("encoder_hidden_dims", [64, 64])],
+        decoder_hidden_dims=[int(d) for d in model_cfg.get("decoder_hidden_dims", [64])],
+        latent_dim=int(model_cfg.get("latent_dim", 12)),
+        use_channel_idx=bool(model_cfg.get("use_channel_idx", True)),
+    )
+    if cfg_arch != arch:
+        logger.warning(
+            "--config's model section doesn't match this checkpoint's actual "
+            "architecture -- it was likely trained under a different config "
+            "version. Building the model from the CHECKPOINT's shapes instead "
+            "of --config so it loads correctly:\n"
+            "  --config model section : %s\n"
+            "  checkpoint architecture: %s",
+            cfg_arch, arch,
+        )
+    else:
+        logger.info("Checkpoint architecture matches --config's model section: %s", arch)
+
+    model = GraphVAE(
+        in_dim=dataset.node_feat_dim,
+        latent_dim=arch["latent_dim"],
+        encoder_hidden_dims=arch["encoder_hidden_dims"],
+        decoder_hidden_dims=arch["decoder_hidden_dims"],
+        dropout=float(model_cfg.get("dropout", 0.1)),  # not part of state_dict; irrelevant at eval anyway
+        mask_ratio=0.0,  # no masking when evaluating
+        use_channel_idx=arch["use_channel_idx"],
+        conv=arch["conv"],
+    )
     model.load_state_dict(state)
 
     # GraphVAETrainer moves the model to device internally; we only use it
