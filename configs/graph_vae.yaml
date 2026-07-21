@@ -36,10 +36,17 @@ data:
   standardize: true                       # z-score features on good-run stats
 
   # ROOT streaming fields (used with --root-files). Match configs/gnn.yaml.
+  # hit_branches just needs one branch per plane prefix (e.g. hits0.h.integral)
+  # to discover the "hits0.h" / "hits1.h" / "hits2.h" prefixes -- from_root()
+  # then pulls integral/channel/time/wire/plane/tpc plus width/sumadc/mult/
+  # hasSP automatically from each prefix when those branches exist in the
+  # tree (checked per file; missing ones are zero-filled, see
+  # sparse_window_dataset.py:from_root). NOTE: this must be set for ROOT
+  # loading to work at all -- if left unset/empty, no hits are read.
   tree_name: caloskim/TrackCaloSkim
-  # hit_branches: [hits0.h.integral, hits0.h.channel, ...]
-  # tpc_branches: [meta.run, meta.subrun, meta.evt]
-  n_channels: 200
+  hit_branches: [hits0.h.integral, hits0.h.channel, hits1.h.integral, hits1.h.channel, hits2.h.integral, hits2.h.channel]
+  tpc_branches: [meta.run, meta.subrun, meta.evt, meta.time]
+  n_channels: 11276
 
   # Geometry-aware graph (see configs/gnn.yaml). electronics recommended.
   channel_map: configs/SBNDTPCChannelMap_v2_with_positions.csv
@@ -49,14 +56,32 @@ data:
   # Integral moments: sum, mean, stdev, min, max, count
   # Rate/occupancy:   occupancy (fraction of events with a hit), hit_rate (hits/event)
   # Timing:           time_mean, time_spread  (require a per-hit time branch)
+  # Width:            width_sum, width_mean, width_min, width_max, width_stdev
+  #                   (hit pulse width; only meaningfully populated on the
+  #                   collection plane in SBND ntuples -- the feature most
+  #                   likely to separate collection-plane anomalies)
+  # SumADC:           sumadc_sum, sumadc_mean, sumadc_min, sumadc_max, sumadc_stdev
+  #                   (raw ADC under the hit; differs from fitted integral
+  #                   when the pulse shape is distorted, e.g. by noise)
+  # Multiplicity:      mult_sum, mult_mean, mult_min, mult_max, mult_stdev
+  #                   (overlapping/split-fit hits -- a common noise signature)
+  # Space-point match: sp_fraction (fraction of a channel's hits with a
+  #                   matched 3-D space point; coherent-noise hits usually
+  #                   don't triangulate across planes, so this drops)
+  # All of the above (except the base integral moments) require the matching
+  # ROOT branch to exist and be readable -- from_root() zero-fills and warns
+  # per file when one is missing rather than failing the whole load.
   # A stronger, less redundant mix than six integral moments:
   node_features: [sum, min, max, mean, stdev, count, occupancy, time_mean, time_spread]   # integral set (best so far)
   # node_features: [sum, mean, stdev, occupancy, time_mean, time_spread]  # rate/timing mix
+  # node_features: [sum, mean, stdev, occupancy, time_mean, time_spread, width_mean, width_stdev, sumadc_mean, mult_mean, sp_fraction]  # + collection-plane-targeted features
 
   # Sign-preserving log1p applied to these features BEFORE standardization.
   # Integral magnitude (sum/min/max/mean) is heavy-tailed even after z-scoring,
   # which makes the VAE reconstruct them as a flat mean; log-compressing the tail
   # lets the model actually track them. occupancy/timing are already well-behaved.
+  # sumadc_sum/sumadc_max and mult_sum are similarly heavy-tailed if you add
+  # them; width_mean/sp_fraction are bounded/well-behaved and don't need it.
   # Must be a subset of node_features. Use the SAME list for train and inference.
   log_features: [sum, min, max, mean]
 

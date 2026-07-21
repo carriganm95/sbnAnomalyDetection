@@ -133,6 +133,7 @@ data:
     - meta.run
     - meta.subrun
     - meta.evt
+    - meta.time
 
   # Number of events per batch read from ROOT stream.  Set to null to read one
   batch_size_stream: 1024

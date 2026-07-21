@@ -25,11 +25,12 @@ data:
     - hits2.h.integral
     - hits2.h.channel
 
-  # TPC metadata branches (run, subrun, event) to track provenance
+  # TPC metadata branches (run, subrun, event, timestamp) to track provenance
   tpc_branches:
     - meta.run
     - meta.subrun
     - meta.evt
+    - meta.time
 
   # Rolling-window materializer options
   window_size: 20

@@ -641,7 +641,11 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
     # Per-channel summary across all windows (which channels are anomalous
     # overall), alongside the per-window per-channel node_scores and the global
     # per-window scores.
-    with np.errstate(invalid="ignore", all="ignore"):
+    # Channels never active over all windows are all-NaN columns -> NaN summary
+    # (expected); silence the benign "Mean/All-NaN of empty slice" warnings.
+    import warnings
+    with np.errstate(invalid="ignore", all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
         channel_mean_error = np.nanmean(node_scores, axis=0).astype(np.float32) \
             if node_scores.shape[0] else np.full(num_channels, np.nan, np.float32)
         channel_max_error = np.nanmax(node_scores, axis=0).astype(np.float32) \

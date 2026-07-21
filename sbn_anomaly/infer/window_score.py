@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -62,7 +63,10 @@ def group_max_mean_score(node_scores: np.ndarray, groups: np.ndarray) -> np.ndar
     if gids.size == 0:
         return mean_score(node_scores)
     gmeans = np.full((W, gids.size), np.nan, dtype=np.float64)
-    with np.errstate(invalid="ignore"):
+    # All-NaN groups/windows are expected (inactive channels) -> NaN result;
+    # silence the benign "Mean of empty slice" / "All-NaN slice" warnings.
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
         for j, g in enumerate(gids):
             cols = np.where(groups == g)[0]
             if cols.size:
