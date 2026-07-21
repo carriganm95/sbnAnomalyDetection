@@ -192,6 +192,14 @@ training's exact fit; the script cross-checks its own replicated pooled
 mean/std against `ds._fit_standardization()`'s real output and warns if they
 don't match bit-for-bit.
 
+**If this flags a real bias:** set `data.standardize_by: plane` in
+`configs/graph_vae.yaml` (see the [top-level README](../README.md) config
+table) and retrain. That fits a separate mean/std per plane instead of one
+pooled fit — planes with too few samples (`data.min_plane_samples`, default
+20) fall back to the pooled stats automatically. Re-run this script
+afterwards (or just re-check good/bad separation) to confirm the offsets
+have shrunk.
+
 ## Other scripts
 
 | Script | Purpose |

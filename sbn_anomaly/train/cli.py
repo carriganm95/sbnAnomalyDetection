@@ -527,6 +527,8 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
         edge_mode=str(data_cfg.get("edge_mode", "sequential")),
         reconstruction=True,
         standardize=bool(data_cfg.get("standardize", True)),
+        standardize_by=str(data_cfg.get("standardize_by", "global")),
+        min_plane_samples=int(data_cfg.get("min_plane_samples", 20)),
         log_features=data_cfg.get("log_features") or None,
     )
 

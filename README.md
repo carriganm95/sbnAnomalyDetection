@@ -332,6 +332,8 @@ for `sequential` graph construction and any graph builder mode that uses radius.
 | `node_features` | Per-channel aggregate feature list. |
 | `log_features` | Features transformed before standardization. |
 | `standardize` | Whether to z-score features using training statistics. |
+| `standardize_by` | `global` (one pooled mean/std, default) or `plane` (separate mean/std per plane — use if `scripts/check_standardization_per_plane.py` shows a plane-biased pooled fit). |
+| `min_plane_samples` | Minimum active-channel samples required to fit a plane its own stats under `standardize_by: plane`; under-sampled planes fall back to the pooled fit. Default 20. |
 | `prune_inactive` | Whether inactive channels are removed from per-window graphs. |
 
 ### `model`
