@@ -37,6 +37,9 @@ BAD_FILE_NUMBERS = {
 
 FILE_PATTERN = "tpc_data_v3_*.npz"
 
+# Run number whose source files should be reported.
+TARGET_RUN = 20142
+
 
 # ============================================================
 # NPZ key categories
@@ -432,6 +435,7 @@ def main() -> None:
     # First pass: count all eligible events so the 75/25 split is global,
     # rather than independently splitting every source file.
     total_eligible_events = 0
+    target_run_files: list[tuple[Path, int, int | None, int | None]] = []
 
     print("First pass: counting eligible events...")
 
@@ -446,10 +450,84 @@ def main() -> None:
             n_events, _ = validate_offsets(path, offsets)
             total_eligible_events += n_events
 
+            if "evt_run" not in data.files:
+                print(
+                    f"Warning: {path.name} has no 'evt_run' array; "
+                    f"cannot check for run {TARGET_RUN}."
+                )
+            else:
+                evt_run = np.asarray(data["evt_run"])
+
+                if evt_run.ndim != 1 or evt_run.shape[0] != n_events:
+                    raise ValueError(
+                        f"{path.name}: 'evt_run' has shape {evt_run.shape}; "
+                        f"expected ({n_events},)."
+                    )
+
+                matching_indices = np.flatnonzero(evt_run == TARGET_RUN)
+
+                if matching_indices.size:
+                    first_event_number: int | None = None
+                    last_event_number: int | None = None
+
+                    if "evt_num" in data.files:
+                        evt_num = np.asarray(data["evt_num"])
+
+                        if evt_num.ndim != 1 or evt_num.shape[0] != n_events:
+                            raise ValueError(
+                                f"{path.name}: 'evt_num' has shape "
+                                f"{evt_num.shape}; expected ({n_events},)."
+                            )
+
+                        matching_event_numbers = evt_num[matching_indices]
+                        first_event_number = int(matching_event_numbers.min())
+                        last_event_number = int(matching_event_numbers.max())
+
+                    target_run_files.append(
+                        (
+                            path,
+                            int(matching_indices.size),
+                            first_event_number,
+                            last_event_number,
+                        )
+                    )
+
         print(
             f"[{display_index}/{len(input_files)}] "
             f"{path.name}: {n_events:,} events"
         )
+
+    print()
+    print(f"Files containing run {TARGET_RUN}:")
+
+    if not target_run_files:
+        print(
+            f"  No eligible files containing run {TARGET_RUN} were found."
+        )
+    else:
+        total_target_events = 0
+
+        for path, event_count, first_event, last_event in target_run_files:
+            total_target_events += event_count
+
+            if first_event is not None and last_event is not None:
+                event_range_text = (
+                    f", event numbers {first_event} through {last_event}"
+                )
+            else:
+                event_range_text = ""
+
+            print(
+                f"  {path.name}: {event_count:,} events"
+                f"{event_range_text}"
+            )
+
+        print(
+            f"  Total: {total_target_events:,} events from "
+            f"{len(target_run_files):,} file(s)"
+        )
+
+    print()
 
     if total_eligible_events < 2:
         raise RuntimeError(
