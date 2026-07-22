@@ -27,7 +27,7 @@ data:
   # windows_path: data/windows_train.npz   # alternative: dense (num_windows, num_nodes, F)
 
   # Window definition (how events are grouped into one reconstruction frame).
-  window_size: 100
+  window_size: 400
   n_temporal_bins: 4
   stride: 100
 
@@ -83,9 +83,9 @@ data:
   # ROOT branch to exist and be readable -- from_root() zero-fills and warns
   # per file when one is missing rather than failing the whole load.
   # A stronger, less redundant mix than six integral moments:
-  node_features: [sum, min, max, mean, stdev, count, occupancy, time_mean, time_spread]   # integral set (best so far)
+  # node_features: [sum, min, max, mean, stdev, count, occupancy, time_mean, time_spread]   # integral set (best so far)
   # node_features: [sum, mean, stdev, occupancy, time_mean, time_spread]  # rate/timing mix
-  # node_features: [sum, mean, stdev, occupancy, time_mean, time_spread, width_mean, width_stdev, sumadc_mean, mult_mean, sp_fraction]  # + collection-plane-targeted features
+  node_features: [sum, mean, stdev, occupancy, time_mean, time_spread, width_mean, width_stdev, sumadc_mean, mult_mean, sp_fraction]  # + collection-plane-targeted features
 
   # Sign-preserving log1p applied to these features BEFORE standardization.
   # Integral magnitude (sum/min/max/mean) is heavy-tailed even after z-scoring,
@@ -123,7 +123,7 @@ training:
   validation_split: 0.1
   use_amp: true
   save_best_only: true
-  beta: 0.8               # KL weight
+  beta: 0.5               # KL weight
   beta_warmup_epochs: 10
   checkpoint_dir: checkpoints/graph_vae/v7
   output_path: checkpoints/graph_vae/v7/graph_vae_final.pt
