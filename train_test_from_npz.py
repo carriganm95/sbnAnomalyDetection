@@ -11,7 +11,7 @@ import numpy as np
 # ============================================================
 
 INPUT_DIR = Path(
-    "/exp/sbnd/data/users/micarrig/DQM/tpc_data_v2"
+    "/exp/sbnd/data/users/micarrig/DQM/tpc_data_v3"
 )
 
 OUTPUT_DIR = Path(
@@ -35,7 +35,7 @@ BAD_FILE_NUMBERS = {
     20621,
 }
 
-FILE_PATTERN = "tpc_data_v2_*.npz"
+FILE_PATTERN = "tpc_data_v3_*.npz"
 
 
 # ============================================================
@@ -73,8 +73,8 @@ SCALAR_KEYS = {
 # ============================================================
 
 def extract_file_number(path: Path) -> int:
-    """Extract the numeric suffix from ``tpc_data_v2_20516.npz``."""
-    match = re.fullmatch(r"tpc_data_v2_(\d+)\.npz", path.name)
+    """Extract the numeric suffix from ``tpc_data_v3_20516.npz``."""
+    match = re.fullmatch(r"tpc_data_v3_(\d+)\.npz", path.name)
 
     if match is None:
         raise ValueError(
