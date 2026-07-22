@@ -58,6 +58,10 @@ FLAT_KEYS = {
     "wires_flat",
     "planes_flat",
     "tpcs_flat",
+    "widths_flat",
+    "sumadcs_flat",
+    "mults_flat",
+    "hassps_flat",
 }
 
 # One value per event. Their first dimension must equal len(offsets) - 1.
