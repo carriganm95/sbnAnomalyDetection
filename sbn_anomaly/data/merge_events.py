@@ -9,8 +9,9 @@ A naive per-key ``np.concatenate`` corrupts these files:
   - ``evt_file_idx`` indexes ``filenames`` -> remap into the merged filename list.
 
 Per-hit arrays (``channels_flat``/``integrals_flat``/``times_flat``/``wires_flat``/
-``planes_flat``/``tpcs_flat``) and per-event arrays (``evt_run``/``evt_subrun``/
-``evt_num``) concatenate directly.
+``planes_flat``/``tpcs_flat``/``widths_flat``/``sumadcs_flat``/``mults_flat``/
+``hassps_flat``) and per-event arrays (``evt_run``/``evt_subrun``/``evt_num``)
+concatenate directly.
 
 CLI:
     python -m sbn_anomaly.data.merge_events --output data/good_events_test.npz \
@@ -29,7 +30,8 @@ from typing import Sequence
 import numpy as np
 
 _PER_HIT = ["channels_flat", "integrals_flat", "times_flat",
-            "wires_flat", "planes_flat", "tpcs_flat"]
+            "wires_flat", "planes_flat", "tpcs_flat",
+            "widths_flat", "sumadcs_flat", "mults_flat", "hassps_flat"]
 _PER_EVENT = ["evt_run", "evt_subrun", "evt_num", "evt_file_idx"]
 
 

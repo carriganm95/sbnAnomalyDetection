@@ -196,6 +196,8 @@ class SparseWindowDatasetPyG(Dataset):
         edge_mode: str = "sequential",
         reconstruction: bool = False,
         standardize: bool = False,
+        standardize_by: str = "global",
+        min_plane_samples: int = 20,
         feature_mean: Optional[np.ndarray] = None,
         feature_std: Optional[np.ndarray] = None,
         log_features: Optional[List[str]] = None,
@@ -275,6 +277,10 @@ class SparseWindowDatasetPyG(Dataset):
         # (graph autoencoder). Forecasting mode: history past frames + 1 target.
         self.reconstruction = bool(reconstruction)
         self.standardize = bool(standardize)
+        self.standardize_by = str(standardize_by)
+        if self.standardize_by not in ("global", "plane"):
+            raise ValueError(f"standardize_by must be 'global' or 'plane', got {standardize_by!r}")
+        self.min_plane_samples = int(min_plane_samples)
 
         n_events = len(self._offsets) - 1
         if self.reconstruction:
@@ -308,12 +314,28 @@ class SparseWindowDatasetPyG(Dataset):
 
         # Per-feature standardization (reconstruction/VAE only). Use provided
         # good-run stats, else fit from a sample of frames.
+        #
+        # standardize_by="global" (default): one mean/std per feature, pooled
+        # across every active channel on every plane -- feature_mean/std have
+        # shape (node_feat_dim,) and broadcast identically to all channels.
+        #
+        # standardize_by="plane": a separate mean/std per plane (see
+        # check_standardization_per_plane.py for why -- pooled stats can hide
+        # a systematic per-plane offset/scale mismatch, e.g. collection vs
+        # induction). feature_mean/std come back with shape
+        # (num_nodes, node_feat_dim) -- already broadcast out per channel by
+        # that channel's plane -- so the application below (frame - mean) /
+        # std needs no changes: numpy broadcasts a (node_feat_dim,) row the
+        # same way it does an exact (num_nodes, node_feat_dim) match.
         self.feature_mean = None
         self.feature_std = None
         if self.reconstruction and self.standardize:
             if feature_mean is not None and feature_std is not None:
                 self.feature_mean = np.asarray(feature_mean, dtype=np.float32)
                 self.feature_std = np.asarray(feature_std, dtype=np.float32)
+            elif self.standardize_by == "plane":
+                self.feature_mean, self.feature_std = self._fit_standardization_per_plane(
+                    min_plane_samples=self.min_plane_samples)
             else:
                 self.feature_mean, self.feature_std = self._fit_standardization()
             self.feature_std = np.where(self.feature_std < 1e-6, 1.0,
@@ -344,6 +366,113 @@ class SparseWindowDatasetPyG(Dataset):
                     np.ones(self.node_feat_dim, np.float32))
         flat = np.concatenate(rows, axis=0)
         return flat.mean(axis=0).astype(np.float32), flat.std(axis=0).astype(np.float32)
+
+    def _channel_plane_lut(self) -> np.ndarray:
+        """Per-channel-id plane assignment, shape (num_nodes,), -1 if unknown.
+
+        Prefers ``planes_flat`` (collapsed per channel -- plane is constant
+        per channel, so this just takes the plane seen on that channel's
+        first hit); falls back to ``self.channel_map`` CSV (offlchan/plane
+        columns) if the events npz didn't carry ``planes_flat``.
+        """
+        if self._planes_flat is not None:
+            lut = np.full(self.num_nodes, -1, dtype=np.int32)
+            order = np.argsort(self._channels_flat, kind="stable")
+            ch_s = self._channels_flat[order]
+            pl_s = self._planes_flat[order]
+            unique_ch, start_idx = np.unique(ch_s, return_index=True)
+            in_range = (unique_ch >= 0) & (unique_ch < self.num_nodes)
+            lut[unique_ch[in_range]] = pl_s[start_idx[in_range]]
+            return lut
+        if self.channel_map:
+            import pandas as pd
+            df = pd.read_csv(self.channel_map)
+            lut = np.full(self.num_nodes, -1, dtype=np.int32)
+            offl = df["offlchan"].to_numpy()
+            plane = df["plane"].to_numpy()
+            valid = (offl >= 0) & (offl < self.num_nodes)
+            lut[offl[valid]] = plane[valid]
+            return lut
+        raise ValueError(
+            "standardize_by='plane' requires plane info: materialize events "
+            "with planes_flat (SparseWindowDatasetPyG.from_root pulls it "
+            "automatically when the ROOT tree has it), or pass data.channel_map "
+            "so per-channel plane can be derived from the SBND channel map CSV."
+        )
+
+    def _fit_standardization_per_plane(self, max_frames: int = 500, min_plane_samples: int = 20):
+        """Like _fit_standardization, but fits a separate mean/std per plane.
+
+        Returns (mean, std) with shape (num_nodes, node_feat_dim) -- each
+        channel's row already holds *its own plane's* fitted stats, so
+        __getitem__'s ``(frame - feature_mean) / feature_std`` needs no
+        changes: numpy broadcasts a (node_feat_dim,) row the same way it
+        does an exact (num_nodes, node_feat_dim) match.
+
+        Channels with unknown plane (not resolvable via planes_flat/
+        channel_map) or planes with fewer than ``min_plane_samples``
+        active-channel samples fall back to the pooled (global) fit for
+        those channels, so this degrades gracefully instead of producing a
+        noisy per-plane estimate or crashing on a small dataset.
+        """
+        channel_plane = self._channel_plane_lut()
+        starts = self._starts
+        if len(starts) > max_frames:
+            rng = np.random.default_rng(0)
+            starts = [starts[i] for i in rng.choice(len(starts), max_frames, replace=False)]
+
+        pooled_rows = []
+        plane_rows: dict = {}
+        for s in starts:
+            frame = self._compute_frame(s, s + self.window_size).reshape(self.num_nodes, -1)
+            act = np.abs(frame).sum(axis=1) > 1e-6
+            if not act.any():
+                continue
+            rows = frame[act]
+            pooled_rows.append(rows)
+            planes_here = channel_plane[act]
+            for p in np.unique(planes_here):
+                if p < 0:
+                    continue
+                plane_rows.setdefault(int(p), []).append(rows[planes_here == p])
+
+        if not pooled_rows:
+            return (np.zeros((self.num_nodes, self.node_feat_dim), np.float32),
+                    np.ones((self.num_nodes, self.node_feat_dim), np.float32))
+
+        pooled_flat = np.concatenate(pooled_rows, axis=0)
+        pooled_mean = pooled_flat.mean(axis=0).astype(np.float32)
+        pooled_std = pooled_flat.std(axis=0).astype(np.float32)
+
+        plane_mean: dict = {}
+        plane_std: dict = {}
+        for p, rows_list in plane_rows.items():
+            flat = np.concatenate(rows_list, axis=0)
+            if flat.shape[0] < min_plane_samples:
+                logger.warning(
+                    "standardize_by='plane': plane %d has only %d active-channel "
+                    "samples (< min_plane_samples=%d) -- falling back to the pooled "
+                    "fit for this plane's channels.", p, flat.shape[0], min_plane_samples)
+                continue
+            plane_mean[p] = flat.mean(axis=0).astype(np.float32)
+            plane_std[p] = flat.std(axis=0).astype(np.float32)
+
+        logger.info(
+            "standardize_by='plane': fit %d plane(s) %s from %d pooled samples "
+            "(planes without their own fit fall back to the pooled stats).",
+            len(plane_mean), sorted(plane_mean), pooled_flat.shape[0])
+
+        # Broadcast each channel's plane-specific stats out to a full
+        # (num_nodes, node_feat_dim) array; unknown/undersampled planes keep
+        # the pooled fallback already tiled in below.
+        mean_out = np.tile(pooled_mean, (self.num_nodes, 1)).astype(np.float32)
+        std_out = np.tile(pooled_std, (self.num_nodes, 1)).astype(np.float32)
+        for p, m in plane_mean.items():
+            mask = channel_plane == p
+            mean_out[mask] = m
+            std_out[mask] = plane_std[p]
+
+        return mean_out, std_out
 
     def standardization(self) -> dict:
         mean = self.feature_mean if self.feature_mean is not None else np.zeros(self.node_feat_dim, np.float32)

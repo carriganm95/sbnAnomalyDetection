@@ -34,6 +34,17 @@ data:
   adjacency_radius: 4
   prune_inactive: true
   standardize: true                       # z-score features on good-run stats
+  # global (default): one mean/std per feature, pooled across every channel
+  #   on every plane. Simple, but can hide a systematic per-plane offset/scale
+  #   mismatch (e.g. collection vs induction) -- see
+  #   scripts/check_standardization_per_plane.py to check whether this is
+  #   actually biasing your data before flipping this.
+  # plane: fit a separate mean/std per plane (requires planes_flat in the
+  #   events npz, or set channel_map below so plane can be derived from
+  #   channel id). Planes with fewer than min_plane_samples active-channel
+  #   samples fall back to the pooled fit rather than a noisy estimate.
+  standardize_by: global
+  # min_plane_samples: 20
 
   # ROOT streaming fields (used with --root-files). Match configs/gnn.yaml.
   # hit_branches just needs one branch per plane prefix (e.g. hits0.h.integral)
