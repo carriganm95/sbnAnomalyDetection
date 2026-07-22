@@ -284,6 +284,110 @@ that plane's raw score against a single global one, since a real degradation
 there may only ever produce a modest absolute rise even once everything else
 is working correctly.
 
+## compare_model_features.py
+
+The model-accurate companion to `compare_events_distributions.py`. That
+script's windowed mode applies a generic stat menu (mean/median/stdev/...) to
+a raw hit variable — fast and torch-free, but it can drift from what
+`graph_vae` actually computes (it has no way to reproduce `occupancy`, a
+hits-with-a-hit / events-in-bin ratio rather than a per-hit reduction, or
+`sp_fraction`), and it can't show standardized values at all.
+
+This script instead builds the real `SparseWindowDatasetPyG` from `--config`'s
+`data` section and reads `data.y` straight out of `__getitem__` for every
+window — the identical code path training/inference use, so there's no
+second implementation of the feature math to fall out of sync. For every
+`data.node_features` entry and temporal bin it recovers **both**:
+
+- **raw** — physical-unit value, recovered by inverting the model's own
+  `(x - mean) / std` with that same mean/std (not recomputed from scratch)
+- **standardized** — `data.y` itself, literally what the loss function and
+  reconstruction target look like
+
+File A's fitted standardization (or an externally supplied checkpoint's) is
+reused for File B too — never refit per file, matching real inference, where
+good-run statistics are applied to whatever data comes in.
+
+```bash
+python scripts/compare_model_features.py \
+    --config configs/graph_vae.yaml \
+    --file-a data/good_events_val.npz --file-b data/bad_events_val.npz \
+    --output model_features_compare.root
+```
+
+Reuse a checkpoint's fitted standardization instead of refitting from
+`--file-a` (recommended when you have one — matches exactly what it trained
+against):
+```bash
+python scripts/compare_model_features.py \
+    --config configs/graph_vae.yaml \
+    --file-a data/good_events_val.npz --file-b data/bad_events_val.npz \
+    --standardization checkpoints/graph_vae/v7/standardization.npz \
+    --output model_features_compare.root
+```
+
+### Output
+
+Same `all_detector`/`per_plane`/`per_channel` (opt-in via `--per-channel`)
+ROOT histogram layout as `compare_events_distributions.py`, split by feature,
+temporal bin, and raw vs. standardized:
+```
+model_features/<feature>/bin<b>/raw/all_detector_<label>
+model_features/<feature>/bin<b>/raw/per_plane/plane<p>/<label>
+model_features/<feature>/bin<b>/standardized/all_detector_<label>
+model_features/<feature>/bin<b>/standardized/per_plane/plane<p>/<label>
+```
+**Plus** overlay+ratio canvases (good/bad histograms overlaid via
+`TRatioPlot`, ratio = bad/good in the pad below) at the `all_detector` and
+`per_plane` level by default:
+```
+canvases/<raw|standardized>/<feature>/bin<b>/all_detector
+canvases/<raw|standardized>/<feature>/bin<b>/per_plane/plane<p>
+```
+`--no-canvases` skips that section if PyROOT isn't available on a given node.
+
+Each histogram gets Poisson (`sqrt(N)`) bin errors (drawn as error bars on
+both the overlay and the propagated ratio), and each canvas is annotated with
+a `#chi^{2}/ndf` (and p-value) from ROOT's own two-sample Poisson chi2 test
+(`TH1::Chi2TestX`, option `"UU"` — appropriate since both histograms are raw
+unweighted counts). `ndf` can come back `0` for a bin range where too few
+bins have entries in both histograms (e.g. a small proof-of-concept sample);
+the canvas falls back to a "too few populated bins" label rather than
+dividing by zero. The chi2/ndf for every canvas is also logged to stdout as
+it's written, so you can grep for the largest ones without opening ROOT.
+
+### Requires
+
+**torch/torch_geometric** (builds the real dataset) **and PyROOT** (draws/
+writes the `TCanvas`/`TRatioPlot` objects — `uproot` alone can't create
+those). Run this in a full LArSoft/analysis environment, not the torch-free
+environment `compare_events_distributions.py` is designed for.
+
+The extraction/histogram-writing logic (raw-value recovery via inverting the
+standardization, per-plane grouping, channel indexing) is unit-tested with
+synthetic duck-typed datasets covering both global and per-plane
+standardization shapes. **The PyROOT canvas-drawing section could not be
+exercised in this development environment (no ROOT/PyROOT install available
+here)** — smoke-test `write_canvases` on a small file before trusting it on
+a full comparison; the `TRatioPlot` two-histogram convention (`ratio = h1/h2`)
+should be double-checked against your ROOT version.
+
+### Option reference
+
+| Option | Default | Description |
+|---|---|---|
+| `--config` | *(required)* | Training config, e.g. `configs/graph_vae.yaml` — supplies `window_size`/`n_temporal_bins`/`stride`/`node_features`/`standardize_by`/`channel_map` |
+| `--file-a` / `--file-b` | *(required)* | Reference/good and comparison/bad events npz |
+| `--label-a` / `--label-b` | `good` / `bad` | |
+| `--output` | *(required)* | Output ROOT file (histograms + canvases) |
+| `--standardization` | *(none)* | Optional `standardization.npz` (e.g. from a checkpoint dir); if omitted, fits from `--file-a` |
+| `--channel-map` | `data.channel_map` in `--config` | |
+| `--channel-range LO HI` | full detector | Restrict per-channel output (with `--per-channel`) |
+| `--per-channel` | off | Also write per-channel histograms (large — combine with `--channel-range`) |
+| `--no-canvases` | off | Skip the PyROOT canvas section |
+| `--bins` / `--range-mode` / `--range-percentiles` | `60` / `percentile` / `0.1 99.9` | Same semantics as `compare_events_distributions.py` |
+| `--max-windows` | unlimited | Cap windows processed per file — fast first look |
+
 ## Other scripts
 
 | Script | Purpose |
