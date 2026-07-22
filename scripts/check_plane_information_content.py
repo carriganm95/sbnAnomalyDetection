@@ -245,28 +245,46 @@ def run(
 
     if len(planes) >= 2:
         lowest_hits_plane = min(plane_summary, key=lambda p: plane_summary[p]["med_hits"])
-        lowest_ratio_plane = min(plane_summary, key=lambda p: plane_summary[p]["med_ratio"])
+        highest_hits_plane = max(plane_summary, key=lambda p: plane_summary[p]["med_hits"])
+        lo_hits = plane_summary[lowest_hits_plane]["med_hits"]
+        hi_hits = plane_summary[highest_hits_plane]["med_hits"]
+        hits_ratio = (hi_hits / lo_hits) if lo_hits > 1e-9 else float("inf")
+        lp_ratio = plane_summary[lowest_hits_plane]["med_ratio"]
         print(
-            f"\nLowest median hits/window: plane {lowest_hits_plane} "
-            f"({plane_summary[lowest_hits_plane]['med_hits']:.3f}).  "
-            f"Closest to the shot-noise floor (lowest ratio): plane {lowest_ratio_plane} "
-            f"({plane_summary[lowest_ratio_plane]['med_ratio']:.3f})."
+            f"\nLowest median hits/window: plane {lowest_hits_plane} ({lo_hits:.3f}), "
+            f"{hits_ratio:.2f}x fewer than the busiest plane {highest_hits_plane}'s {hi_hits:.3f}."
         )
-        if lowest_hits_plane == lowest_ratio_plane and plane_summary[lowest_hits_plane]["med_ratio"] < 2.0:
+        # The mechanism test is whether THIS plane's own ratio sits near the shot-noise
+        # floor (~1), not whether it happens to be the single lowest ratio across planes
+        # -- ratios this close together (e.g. 0.99 vs 1.14) are themselves noisy, and a
+        # near-1 ratio on every plane is *expected* if hit occurrence is close to Poisson
+        # everywhere. What actually matters: is the low-hit plane's much wider absolute
+        # noise floor (CV_theory ~ 1/sqrt(hits/window)) fully explained by having fewer
+        # hits, or is there a *separate* unexplained effect on top of that?
+        if hits_ratio > 1.5 and lp_ratio < 1.5:
             print(
-                f"Plane {lowest_hits_plane} has both the fewest hits/window AND a "
-                "near-shot-noise ratio -- consistent with the 'less information per "
-                "window' hypothesis: its baseline variance looks mostly like counting "
-                "noise from having few hits to average over, not genuine window-to-window "
-                "structure. Standardizing by this std doesn't fix that -- it just gives "
-                "you a noise floor to divide by. Consider a larger window_size (more hits "
-                "to average, at the cost of time resolution) and/or per-plane anomaly "
-                "thresholds instead of a single global one."
+                f"Plane {lowest_hits_plane} sees {hits_ratio:.2f}x fewer hits/window than "
+                f"the busiest plane, and its own count variance is still close to the "
+                f"Poisson shot-noise floor (ratio={lp_ratio:.3f}). Its wider noise floor "
+                "isn't a separate, unexplained effect -- it falls straight out of having "
+                "fewer hits to average over per window. Standardizing by that std doesn't "
+                "fix this; it just gives you a wider denominator to divide anomaly "
+                "deviations by. Consider a larger window_size (more hits to average, at "
+                "the cost of time resolution) and/or a per-plane anomaly threshold instead "
+                "of comparing this plane's raw score against a single global one."
+            )
+        elif hits_ratio > 1.5:
+            print(
+                f"Plane {lowest_hits_plane} does see {hits_ratio:.2f}x fewer hits/window, "
+                f"but its count variance (ratio={lp_ratio:.3f}) is well above the "
+                "shot-noise floor -- something beyond simple small-N sampling is driving "
+                "its variance, so low hit count alone doesn't fully explain the noise "
+                "floor there."
             )
         else:
             print(
-                "No single plane stands out on both counts -- this hypothesis doesn't "
-                "look like the dominant explanation here."
+                "No plane sees meaningfully fewer hits/window than the others here -- "
+                "this hypothesis doesn't look like the explanation for this dataset."
             )
     else:
         print("\nFewer than 2 planes had channels with hits -- no cross-plane comparison possible.")
