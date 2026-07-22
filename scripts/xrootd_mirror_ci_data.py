@@ -74,10 +74,18 @@ from typing import List, Optional, Tuple
 logger = logging.getLogger("xrootd_mirror_ci_data")
 
 
-def discover_files(source_glob: str, subdirs: List[str]) -> List[Path]:
+def discover_files(
+    source_glob: str, subdirs: List[str], exclude_dirs: Optional[List[str]] = None,
+) -> List[Path]:
     """Find every .root file under <matched top dir>/<subdir>/ (recursively),
     for every top-level directory `source_glob` expands to.
+
+    Files under any directory component named in `exclude_dirs` (default:
+    just "log") are skipped -- e.g. <subdir>/log/whatever.root, or a nested
+    .../reco/some_job/log/foo.root, are excluded regardless of how deep the
+    "log" component sits in the path.
     """
+    exclude = set(exclude_dirs) if exclude_dirs is not None else {"log"}
     top_dirs = sorted({Path(p) for p in glob.glob(source_glob) if Path(p).is_dir()})
     if not top_dirs:
         raise ValueError(f"No directories matched {source_glob!r}")
@@ -91,8 +99,16 @@ def discover_files(source_glob: str, subdirs: List[str]) -> List[Path]:
                 logger.warning("  %s: no '%s' subdirectory -- skipping", top, sub)
                 continue
             found = sorted(subdir.rglob("*.root"))
-            logger.info("  %s/%s: %d .root file(s)", top.name, sub, len(found))
-            files.extend(found)
+            kept = [
+                f for f in found
+                if not (exclude & set(f.relative_to(subdir).parts[:-1]))
+            ]
+            n_excluded = len(found) - len(kept)
+            if n_excluded:
+                logger.info("  %s/%s: excluding %d file(s) under %s",
+                            top.name, sub, n_excluded, sorted(exclude))
+            logger.info("  %s/%s: %d .root file(s)", top.name, sub, len(kept))
+            files.extend(kept)
     return files
 
 
@@ -160,8 +176,9 @@ def mirror(
     overwrite: bool,
     dry_run: bool,
     max_workers: int,
+    exclude_dirs: Optional[List[str]] = None,
 ) -> None:
-    files = discover_files(source_glob, subdirs)
+    files = discover_files(source_glob, subdirs, exclude_dirs=exclude_dirs)
     if not files:
         logger.warning("No .root files found under any matched directory's %s -- nothing to do.", subdirs)
         return
@@ -213,6 +230,9 @@ def _parse_args(argv):
                      help="e.g. root://fndca1.fnal.gov:1094 -- verify this for your site, see module docstring")
     ap.add_argument("--subdirs", nargs="+", default=["reco", "decode"],
                      help="Subdirectory name(s) under each matched build directory to mirror (default: reco decode)")
+    ap.add_argument("--exclude-dirs", nargs="+", default=["log"],
+                     help="Directory name(s) to skip anywhere in the path under a subdir, e.g. "
+                          "reco/log/foo.root is excluded when 'log' is in this list (default: log)")
     ap.add_argument("--overwrite", action="store_true",
                      help="Re-copy files that already exist at the destination (default: skip them)")
     ap.add_argument("--dry-run", action="store_true",
@@ -228,7 +248,7 @@ def main(argv=None):
     mirror(
         source_glob=args.source_glob, dest=args.dest, xrootd_door=args.xrootd_door,
         subdirs=args.subdirs, overwrite=args.overwrite, dry_run=args.dry_run,
-        max_workers=args.max_workers,
+        max_workers=args.max_workers, exclude_dirs=args.exclude_dirs,
     )
 
 

@@ -432,6 +432,7 @@ first, then a small real transfer, before mirroring the full dataset.
 | `--dest` | *(required)* | Local destination root |
 | `--xrootd-door` | *(required)* | e.g. `root://fndca1.fnal.gov:1094` — verify for your site |
 | `--subdirs` | `reco decode` | Subdirectory name(s) to mirror under each matched build dir |
+| `--exclude-dirs` | `log` | Directory name(s) to skip anywhere in the path under a subdir (e.g. `reco/log/foo.root` or a nested `.../some_job/log/foo.root` are both excluded) |
 | `--overwrite` | off | Re-copy files that already exist at the destination |
 | `--dry-run` | off | Print what would be copied / the exact `xrdcp` commands, copy nothing |
 | `--max-workers` | `4` | Parallel `xrdcp` transfers |
