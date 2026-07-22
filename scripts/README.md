@@ -388,6 +388,54 @@ should be double-checked against your ROOT version.
 | `--bins` / `--range-mode` / `--range-percentiles` | `60` / `percentile` / `0.1 99.9` | Same semantics as `compare_events_distributions.py` |
 | `--max-windows` | unlimited | Cap windows processed per file — fast first look |
 
+## xrootd_mirror_ci_data.py
+
+Mirrors `reco/` and `decode/` ROOT files from the `CI_build_lar_ci_*` DQM
+dCache area to a local directory via `xrdcp`, preserving the source
+directory structure (`<dest>/CI_build_lar_ci_<N>/reco/...`,
+`<dest>/CI_build_lar_ci_<N>/decode/...`).
+
+```bash
+python scripts/xrootd_mirror_ci_data.py \
+    --source-glob '/pnfs/sbnd/scratch/ci_validation/dqm/v09_93_01_02/CI_build_lar_ci*' \
+    --dest /exp/sbnd/data/users/<you>/DQM/ci_mirror \
+    --xrootd-door root://fndca1.fnal.gov:1094 \
+    --dry-run
+```
+Drop `--dry-run` once the file list/commands it prints look right.
+
+**You must supply `--xrootd-door` yourself** — the correct xrootd
+redirector/door for your dCache instance isn't something that could be
+confirmed from this environment; verify it (e.g. copy one small file first)
+before pointing this at the full dataset. `--subdirs` defaults to
+`reco decode`; pass `--subdirs raw_decode` etc. if your area uses a
+different name than `decode` (this project's `data/README.md` documents
+`raw_decode` elsewhere — check `ls` on your actual area first).
+
+Listing/globbing under `/pnfs` is normal POSIX filesystem access (dCache's
+NFS4 namespace mount); only the actual file copy goes through `xrdcp`, which
+is the correct way to move real data off dCache rather than a plain `cp`.
+Re-running the same command is safe and resumes automatically — files
+already present at the destination are skipped unless `--overwrite` is
+given, so a partially-failed run can just be re-launched. Failed transfers
+are logged individually and summarized at the end.
+
+File discovery, path-mirroring, URL construction, skip-existing behavior,
+and dry-run orchestration are unit-tested against a synthetic directory
+tree. The actual `xrdcp` subprocess call against a real dCache instance
+could not be exercised in this development environment — do a `--dry-run`
+first, then a small real transfer, before mirroring the full dataset.
+
+| Option | Default | Description |
+|---|---|---|
+| `--source-glob` | *(required)* | Glob matching per-build top-level directories |
+| `--dest` | *(required)* | Local destination root |
+| `--xrootd-door` | *(required)* | e.g. `root://fndca1.fnal.gov:1094` — verify for your site |
+| `--subdirs` | `reco decode` | Subdirectory name(s) to mirror under each matched build dir |
+| `--overwrite` | off | Re-copy files that already exist at the destination |
+| `--dry-run` | off | Print what would be copied / the exact `xrdcp` commands, copy nothing |
+| `--max-workers` | `4` | Parallel `xrdcp` transfers |
+
 ## Other scripts
 
 | Script | Purpose |
