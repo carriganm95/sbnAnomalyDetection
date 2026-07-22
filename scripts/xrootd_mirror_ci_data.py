@@ -54,6 +54,14 @@ Only the raw_decode-style subdirectory, more parallel transfers:
         --xrootd-door root://fndca1.fnal.gov:1094 \\
         --subdirs raw_decode --max-workers 8
 
+Plain filesystem copy instead of xrdcp (bypasses xrootd entirely -- for
+quick local testing, or when /pnfs is directly POSIX-readable in your
+environment; --xrootd-door is not needed with this method):
+    python scripts/xrootd_mirror_ci_data.py \\
+        --source-glob '/pnfs/sbnd/scratch/ci_validation/dqm/v09_93_01_02/CI_build_lar_ci*' \\
+        --dest /exp/sbnd/data/users/<you>/DQM/ci_mirror \\
+        --copy-method cp
+
 Destination layout mirrors the source: for a matched top-level directory
 CI_build_lar_ci_12 under the common parent of --source-glob's matches, files
 land at <dest>/CI_build_lar_ci_12/reco/... and <dest>/CI_build_lar_ci_12/decode/....
@@ -65,6 +73,7 @@ import argparse
 import glob
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -144,12 +153,42 @@ def xrootd_url(local_pnfs_path: Path, xrootd_door: str) -> str:
 
 
 def copy_one(
-    source_file: Path, dest_file: Path, xrootd_door: str, overwrite: bool, dry_run: bool,
+    source_file: Path,
+    dest_file: Path,
+    xrootd_door: Optional[str],
+    overwrite: bool,
+    dry_run: bool,
+    copy_method: str = "xrdcp",
 ) -> Tuple[Path, bool, str]:
-    """Copy one file via xrdcp. Returns (source_file, ok, message)."""
+    """Copy one file via xrdcp (default) or a plain filesystem copy.
+
+    copy_method="cp": bypasses xrootd entirely and copies straight off the
+    POSIX path (shutil.copy2, i.e. cp -p semantics -- preserves mtime/perm
+    bits). Useful when /pnfs is directly POSIX-readable in your environment
+    (it is for listing/globbing regardless -- see module docstring) and you
+    want a quick local test, or don't have/need an xrootd door. For real
+    bulk transfers off dCache, xrdcp is still the recommended path.
+
+    Returns (source_file, ok, message).
+    """
     if dest_file.exists() and not overwrite:
         return (source_file, True, "skipped (already exists)")
     dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if copy_method == "cp":
+        if dry_run:
+            return (source_file, True, f"[dry-run] cp -p {source_file} {dest_file}")
+        try:
+            shutil.copy2(source_file, dest_file)
+        except OSError as exc:
+            return (source_file, False, f"plain copy failed: {exc}")
+        return (source_file, True, "copied (cp)")
+
+    if copy_method != "xrdcp":
+        raise ValueError(f"copy_method must be 'xrdcp' or 'cp', got {copy_method!r}")
+    if not xrootd_door:
+        return (source_file, False, "--xrootd-door is required when --copy-method xrdcp (default) is used")
+
     src_url = xrootd_url(source_file, xrootd_door)
     cmd = ["xrdcp"]
     if overwrite:
@@ -165,19 +204,25 @@ def copy_one(
         return (source_file, False, "timed out after 3600s")
     if result.returncode != 0:
         return (source_file, False, f"xrdcp failed (rc={result.returncode}): {result.stderr.strip()[-500:]}")
-    return (source_file, True, "copied")
+    return (source_file, True, "copied (xrdcp)")
 
 
 def mirror(
     source_glob: str,
     dest: str,
-    xrootd_door: str,
+    xrootd_door: Optional[str],
     subdirs: List[str],
     overwrite: bool,
     dry_run: bool,
     max_workers: int,
     exclude_dirs: Optional[List[str]] = None,
+    copy_method: str = "xrdcp",
 ) -> None:
+    if copy_method not in ("xrdcp", "cp"):
+        raise ValueError(f"copy_method must be 'xrdcp' or 'cp', got {copy_method!r}")
+    if copy_method == "xrdcp" and not xrootd_door:
+        raise ValueError("--xrootd-door is required unless --copy-method cp is used")
+
     files = discover_files(source_glob, subdirs, exclude_dirs=exclude_dirs)
     if not files:
         logger.warning("No .root files found under any matched directory's %s -- nothing to do.", subdirs)
@@ -185,7 +230,7 @@ def mirror(
 
     source_root = common_source_root(source_glob)
     dest_root = Path(dest)
-    logger.info("%d file(s) to mirror from %s to %s", len(files), source_root, dest_root)
+    logger.info("%d file(s) to mirror from %s to %s (copy_method=%s)", len(files), source_root, dest_root, copy_method)
     if dry_run:
         logger.info("DRY RUN -- no files will actually be copied")
 
@@ -193,7 +238,8 @@ def mirror(
     failed: List[Tuple[Path, str]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
-            ex.submit(copy_one, f, dest_path_for(f, source_root, dest_root), xrootd_door, overwrite, dry_run): f
+            ex.submit(copy_one, f, dest_path_for(f, source_root, dest_root),
+                      xrootd_door, overwrite, dry_run, copy_method): f
             for f in files
         }
         for i, fut in enumerate(as_completed(futures), 1):
@@ -226,8 +272,13 @@ def _parse_args(argv):
                      help="Glob matching the per-build top-level directories, e.g. "
                           "'/pnfs/sbnd/scratch/ci_validation/dqm/v09_93_01_02/CI_build_lar_ci*'")
     ap.add_argument("--dest", required=True, help="Local destination root directory")
-    ap.add_argument("--xrootd-door", required=True,
-                     help="e.g. root://fndca1.fnal.gov:1094 -- verify this for your site, see module docstring")
+    ap.add_argument("--copy-method", choices=["xrdcp", "cp"], default="xrdcp",
+                     help="xrdcp (default, recommended for real dCache transfers) or cp -- a plain "
+                          "filesystem copy (shutil.copy2) that bypasses xrootd entirely, for quick "
+                          "local testing or environments where /pnfs is directly POSIX-readable")
+    ap.add_argument("--xrootd-door", default=None,
+                     help="Required when --copy-method xrdcp (default). e.g. root://fndca1.fnal.gov:1094 "
+                          "-- verify this for your site, see module docstring. Not needed with --copy-method cp")
     ap.add_argument("--subdirs", nargs="+", default=["reco", "decode"],
                      help="Subdirectory name(s) under each matched build directory to mirror (default: reco decode)")
     ap.add_argument("--exclude-dirs", nargs="+", default=["log"],
@@ -236,9 +287,9 @@ def _parse_args(argv):
     ap.add_argument("--overwrite", action="store_true",
                      help="Re-copy files that already exist at the destination (default: skip them)")
     ap.add_argument("--dry-run", action="store_true",
-                     help="List what would be copied and the exact xrdcp commands, copy nothing")
+                     help="List what would be copied and the exact copy commands, copy nothing")
     ap.add_argument("--max-workers", type=int, default=4,
-                     help="Parallel xrdcp transfers (default 4 -- network-bound; too high can overload the door)")
+                     help="Parallel transfers (default 4 -- network-bound for xrdcp; too high can overload the door)")
     return ap.parse_args(argv)
 
 
@@ -249,6 +300,7 @@ def main(argv=None):
         source_glob=args.source_glob, dest=args.dest, xrootd_door=args.xrootd_door,
         subdirs=args.subdirs, overwrite=args.overwrite, dry_run=args.dry_run,
         max_workers=args.max_workers, exclude_dirs=args.exclude_dirs,
+        copy_method=args.copy_method,
     )
 
 

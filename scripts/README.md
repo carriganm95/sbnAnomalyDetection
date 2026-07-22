@@ -430,7 +430,8 @@ first, then a small real transfer, before mirroring the full dataset.
 |---|---|---|
 | `--source-glob` | *(required)* | Glob matching per-build top-level directories |
 | `--dest` | *(required)* | Local destination root |
-| `--xrootd-door` | *(required)* | e.g. `root://fndca1.fnal.gov:1094` — verify for your site |
+| `--copy-method` | `xrdcp` | `xrdcp` (recommended for real dCache transfers) or `cp` — a plain filesystem copy (`shutil.copy2`) that bypasses xrootd entirely, for quick local testing or when `/pnfs` is directly POSIX-readable |
+| `--xrootd-door` | *(required unless `--copy-method cp`)* | e.g. `root://fndca1.fnal.gov:1094` — verify for your site |
 | `--subdirs` | `reco decode` | Subdirectory name(s) to mirror under each matched build dir |
 | `--exclude-dirs` | `log` | Directory name(s) to skip anywhere in the path under a subdir (e.g. `reco/log/foo.root` or a nested `.../some_job/log/foo.root` are both excluded) |
 | `--overwrite` | off | Re-copy files that already exist at the destination |
