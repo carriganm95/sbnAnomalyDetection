@@ -36,7 +36,7 @@ BAD_FILE_NUMBERS = {
     20615,
     20620,
     20621,
-    20769,
+    # 20769,
 }
 
 FILE_PATTERN = "tpc_data_v3_*.npz"
