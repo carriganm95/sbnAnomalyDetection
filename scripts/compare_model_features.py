@@ -289,71 +289,146 @@ def write_histograms(
 # this section on a small file before trusting it on a full dataset.
 # ---------------------------------------------------------------------------
 
-def _make_th1(ROOT, name: str, title: str, counts: np.ndarray, lo: float, hi: float):
-    """Build a TH1D from precomputed bin counts with Poisson (sqrt-N)
-    statistical errors.
+def _root_safe_name(value: str) -> str:
+    """Return a ROOT-safe object name with no path separators or spaces."""
+    return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in str(value))
 
-    counts are raw entry counts (np.histogram output), not weighted fills, so
-    the standard counting-statistics error is sqrt(N) per bin. Sumw2() alone
-    is fill-order-dependent (it back-fills fSumw2[bin] = content[bin] only if
-    called after SetBinContent, assuming unit weights) -- set bin errors
-    explicitly as well so this doesn't silently depend on that behavior.
-    """
-    h = ROOT.TH1D(name, title, len(counts), lo, hi)
-    for i, c in enumerate(counts):
-        h.SetBinContent(i + 1, float(c))
-    h.Sumw2()
-    for i, c in enumerate(counts):
-        h.SetBinError(i + 1, float(np.sqrt(max(float(c), 0.0))))
+
+def _normalize_histogram_counts(counts: np.ndarray):
+    """Return unit-area bin fractions and propagated Poisson errors."""
+    raw = np.asarray(counts, dtype=np.float64)
+    total = float(np.sum(raw))
+    if total <= 0.0:
+        return raw.copy(), np.zeros_like(raw)
+    return raw / total, np.sqrt(np.clip(raw, 0.0, None)) / total
+
+
+def _make_th1(
+    ROOT,
+    name: str,
+    title: str,
+    values: np.ndarray,
+    errors: np.ndarray,
+    lo: float,
+    hi: float,
+):
+    """Build a detached TH1D from supplied bin values and errors."""
+    values = np.asarray(values, dtype=np.float64)
+    errors = np.asarray(errors, dtype=np.float64)
+    if values.shape != errors.shape:
+        raise ValueError(f"Histogram values/errors shape mismatch for {name}")
+
+    safe_name = _root_safe_name(name)
+    h = ROOT.TH1D(safe_name, title, len(values), float(lo), float(hi))
     h.SetDirectory(0)
+    h.Sumw2()
+
+    for i, (value, error) in enumerate(zip(values, errors), start=1):
+        h.SetBinContent(i, float(value))
+        h.SetBinError(i, float(error))
+
+    ROOT.SetOwnership(h, False)
     return h
 
 
-def _chi2_ndf(ROOT, h1, h2):
-    """Poisson two-sample chi2 test between h1 and h2 via ROOT's own
-    TH1::Chi2TestX (not reimplemented here) -- "UU" (unweighted-unweighted)
-    is the correct option since both histograms are raw entry counts with
-    sqrt(N) errors, not weighted fills.
-
-    Returns (chi2, ndf, pvalue). ndf can come back 0 if too few bins have
-    entries in both histograms (e.g. a very small proof-of-concept sample) --
-    callers must guard against dividing by it.
-
-    Uses ctypes for the Double_t&/Int_t& out-parameters (the modern PyROOT
-    convention, >= 6.22-ish). If your PyROOT is old enough that this doesn't
-    bind correctly, the legacy fallback is ROOT.Long()/ROOT.Double() proxy
-    objects in place of the ctypes ones below.
-    """
+def _chi2_ndf(ROOT, name: str, counts_1: np.ndarray, counts_2: np.ndarray, lo: float, hi: float):
+    """Run ROOT's unweighted two-sample chi-square test on raw counts."""
     import ctypes
+
+    counts_1 = np.asarray(counts_1, dtype=np.float64)
+    counts_2 = np.asarray(counts_2, dtype=np.float64)
+    if counts_1.sum() <= 0.0 or counts_2.sum() <= 0.0:
+        return 0.0, 0, 0.0
+
+    errors_1 = np.sqrt(np.clip(counts_1, 0.0, None))
+    errors_2 = np.sqrt(np.clip(counts_2, 0.0, None))
+    h1 = _make_th1(ROOT, f"chi2_{name}_1", "", counts_1, errors_1, lo, hi)
+    h2 = _make_th1(ROOT, f"chi2_{name}_2", "", counts_2, errors_2, lo, hi)
+
     chi2 = ctypes.c_double(0.0)
     ndf = ctypes.c_int(0)
     igood = ctypes.c_int(0)
     pvalue = h1.Chi2TestX(h2, chi2, ndf, igood, "UU")
-    return chi2.value, ndf.value, pvalue
+    return chi2.value, ndf.value, float(pvalue)
 
 
 def _get_or_make_dir(tdirectory, path: str):
     d = tdirectory
     if not path:
         return d
+
     for part in path.split("/"):
         sub = d.GetDirectory(part)
         if not sub:
             sub = d.mkdir(part)
+        if not sub:
+            raise RuntimeError(f"Could not create ROOT directory component: {part}")
         d = sub
     return d
 
 
-def _draw_ratio_canvas(ROOT, name: str, x_title: str, counts_good: np.ndarray, counts_bad: np.ndarray,
-                        lo: float, hi: float, label_a: str, label_b: str, logger_=None):
-    """One overlay canvas: good vs bad histograms (with Poisson error bars)
-    on top, ratio (bad/good, errors propagated from both) below, via
-    TRatioPlot, plus a chi2/ndf annotation from ROOT's own two-sample Poisson
-    chi2 test. Both histograms share (bins, lo, hi) so bin-by-bin comparison
-    (ratio and chi2 alike) is meaningful.
-    """
-    h_good = _make_th1(ROOT, f"{name}_good", f"{name};{x_title};entries", counts_good, lo, hi)
-    h_bad = _make_th1(ROOT, f"{name}_bad", name, counts_bad, lo, hi)
+def _draw_ratio_canvas(
+    ROOT,
+    name: str,
+    x_title: str,
+    counts_good: np.ndarray,
+    counts_bad: np.ndarray,
+    lo: float,
+    hi: float,
+    label_a: str,
+    label_b: str,
+    logger_=None,
+):
+    """Create a unit-area overlay and bad/good ratio canvas."""
+    raw_good = np.asarray(counts_good, dtype=np.float64)
+    raw_bad = np.asarray(counts_bad, dtype=np.float64)
+
+    if raw_good.ndim != 1 or raw_bad.ndim != 1:
+        raise ValueError("Histogram count arrays must be one-dimensional")
+    if raw_good.size != raw_bad.size:
+        raise ValueError(
+            f"Histogram bin mismatch for {name}: {raw_good.size} versus {raw_bad.size}"
+        )
+    if raw_good.size == 0:
+        return None
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        if logger_ is not None:
+            logger_.warning("Skipping %s: invalid histogram range [%s, %s]", name, lo, hi)
+        return None
+
+    good_total = float(raw_good.sum())
+    bad_total = float(raw_bad.sum())
+    if good_total <= 0.0 or bad_total <= 0.0:
+        if logger_ is not None:
+            logger_.warning(
+                "Skipping canvas %-45s: empty histogram (%s=%g, %s=%g)",
+                name, label_a, good_total, label_b, bad_total,
+            )
+        return None
+
+    plot_good, error_good = _normalize_histogram_counts(raw_good)
+    plot_bad, error_bad = _normalize_histogram_counts(raw_bad)
+
+    safe_name = _root_safe_name(name)
+    h_good = _make_th1(
+        ROOT,
+        f"h_{safe_name}_{_root_safe_name(label_a)}",
+        f"{name};{x_title};fraction of entries",
+        plot_good,
+        error_good,
+        lo,
+        hi,
+    )
+    h_bad = _make_th1(
+        ROOT,
+        f"h_{safe_name}_{_root_safe_name(label_b)}",
+        f"{name};{x_title};fraction of entries",
+        plot_bad,
+        error_bad,
+        lo,
+        hi,
+    )
+
     h_good.SetLineColor(ROOT.kBlue + 1)
     h_good.SetLineWidth(2)
     h_good.SetMarkerStyle(20)
@@ -363,46 +438,66 @@ def _draw_ratio_canvas(ROOT, name: str, x_title: str, counts_good: np.ndarray, c
     h_bad.SetMarkerStyle(21)
     h_bad.SetMarkerColor(ROOT.kRed + 1)
 
-    chi2, ndf, pvalue = _chi2_ndf(ROOT, h_bad, h_good)
+    chi2, ndf, pvalue = _chi2_ndf(ROOT, safe_name, raw_bad, raw_good, lo, hi)
     if logger_ is not None:
         if ndf > 0:
-            logger_.info("  %-40s chi2/ndf = %.2f/%d = %.3f  (p=%.4f)", name, chi2, ndf, chi2 / ndf, pvalue)
+            logger_.info(
+                "  %-45s chi2/ndf = %.2f/%d = %.3f (p=%.4f)",
+                name, chi2, ndf, chi2 / ndf, pvalue,
+            )
         else:
-            logger_.info("  %-40s chi2/ndf: ndf=0 (too few bins with entries in both histograms)", name)
+            logger_.info("  %-45s chi2/ndf unavailable", name)
 
-    c = ROOT.TCanvas(f"c_{name}", name, 800, 700)
-    c.cd()
-    # TRatioPlot(h1, h2) plots ratio = h1 / h2 -- put bad first so the ratio
-    # panel reads bad/good (matches the ratio convention used elsewhere in
-    # these diagnostics: deviation from 1 = bad differs from good). Draw
-    # option "E" on both so the overlay shows Poisson error bars, not just
-    # outlines.
-    rp = ROOT.TRatioPlot(h_bad, h_good)
-    rp.SetH1DrawOpt("E")
-    rp.SetH2DrawOpt("E")
-    rp.Draw()
-    rp.GetLowerRefYaxis().SetTitle(f"{label_b}/{label_a}")
-    rp.GetUpperRefYaxis().SetTitle("entries")
-    rp.GetUpperPad().cd()
+    canvas = ROOT.TCanvas(f"c_{safe_name}", name, 800, 700)
+    ROOT.SetOwnership(canvas, False)
+    canvas.cd()
+
+    ratio_plot = ROOT.TRatioPlot(h_bad, h_good)
+    ROOT.SetOwnership(ratio_plot, False)
+    ratio_plot.SetH1DrawOpt("E")
+    ratio_plot.SetH2DrawOpt("E")
+    ratio_plot.Draw()
+
+    ratio_plot.GetLowerRefYaxis().SetTitle(f"{label_b}/{label_a}")
+    ratio_plot.GetUpperRefYaxis().SetTitle("fraction of entries")
+
+    ratio_plot.GetUpperPad().cd()
     legend = ROOT.TLegend(0.65, 0.72, 0.88, 0.88)
+    ROOT.SetOwnership(legend, False)
     legend.AddEntry(h_good, label_a, "lep")
     legend.AddEntry(h_bad, label_b, "lep")
     legend.Draw()
 
     chi2_text = ROOT.TLatex()
+    ROOT.SetOwnership(chi2_text, False)
     chi2_text.SetNDC(True)
     chi2_text.SetTextSize(0.045)
     if ndf > 0:
         chi2_text.DrawLatex(
-            0.15, 0.83, f"#chi^{{2}}/ndf = {chi2:.2f}/{ndf} = {chi2 / ndf:.2f}  (p = {pvalue:.3f})")
+            0.15,
+            0.83,
+            f"#chi^{{2}}/ndf = {chi2:.2f}/{ndf} = {chi2 / ndf:.2f} (p = {pvalue:.3f})",
+        )
     else:
-        chi2_text.DrawLatex(0.15, 0.83, "#chi^{2}/ndf: too few populated bins")
+        chi2_text.DrawLatex(0.15, 0.83, "#chi^{2}/ndf unavailable")
 
-    c.Update()
-    # Keep references alive on the canvas object so they aren't garbage
-    # collected before Write() -- ROOT/PyROOT ownership footgun.
-    c._keepalive = (h_good, h_bad, rp, legend, chi2_text)
-    return c
+    canvas.Modified()
+    canvas.Update()
+    canvas._keepalive = (h_good, h_bad, ratio_plot, legend, chi2_text)
+    return canvas
+
+def _write_and_close_canvas(canvas, key_name: str) -> bool:
+    """Write one canvas, then close it without letting PyROOT double-delete it."""
+    if canvas is None:
+        return False
+
+    canvas.Write(key_name, 2)  # TObject::kOverwrite
+    canvas.Close()
+
+    # ROOT owns/deletes the drawing objects. Their Python wrappers must not.
+    if hasattr(canvas, "_keepalive"):
+        del canvas._keepalive
+    return True
 
 
 def write_canvases(
@@ -418,53 +513,162 @@ def write_canvases(
     range_percentiles,
 ) -> int:
     import ROOT
-    ROOT.gROOT.SetBatch(True)
 
-    outfile = ROOT.TFile(output_path, "UPDATE")
+    ROOT.gROOT.SetBatch(True)
+    ROOT.TH1.AddDirectory(False)
+
+    outfile = ROOT.TFile.Open(output_path, "UPDATE")
+    if not outfile or outfile.IsZombie():
+        raise RuntimeError(f"Could not open ROOT output for canvas writing: {output_path}")
+
     n_canvases = 0
     keys = sorted(set(vals_a) | set(vals_b))
-    for (fname, b) in keys:
-        a = vals_a.get((fname, b), {"channel": np.empty(0), "std": np.empty(0), "raw": np.empty(0)})
-        bb = vals_b.get((fname, b), {"channel": np.empty(0), "std": np.empty(0), "raw": np.empty(0)})
-        for kind in ("raw", "standardized"):
-            src_key = "raw" if kind == "raw" else "std"
-            a_val, b_val = a[src_key], bb[src_key]
-            if a_val.size == 0 and b_val.size == 0:
-                continue
-            rng = _hist_range([a_val, b_val], range_mode, *range_percentiles)
-            lo, hi = rng
-            base_dir = f"canvases/{kind}/{fname}/bin{b}"
 
-            counts_a, _ = np.histogram(a_val, bins=bins, range=rng) if a_val.size else (np.zeros(bins), None)
-            counts_b, _ = np.histogram(b_val, bins=bins, range=rng) if b_val.size else (np.zeros(bins), None)
-            d = _get_or_make_dir(outfile, f"{base_dir}")
-            d.cd()
-            c = _draw_ratio_canvas(ROOT, "all_detector", f"{fname} bin{b} ({kind})",
-                                    counts_a, counts_b, lo, hi, label_a, label_b, logger_=logger)
-            c.Write("all_detector")
-            n_canvases += 1
+    try:
+        for fname, b in keys:
+            empty = {
+                "channel": np.empty(0, dtype=np.int64),
+                "std": np.empty(0, dtype=np.float32),
+                "raw": np.empty(0, dtype=np.float32),
+            }
+            a = vals_a.get((fname, b), empty)
+            bb = vals_b.get((fname, b), empty)
 
-            if a["channel"].size or bb["channel"].size:
-                planes = sorted(set(
-                    int(p) for p in plane_lut[np.clip(
-                        np.concatenate([a["channel"], bb["channel"]]).astype(np.int64), 0, n_channels - 1)]
-                    if p >= 0
-                ))
-                for p in planes:
-                    pa = a_val[plane_lut[np.clip(a["channel"], 0, n_channels - 1)] == p] if a["channel"].size else np.empty(0)
-                    pb = b_val[plane_lut[np.clip(bb["channel"], 0, n_channels - 1)] == p] if bb["channel"].size else np.empty(0)
-                    if pa.size == 0 and pb.size == 0:
-                        continue
-                    counts_pa, _ = np.histogram(pa, bins=bins, range=rng) if pa.size else (np.zeros(bins), None)
-                    counts_pb, _ = np.histogram(pb, bins=bins, range=rng) if pb.size else (np.zeros(bins), None)
-                    pd = _get_or_make_dir(outfile, f"{base_dir}/per_plane")
-                    pd.cd()
-                    cp = _draw_ratio_canvas(ROOT, f"plane{p}", f"{fname} bin{b} plane{p} ({kind})",
-                                             counts_pa, counts_pb, lo, hi, label_a, label_b, logger_=logger)
-                    cp.Write(f"plane{p}")
+            for kind in ("raw", "standardized"):
+                src_key = "raw" if kind == "raw" else "std"
+                a_val = np.asarray(a[src_key])
+                b_val = np.asarray(bb[src_key])
+
+                # A ratio requires entries on both sides. Histograms are still
+                # written by uproot even when only one side has data.
+                if a_val.size == 0 or b_val.size == 0:
+                    logger.warning(
+                        "Skipping %s/%s/bin%d canvases: %s values=%d, %s values=%d",
+                        kind,
+                        fname,
+                        b,
+                        label_a,
+                        a_val.size,
+                        label_b,
+                        b_val.size,
+                    )
+                    continue
+
+                rng = _hist_range([a_val, b_val], range_mode, *range_percentiles)
+                lo, hi = float(rng[0]), float(rng[1])
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    logger.warning(
+                        "Skipping %s/%s/bin%d canvases: invalid range [%s, %s]",
+                        kind,
+                        fname,
+                        b,
+                        lo,
+                        hi,
+                    )
+                    continue
+
+                counts_a, _ = np.histogram(a_val, bins=bins, range=(lo, hi))
+                counts_b, _ = np.histogram(b_val, bins=bins, range=(lo, hi))
+
+                if counts_a.sum() <= 0 or counts_b.sum() <= 0:
+                    logger.warning(
+                        "Skipping %s/%s/bin%d: one histogram is empty after binning",
+                        kind, fname, b,
+                    )
+                    continue
+
+                base_dir = f"canvases/{kind}/{fname}/bin{b}"
+                directory = _get_or_make_dir(outfile, base_dir)
+                directory.cd()
+
+                unique_name = f"{kind}_{fname}_bin{b}_all_detector"
+                canvas = _draw_ratio_canvas(
+                    ROOT,
+                    unique_name,
+                    f"{fname} bin {b} ({kind})",
+                    counts_a,
+                    counts_b,
+                    lo,
+                    hi,
+                    label_a,
+                    label_b,
+                    logger_=logger,
+                )
+                if _write_and_close_canvas(canvas, "all_detector"):
                     n_canvases += 1
 
-    outfile.Close()
+                channels = []
+                if np.asarray(a["channel"]).size:
+                    channels.append(np.asarray(a["channel"], dtype=np.int64))
+                if np.asarray(bb["channel"]).size:
+                    channels.append(np.asarray(bb["channel"], dtype=np.int64))
+                if not channels:
+                    continue
+
+                all_channels = np.clip(np.concatenate(channels), 0, n_channels - 1)
+                planes = sorted({int(p) for p in plane_lut[all_channels] if p >= 0})
+
+                for plane in planes:
+                    if np.asarray(a["channel"]).size:
+                        a_channels = np.asarray(a["channel"], dtype=np.int64)
+                        a_plane = plane_lut[np.clip(a_channels, 0, n_channels - 1)]
+                        pa = a_val[a_plane == plane]
+                    else:
+                        pa = np.empty(0, dtype=np.float32)
+
+                    if np.asarray(bb["channel"]).size:
+                        b_channels = np.asarray(bb["channel"], dtype=np.int64)
+                        b_plane = plane_lut[np.clip(b_channels, 0, n_channels - 1)]
+                        pb = b_val[b_plane == plane]
+                    else:
+                        pb = np.empty(0, dtype=np.float32)
+
+                    if pa.size == 0 or pb.size == 0:
+                        logger.warning(
+                            "Skipping %s/%s/bin%d/plane%d: %s values=%d, %s values=%d",
+                            kind,
+                            fname,
+                            b,
+                            plane,
+                            label_a,
+                            pa.size,
+                            label_b,
+                            pb.size,
+                        )
+                        continue
+
+                    counts_pa, _ = np.histogram(pa, bins=bins, range=(lo, hi))
+                    counts_pb, _ = np.histogram(pb, bins=bins, range=(lo, hi))
+
+                    plane_dir = _get_or_make_dir(outfile, f"{base_dir}/per_plane")
+                    plane_dir.cd()
+
+                    unique_plane_name = f"{kind}_{fname}_bin{b}_plane{plane}"
+                    plane_canvas = _draw_ratio_canvas(
+                        ROOT,
+                        unique_plane_name,
+                        f"{fname} bin {b} plane {plane} ({kind})",
+                        counts_pa,
+                        counts_pb,
+                        lo,
+                        hi,
+                        label_a,
+                        label_b,
+                        logger_=logger,
+                    )
+                    if _write_and_close_canvas(plane_canvas, f"plane{plane}"):
+                        n_canvases += 1
+
+        outfile.cd()
+        outfile.Write("", 2)
+    finally:
+        # Prevent gPad from retaining a pointer to a canvas that was closed.
+        try:
+            ROOT.gROOT.SetSelectedPad(0)
+        except Exception:
+            pass
+        outfile.Close()
+
     return n_canvases
 
 
@@ -496,6 +700,19 @@ def compare(
 
     ds_a, ds_b = build_datasets(file_a, file_b, config, standardization, channel_map, n_channels)
     n_channels = n_channels or ds_a.num_nodes
+
+    if len(ds_a) == 0:
+        logger.warning(
+            "Dataset A produces zero windows. Its histograms will be empty and "
+            "all ratio canvases will be skipped. Check that the file contains "
+            "at least data.window_size events."
+        )
+    if len(ds_b) == 0:
+        logger.warning(
+            "Dataset B produces zero windows. Its histograms will be empty and "
+            "all ratio canvases will be skipped. Check that the file contains "
+            "at least data.window_size events."
+        )
 
     if ds_a._planes_flat is not None:
         plane_lut = _channel_to_plane_lut(ds_a._channels_flat, ds_a._planes_flat, n_channels)
