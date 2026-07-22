@@ -238,6 +238,52 @@ touching the loss function. If it does show a persistent gap, that points at
 a plane-balanced loss (mean of per-plane means instead of one global mean)
 rather than more features or a bigger model.
 
+## check_plane_information_content.py
+
+Checks a fifth hypothesis, distinct from the standardization/loss-weighting
+ones above: collection is often the best-calibrated, lowest-noise plane in
+SBND, but that can come with **fewer hits per channel per window** than
+induction. Per-plane standardization corrects for a plane's absolute
+mean/std, but not for *why* that std is what it is — if a channel only sees
+a handful of hits per window, its window-level statistics (count, occupancy,
+mean-of-hit-integral) are themselves noisy estimates from small sample size
+(shot noise), and standardization just divides by that inflated noise floor.
+The same absolute anomaly deviation then buys fewer standard deviations on
+that plane, purely from statistics, not from any bug.
+
+This tests both halves directly from a good-run events npz, no
+model/checkpoint/torch required:
+
+- **Premise** — does this plane actually see fewer hits/window? (median
+  hits/window, occupancy, per plane)
+- **Mechanism** — is a channel's window-to-window hit-count variance close to
+  pure Poisson shot noise at its own rate, or is there real structure above
+  that floor? For hits arriving at window-level rate `lambda`, Poisson
+  statistics alone predict `CV_theory = 1/sqrt(lambda)`; the ratio
+  `CV_observed / CV_theory` near `1.0` means the variance standardization
+  divides by is mostly irreducible counting noise, not genuine signal.
+
+```bash
+python scripts/check_plane_information_content.py \
+    --events data/good_events_val.npz \
+    --window-size 100 --stride 100 \
+    --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv
+```
+Or pass `--config configs/graph_vae.yaml` to pick up `window_size`/`stride`/
+`channel_map` from its `data` section instead of specifying them by hand.
+Plane comes from `planes_flat` in the events npz if present, otherwise
+`--channel-map`. `--output-csv` dumps the full per-channel table
+(`mean_count`, `occupancy`, `cv_count_observed`, `cv_count_theory`, `ratio`,
+plus the same for window-summed integral as context).
+
+**If a plane has both the fewest hits/window and a near-1.0 ratio:** that
+supports the hypothesis. The fix isn't more features or architecture — try a
+larger `data.window_size` (more hits to average per window, at the cost of
+time resolution) and/or a per-plane anomaly threshold instead of comparing
+that plane's raw score against a single global one, since a real degradation
+there may only ever produce a modest absolute rise even once everything else
+is working correctly.
+
 ## Other scripts
 
 | Script | Purpose |
