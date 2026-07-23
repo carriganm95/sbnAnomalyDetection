@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+import argparse
 import re
 
 import numpy as np
@@ -13,7 +14,7 @@ import numpy as np
 # ============================================================
 
 INPUT_DIR = Path(
-    "/exp/sbnd/data/users/micarrig/DQM/tpc_data_v3"
+    "/exp/sbnd/data/users/micarrig/DQM/"
 )
 
 OUTPUT_DIR = Path(
@@ -419,11 +420,29 @@ class OutputAccumulator:
         return output
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Split non-bad NPZ events into good_runs.npz and "
+            "windows_train.npz. Bad NPZ files are only combined and written "
+            "when --with-bad is supplied."
+        )
+    )
+    parser.add_argument(
+        "--with-bad",
+        action="store_true",
+        help="Also combine configured bad source files into bad_runs.npz.",
+    )
+    return parser.parse_args()
+
+
 # ============================================================
 # Main
 # ============================================================
 
 def main() -> None:
+    args = parse_args()
+
     if not INPUT_DIR.is_dir():
         raise FileNotFoundError(
             f"Input directory does not exist: {INPUT_DIR}"
@@ -439,10 +458,10 @@ def main() -> None:
         raise RuntimeError(
             f"No non-bad input files were found in {INPUT_DIR}"
         )
-    if not bad_input_files:
+    if args.with_bad and not bad_input_files:
         raise RuntimeError(
-            "None of the configured BAD_FILE_NUMBERS were found in "
-            f"{INPUT_DIR}"
+            "--with-bad was requested, but none of the configured "
+            f"BAD_FILE_NUMBERS were found in {INPUT_DIR}"
         )
 
     missing_bad_file_numbers = sorted(
@@ -454,20 +473,24 @@ def main() -> None:
     print(f"Found {len(input_files)} non-bad input files.")
     print(f"First non-bad file: {input_files[0].name}")
     print(f"Last non-bad file:  {input_files[-1].name}")
-    print(f"Found {len(bad_input_files)} bad input files.")
-    print("Bad files:")
-    for path in bad_input_files:
-        print(f"  {path.name}")
+    if args.with_bad:
+        print(f"Found {len(bad_input_files)} bad input files.")
+        print("Bad files:")
+        for path in bad_input_files:
+            print(f"  {path.name}")
 
-    if missing_bad_file_numbers:
-        print(
-            "Warning: configured bad file numbers not found: "
-            + ", ".join(str(number) for number in missing_bad_file_numbers)
-        )
+        if missing_bad_file_numbers:
+            print(
+                "Warning: configured bad file numbers not found: "
+                + ", ".join(str(number) for number in missing_bad_file_numbers)
+            )
+    else:
+        print("Bad NPZ output disabled; use --with-bad to enable it.")
     print(f"good_runs fraction:     {GOOD_RUNS_FRACTION:.2%}")
     print(f"windows_train fraction: {1.0 - GOOD_RUNS_FRACTION:.2%}")
     print(f"Good-runs output: {GOOD_RUNS_PATH}")
-    print(f"Bad-runs output:  {BAD_RUNS_PATH}")
+    if args.with_bad:
+        print(f"Bad-runs output:  {BAD_RUNS_PATH}")
     print(f"Training output:  {WINDOWS_TRAIN_PATH}")
     print()
 
@@ -690,75 +713,78 @@ def main() -> None:
             f"first-pass count {total_eligible_events:,}."
         )
 
-    print()
-    print("Collecting bad files...")
+    bad_output: Optional[OutputAccumulator] = None
 
-    bad_output = OutputAccumulator("bad_runs")
+    if args.with_bad:
+        print()
+        print("Collecting bad files...")
 
-    for display_index, path in enumerate(bad_input_files, start=1):
-        file_number = extract_file_number(path)
-        print(
-            f"[{display_index}/{len(bad_input_files)}] "
-            f"Loading bad file {path.name}"
-        )
+        bad_output = OutputAccumulator("bad_runs")
 
-        with np.load(path, allow_pickle=True) as data:
-            keys = set(data.files)
+        for display_index, path in enumerate(bad_input_files, start=1):
+            file_number = extract_file_number(path)
+            print(
+                f"[{display_index}/{len(bad_input_files)}] "
+                f"Loading bad file {path.name}"
+            )
 
-            if "offsets" not in keys:
-                raise KeyError(
-                    f"{path.name} does not contain required array 'offsets'."
+            with np.load(path, allow_pickle=True) as data:
+                keys = set(data.files)
+
+                if "offsets" not in keys:
+                    raise KeyError(
+                        f"{path.name} does not contain required array 'offsets'."
+                    )
+
+                offsets = np.asarray(data["offsets"], dtype=np.int64)
+                n_events, n_flat_entries = validate_offsets(path, offsets)
+
+                flat_keys = keys.intersection(FLAT_KEYS)
+                event_keys = keys.intersection(EVENT_KEYS)
+                scalar_keys = keys.intersection(SCALAR_KEYS)
+
+                for key in sorted(flat_keys):
+                    array = np.asarray(data[key])
+                    if array.ndim == 0 or array.shape[0] != n_flat_entries:
+                        raise ValueError(
+                            f"{path.name}: flat array '{key}' has shape "
+                            f"{array.shape}; expected first dimension "
+                            f"{n_flat_entries:,}."
+                        )
+
+                for key in sorted(event_keys):
+                    array = np.asarray(data[key])
+                    if array.ndim == 0 or array.shape[0] != n_events:
+                        raise ValueError(
+                            f"{path.name}: event array '{key}' has shape "
+                            f"{array.shape}; expected first dimension "
+                            f"{n_events:,}."
+                        )
+
+                all_event_indices = np.arange(n_events, dtype=np.int64)
+
+                bad_output.add_selected_events(
+                    path=path,
+                    file_number=file_number,
+                    data=data,
+                    offsets=offsets,
+                    event_indices=all_event_indices,
+                    flat_keys=flat_keys,
+                    event_keys=event_keys,
+                    scalar_keys=scalar_keys,
                 )
 
-            offsets = np.asarray(data["offsets"], dtype=np.int64)
-            n_events, n_flat_entries = validate_offsets(path, offsets)
-
-            flat_keys = keys.intersection(FLAT_KEYS)
-            event_keys = keys.intersection(EVENT_KEYS)
-            scalar_keys = keys.intersection(SCALAR_KEYS)
-
-            for key in sorted(flat_keys):
-                array = np.asarray(data[key])
-                if array.ndim == 0 or array.shape[0] != n_flat_entries:
-                    raise ValueError(
-                        f"{path.name}: flat array '{key}' has shape "
-                        f"{array.shape}; expected first dimension "
-                        f"{n_flat_entries:,}."
-                    )
-
-            for key in sorted(event_keys):
-                array = np.asarray(data[key])
-                if array.ndim == 0 or array.shape[0] != n_events:
-                    raise ValueError(
-                        f"{path.name}: event array '{key}' has shape "
-                        f"{array.shape}; expected first dimension "
-                        f"{n_events:,}."
-                    )
-
-            all_event_indices = np.arange(n_events, dtype=np.int64)
-
-            bad_output.add_selected_events(
-                path=path,
-                file_number=file_number,
-                data=data,
-                offsets=offsets,
-                event_indices=all_event_indices,
-                flat_keys=flat_keys,
-                event_keys=event_keys,
-                scalar_keys=scalar_keys,
-            )
-
-            print(
-                f"    bad_runs={n_events:,} events, "
-                f"{n_flat_entries:,} flat entries"
-            )
+                print(
+                    f"    bad_runs={n_events:,} events, "
+                    f"{n_flat_entries:,} flat entries"
+                )
 
     print()
     print("Combining arrays...")
 
     good_npz = good_output.make_output(GOOD_RUNS_FRACTION)
     train_npz = train_output.make_output(GOOD_RUNS_FRACTION)
-    bad_npz = bad_output.make_output(None)
+    bad_npz = bad_output.make_output(None) if bad_output is not None else None
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -768,8 +794,9 @@ def main() -> None:
     print(f"Writing {WINDOWS_TRAIN_PATH}...")
     np.savez_compressed(WINDOWS_TRAIN_PATH, **train_npz)
 
-    print(f"Writing {BAD_RUNS_PATH}...")
-    np.savez_compressed(BAD_RUNS_PATH, **bad_npz)
+    if bad_npz is not None:
+        print(f"Writing {BAD_RUNS_PATH}...")
+        np.savez_compressed(BAD_RUNS_PATH, **bad_npz)
 
     print()
     print("Finished.")
@@ -783,13 +810,15 @@ def main() -> None:
         f"{train_output.total_flat_entries:,} flat entries, "
         f"{len(train_output.loaded_filenames):,} contributing files"
     )
-    print(
-        f"bad_runs.npz:      {bad_output.total_events:,} events, "
-        f"{bad_output.total_flat_entries:,} flat entries, "
-        f"{len(bad_output.loaded_filenames):,} contributing files"
-    )
+    if bad_output is not None:
+        print(
+            f"bad_runs.npz:      {bad_output.total_events:,} events, "
+            f"{bad_output.total_flat_entries:,} flat entries, "
+            f"{len(bad_output.loaded_filenames):,} contributing files"
+        )
     print(f"Good-runs output: {GOOD_RUNS_PATH}")
-    print(f"Bad-runs output:  {BAD_RUNS_PATH}")
+    if args.with_bad:
+        print(f"Bad-runs output:  {BAD_RUNS_PATH}")
     print(f"Training output:  {WINDOWS_TRAIN_PATH}")
 
 
