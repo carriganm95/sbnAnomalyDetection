@@ -107,7 +107,7 @@ def list_common_events(
     hits_file: str,
     tree_name: str = "caloskim/TrackCaloSkim",
     raw_tree_name: str = "rawdigits",
-    hits_meta_branches=("meta.run", "meta.subrun", "meta.evt"),
+    hits_meta_branches=("trk/meta/meta.run", "trk/meta/meta.subrun", "trk/meta/meta.evt"),
 ):
     """(run, subrun, event) triples present in BOTH files, sorted.
 
@@ -139,12 +139,15 @@ def list_common_events(
             raise ValueError(
                 f"Missing meta branch(es) {missing} in {hits_file} -- run with --list-branches to see "
                 f"what '{tree_name}' actually has, then pass the real names via --meta-branches.")
-        hit_arrs = tree.arrays(list(hits_meta_branches), library="np")
-    hits_events = set(zip(
-        hit_arrs[hits_meta_branches[0]].tolist(),
-        hit_arrs[hits_meta_branches[1]].tolist(),
-        hit_arrs[hits_meta_branches[2]].tolist(),
-    ))
+        # Read each branch individually (tree[name].array(...)) rather than a
+        # batched tree.arrays([...]) dict lookup -- for a deeply-nested branch
+        # (e.g. "trk/meta/meta.run") it's not safe to assume the returned
+        # dict is keyed by the full search path rather than the branch's own
+        # bare name. Indexing tree[...] directly sidesteps that ambiguity.
+        run_arr = tree[hits_meta_branches[0]].array(library="np")
+        subrun_arr = tree[hits_meta_branches[1]].array(library="np")
+        evt_arr = tree[hits_meta_branches[2]].array(library="np")
+    hits_events = set(zip(run_arr.tolist(), subrun_arr.tolist(), evt_arr.tolist()))
 
     common = sorted(raw_events & hits_events)
     return common, len(raw_events - hits_events), len(hits_events - raw_events)
@@ -176,21 +179,57 @@ def list_hits_tree_branches(hits_file: str, tree_name: str) -> None:
 
 
 def find_raw_event(raw_file: str, run: Optional[int], subrun: Optional[int], event: Optional[int],
-                    event_index: Optional[int] = None):
+                    event_index: Optional[int] = None, tree_name: str = "rawdigits"):
     """Return the matching RawEvent from --raw-file (by run/subrun/event, or
     by simple entry index if event_index is given instead).
-    """
-    from sbn_anomaly.data.raw_digit_reader import RawDigitReader
 
-    reader = RawDigitReader(raw_file)
-    for i, ev in enumerate(reader):
+    Deliberately does NOT use RawDigitReader's default chunked iteration
+    (step_size=64) here: that reads up to 64 FULL (nchan, nticks) events'
+    adc arrays into memory per chunk just to scan for one match, which for
+    SBND (~11k channels x thousands of ticks) is easily several GB per
+    chunk -- the likely cause of this script getting OOM-killed. Instead:
+    read only the small run/subrun/event scalar branches for the whole tree
+    first (a few bytes/entry, cheap even on a huge file) to find the
+    matching entry index, then do a single targeted entry_start/entry_stop
+    read of just that ONE entry's channel/pedestal/adc branches.
+    """
+    import uproot
+
+    from sbn_anomaly.data.raw_digit_reader import RawEvent, _reshape_adc
+
+    with uproot.open(raw_file) as f:
+        if tree_name not in f:
+            raise ValueError(f"Tree '{tree_name}' not found in {raw_file}")
+        tree = f[tree_name]
+
         if event_index is not None:
-            if i == event_index:
-                return ev
-        elif ev.run == run and ev.subrun == subrun and ev.event == event:
-            return ev
-    where = f"event_index={event_index}" if event_index is not None else f"run={run} subrun={subrun} event={event}"
-    raise ValueError(f"No matching event ({where}) found in {raw_file}")
+            idx = event_index
+        else:
+            scalars = tree.arrays(["run", "subrun", "event"], library="np")
+            matches = np.where(
+                (scalars["run"] == run) & (scalars["subrun"] == subrun) & (scalars["event"] == event)
+            )[0]
+            if matches.size == 0:
+                where = f"run={run} subrun={subrun} event={event}"
+                raise ValueError(f"No matching event ({where}) found in {raw_file}")
+            idx = int(matches[0])
+
+        chunk = tree.arrays(
+            ["run", "subrun", "event", "nchan", "nticks", "channel", "pedestal", "adc"],
+            entry_start=idx, entry_stop=idx + 1, library="np",
+        )
+        if len(chunk["run"]) == 0:
+            raise ValueError(f"No matching event (event_index={event_index}) found in {raw_file}")
+
+        nchan = int(chunk["nchan"][0])
+        nticks = int(chunk["nticks"][0])
+        adc = _reshape_adc(chunk["adc"][0], nchan, nticks)
+        return RawEvent(
+            run=int(chunk["run"][0]), subrun=int(chunk["subrun"][0]), event=int(chunk["event"][0]),
+            channel=np.asarray(chunk["channel"][0], dtype=np.int32),
+            pedestal=np.asarray(chunk["pedestal"][0], dtype=np.float32),
+            adc=adc,
+        )
 
 
 def compute_hit_amplitude(integral: float, width: float, stored_amplitude: Optional[float]) -> float:
@@ -212,7 +251,7 @@ def load_hits_for_event(
     subrun: Optional[int],
     event: Optional[int],
     event_index: Optional[int] = None,
-    meta_branches=("meta.run", "meta.subrun", "meta.evt"),
+    meta_branches=("trk/meta/meta.run", "trk/meta/meta.subrun", "trk/meta/meta.evt"),
 ) -> Dict[int, list]:
     """Return {channel: [hit dict, ...]} for one entry of --hits-file.
 
@@ -251,11 +290,17 @@ def load_hits_for_event(
                     f"Missing meta branch(es) {missing_meta} in {hits_file} -- run with "
                     f"--list-branches to see what '{tree_name}' actually has, then pass the real "
                     f"names via --meta-branches (or use --event-index instead)")
-            meta = tree.arrays(list(meta_branches), library="np")
+            # Read each meta branch individually (tree[name].array(...))
+            # rather than a batched tree.arrays([...]) dict lookup -- see
+            # list_common_events for why: for a deeply-nested branch (e.g.
+            # "trk/meta/meta.run") it's not safe to assume the returned dict
+            # is keyed by the full search path rather than the branch's own
+            # bare name.
+            run_arr = tree[meta_branches[0]].array(library="np")
+            subrun_arr = tree[meta_branches[1]].array(library="np")
+            evt_arr = tree[meta_branches[2]].array(library="np")
             matches = np.where(
-                (meta[meta_branches[0]] == run)
-                & (meta[meta_branches[1]] == subrun)
-                & (meta[meta_branches[2]] == event)
+                (run_arr == run) & (subrun_arr == subrun) & (evt_arr == event)
             )[0]
             if matches.size == 0:
                 raise ValueError(f"run={run} subrun={subrun} event={event} not found in {hits_file}")
@@ -403,7 +448,7 @@ def run(
     activity_nsigma: float,
     all_channels: bool,
     channel_range: Optional[tuple],
-    meta_branches=("meta.run", "meta.subrun", "meta.evt"),
+    meta_branches=("trk/meta/meta.run", "trk/meta/meta.subrun", "trk/meta/meta.evt"),
 ) -> None:
     import ROOT
     ROOT.gROOT.SetBatch(True)
@@ -470,10 +515,12 @@ def _parse_args(argv):
     ap.add_argument("--list-branches", action="store_true",
                      help="Print every branch (recursive) in --tree-name of --hits-file, then exit -- "
                           "use this if --tree-name/--meta-branches don't match what's actually in the file")
-    ap.add_argument("--meta-branches", nargs=3, default=["meta.run", "meta.subrun", "meta.evt"],
+    ap.add_argument("--meta-branches", nargs=3,
+                     default=["trk/meta/meta.run", "trk/meta/meta.subrun", "trk/meta/meta.evt"],
                      metavar=("RUN_BRANCH", "SUBRUN_BRANCH", "EVENT_BRANCH"),
                      help="Per-event provenance branch names in --hits-file, in run/subrun/event order "
-                          "(default matches SBND caloskim: meta.run meta.subrun meta.evt)")
+                          "(default matches observed SBND caloskim layout: nested two levels under "
+                          "'trk/meta/...'; override with --list-branches output if your file differs)")
     ap.add_argument("--output", default=None, help="Required unless --list-events/--list-branches is given")
     ap.add_argument("--tree-name", default="caloskim/TrackCaloSkim")
     ap.add_argument("--hit-branches", nargs="+",
