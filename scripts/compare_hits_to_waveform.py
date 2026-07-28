@@ -129,9 +129,16 @@ def list_common_events(
         if tree_name not in hf:
             raise ValueError(f"Tree '{tree_name}' not found in {hits_file}")
         tree = hf[tree_name]
-        missing = [b for b in hits_meta_branches if b not in set(tree.keys())]
+        # recursive=True: meta.run/meta.subrun/meta.evt are nested UNDER a
+        # parent branch (e.g. "trk"), not top-level themselves -- a
+        # non-recursive tree.keys() misses them entirely even though
+        # tree.arrays([...]) can address them fine by their own branch name.
+        available = set(tree.keys(recursive=True))
+        missing = [b for b in hits_meta_branches if b not in available]
         if missing:
-            raise ValueError(f"Missing meta branch(es) {missing} in {hits_file}")
+            raise ValueError(
+                f"Missing meta branch(es) {missing} in {hits_file} -- run with --list-branches to see "
+                f"what '{tree_name}' actually has, then pass the real names via --meta-branches.")
         hit_arrs = tree.arrays(list(hits_meta_branches), library="np")
     hits_events = set(zip(
         hit_arrs[hits_meta_branches[0]].tolist(),
@@ -141,6 +148,31 @@ def list_common_events(
 
     common = sorted(raw_events & hits_events)
     return common, len(raw_events - hits_events), len(hits_events - raw_events)
+
+
+def list_hits_tree_branches(hits_file: str, tree_name: str) -> None:
+    """Print the top-level keys in --hits-file, and every branch (recursive
+    -- includes branches nested under a parent branch like "trk", which a
+    shallow listing misses) in --tree-name if it's found there.
+    """
+    import uproot
+
+    with uproot.open(hits_file) as f:
+        top = sorted(f.keys(recursive=False))
+        print(f"Top-level key(s) in {hits_file}:")
+        for k in top:
+            print(f"  {k}")
+
+        if tree_name in f:
+            names = sorted(f[tree_name].keys(recursive=True))
+            print(f"\n{len(names)} branch(es) in tree '{tree_name}' (recursive):")
+            for n in names:
+                print(f"  {n}")
+        else:
+            print(f"\nTree '{tree_name}' not found directly under a top-level key. "
+                  f"Every nested key (recursive) -- look for the real tree path:")
+            for k in sorted(f.keys(recursive=True)):
+                print(f"  {k}")
 
 
 def find_raw_event(raw_file: str, run: Optional[int], subrun: Optional[int], event: Optional[int],
@@ -206,15 +238,19 @@ def load_hits_for_event(
         if tree_name not in f:
             raise ValueError(f"Tree '{tree_name}' not found in {hits_file}")
         tree = f[tree_name]
-        available = set(tree.keys())
+        # recursive=True -- see list_common_events for why (branches nested
+        # under a parent like "trk" are invisible to a shallow scan).
+        available = set(tree.keys(recursive=True))
 
         if event_index is not None:
             idx = event_index
         else:
             missing_meta = [b for b in meta_branches if b not in available]
             if missing_meta:
-                raise ValueError(f"Missing meta branches {missing_meta} in {hits_file} -- "
-                                  f"use --event-index instead of --run/--subrun/--event")
+                raise ValueError(
+                    f"Missing meta branch(es) {missing_meta} in {hits_file} -- run with "
+                    f"--list-branches to see what '{tree_name}' actually has, then pass the real "
+                    f"names via --meta-branches (or use --event-index instead)")
             meta = tree.arrays(list(meta_branches), library="np")
             matches = np.where(
                 (meta[meta_branches[0]] == run)
@@ -367,6 +403,7 @@ def run(
     activity_nsigma: float,
     all_channels: bool,
     channel_range: Optional[tuple],
+    meta_branches=("meta.run", "meta.subrun", "meta.evt"),
 ) -> None:
     import ROOT
     ROOT.gROOT.SetBatch(True)
@@ -378,7 +415,8 @@ def run(
 
     logger.info("Looking up matching hits in %s ...", hits_file)
     hits_by_channel = load_hits_for_event(
-        hits_file, tree_name, hit_branches, raw_event.run, raw_event.subrun, raw_event.event, event_index)
+        hits_file, tree_name, hit_branches, raw_event.run, raw_event.subrun, raw_event.event, event_index,
+        meta_branches=meta_branches)
     total_hits = sum(len(v) for v in hits_by_channel.values())
     logger.info("Found %d hits across %d channels for this event", total_hits, len(hits_by_channel))
 
@@ -429,7 +467,14 @@ def _parse_args(argv):
     ap.add_argument("--list-events", action="store_true",
                      help="Print every (run, subrun, event) common to --raw-file and --hits-file, then exit "
                           "without drawing anything -- use this to pick --run/--subrun/--event")
-    ap.add_argument("--output", default=None, help="Required unless --list-events is given")
+    ap.add_argument("--list-branches", action="store_true",
+                     help="Print every branch (recursive) in --tree-name of --hits-file, then exit -- "
+                          "use this if --tree-name/--meta-branches don't match what's actually in the file")
+    ap.add_argument("--meta-branches", nargs=3, default=["meta.run", "meta.subrun", "meta.evt"],
+                     metavar=("RUN_BRANCH", "SUBRUN_BRANCH", "EVENT_BRANCH"),
+                     help="Per-event provenance branch names in --hits-file, in run/subrun/event order "
+                          "(default matches SBND caloskim: meta.run meta.subrun meta.evt)")
+    ap.add_argument("--output", default=None, help="Required unless --list-events/--list-branches is given")
     ap.add_argument("--tree-name", default="caloskim/TrackCaloSkim")
     ap.add_argument("--hit-branches", nargs="+",
                      default=["hits0.h.integral", "hits0.h.channel",
@@ -451,8 +496,15 @@ def main(argv=None):
     args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    if args.list_branches:
+        list_hits_tree_branches(args.hits_file, args.tree_name)
+        return
+
+    meta_branches = tuple(args.meta_branches)
+
     if args.list_events:
-        common, n_only_raw, n_only_hits = list_common_events(args.raw_file, args.hits_file, args.tree_name)
+        common, n_only_raw, n_only_hits = list_common_events(
+            args.raw_file, args.hits_file, args.tree_name, hits_meta_branches=meta_branches)
         print(f"{len(common)} event(s) present in BOTH files "
               f"({n_only_raw} only in --raw-file, {n_only_hits} only in --hits-file):")
         for i, (r, s, e) in enumerate(common):
@@ -472,7 +524,8 @@ def main(argv=None):
     if not have_explicit and event_index is None:
         logger.info("No --run/--subrun/--event or --event-index given -- looking up the first "
                     "event common to both files ...")
-        common, _, _ = list_common_events(args.raw_file, args.hits_file, args.tree_name)
+        common, _, _ = list_common_events(
+            args.raw_file, args.hits_file, args.tree_name, hits_meta_branches=meta_branches)
         if not common:
             raise SystemExit(f"No events are common to {args.raw_file} and {args.hits_file} -- "
                               f"nothing to draw. Re-run with --list-events to inspect both files.")
@@ -483,13 +536,14 @@ def main(argv=None):
             run_, subrun, event, len(common))
 
     if not args.output:
-        raise SystemExit("--output is required (unless --list-events is given)")
+        raise SystemExit("--output is required (unless --list-events/--list-branches is given)")
 
     run(
         raw_file=args.raw_file, hits_file=args.hits_file, output=args.output,
         run_=run_, subrun=subrun, event=event, event_index=event_index,
         tree_name=args.tree_name, hit_branches=args.hit_branches,
         remove_coherent=args.remove_coherent, coherent_group_size=args.coherent_group_size,
+        meta_branches=meta_branches,
         activity_nsigma=args.activity_nsigma, all_channels=args.all_channels,
         channel_range=tuple(args.channel_range) if args.channel_range else None,
     )
