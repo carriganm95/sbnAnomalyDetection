@@ -253,12 +253,25 @@ def load_hits_for_event(
     event_index: Optional[int] = None,
     meta_branches=("trk/meta/meta.run", "trk/meta/meta.subrun", "trk/meta/meta.evt"),
 ) -> Dict[int, list]:
-    """Return {channel: [hit dict, ...]} for one entry of --hits-file.
+    """Return {channel: [hit dict, ...]} for --hits-file's run/subrun/event.
 
     Each hit dict has time/width/integral/amplitude/plane. Reads the small
     per-event meta branches first (cheap, whole tree) to find the matching
-    entry index, then reads only that single entry's (jagged) hit branches
-    -- avoids loading the full tree into memory for a one-event lookup.
+    entry index/indices, then reads only those entries' (jagged) hit
+    branches -- avoids loading the full tree into memory for a one-event
+    lookup.
+
+    IMPORTANT: this tree is one row per reconstructed TRACK (see the
+    "trk/meta/..." branch nesting), not one row per event -- an event with
+    N tracks has N entries sharing the same run/subrun/event. All matching
+    entries are merged (not just the first), otherwise only the first
+    track's hits would be used, silently dropping every other track's hits
+    for that event. Exact-duplicate hits (same channel/time/integral/width,
+    which can happen if a hit is shared between tracks) are collapsed to
+    one. Note this still can't recover hits NOT associated with any track
+    (e.g. isolated/unclustered hits), if this ntuple only stores
+    track-associated ones -- check hit counts here against the full
+    per-plane hit collection if you need an exhaustive comparison.
     """
     import awkward as ak
     import uproot
@@ -282,7 +295,7 @@ def load_hits_for_event(
         available = set(tree.keys(recursive=True))
 
         if event_index is not None:
-            idx = event_index
+            idx_list = [event_index]
         else:
             missing_meta = [b for b in meta_branches if b not in available]
             if missing_meta:
@@ -304,37 +317,50 @@ def load_hits_for_event(
             )[0]
             if matches.size == 0:
                 raise ValueError(f"run={run} subrun={subrun} event={event} not found in {hits_file}")
-            idx = int(matches[0])
+            idx_list = matches.tolist()
+            if len(idx_list) > 1:
+                logger.info(
+                    "%d entries in %s match run=%d subrun=%d event=%d (one row per track, not per "
+                    "event) -- merging hits from all %d tracks",
+                    len(idx_list), hits_file, run, subrun, event, len(idx_list))
 
         have_amp = bool(amp_b) and all(b in available for b in amp_b)
         needed = list(set(integral_b + channel_b + time_b + plane_b + width_b + (amp_b if have_amp else [])))
-        chunk = tree.arrays(needed, entry_start=idx, entry_stop=idx + 1, library="ak")
+        lo, hi = min(idx_list), max(idx_list) + 1
+        chunk = tree.arrays(needed, entry_start=lo, entry_stop=hi, library="ak")
+        rel_idxs = [i - lo for i in idx_list]
 
         hits_by_channel: Dict[int, list] = {}
+        seen: set = set()  # (channel, time, integral, width) -- collapse hits shared by >1 track row
         for pfx_idx, (ib, cb, tb, pb, wb) in enumerate(zip(integral_b, channel_b, time_b, plane_b, width_b)):
-            try:
-                integrals = ak.to_numpy(ak.flatten(chunk[ib][0], axis=None)).astype(np.float64)
-                channels = ak.to_numpy(ak.flatten(chunk[cb][0], axis=None)).astype(np.int64)
-                times = ak.to_numpy(ak.flatten(chunk[tb][0], axis=None)).astype(np.float64)
-                planes = ak.to_numpy(ak.flatten(chunk[pb][0], axis=None)).astype(np.int64)
-                widths = ak.to_numpy(ak.flatten(chunk[wb][0], axis=None)).astype(np.float64)
-            except Exception:
-                continue
-            amps = None
-            if have_amp:
-                amps = ak.to_numpy(ak.flatten(chunk[amp_b[pfx_idx]][0], axis=None)).astype(np.float64)
-            m = min(len(integrals), len(channels), len(times), len(planes), len(widths))
-            for i in range(m):
-                c = int(channels[i])
-                if c < 0:
+            for rel in rel_idxs:
+                try:
+                    integrals = ak.to_numpy(ak.flatten(chunk[ib][rel], axis=None)).astype(np.float64)
+                    channels = ak.to_numpy(ak.flatten(chunk[cb][rel], axis=None)).astype(np.int64)
+                    times = ak.to_numpy(ak.flatten(chunk[tb][rel], axis=None)).astype(np.float64)
+                    planes = ak.to_numpy(ak.flatten(chunk[pb][rel], axis=None)).astype(np.int64)
+                    widths = ak.to_numpy(ak.flatten(chunk[wb][rel], axis=None)).astype(np.float64)
+                except Exception:
                     continue
-                width = float(widths[i])
-                stored_amp = float(amps[i]) if amps is not None and i < len(amps) else None
-                hits_by_channel.setdefault(c, []).append(dict(
-                    time=float(times[i]), width=width, integral=float(integrals[i]),
-                    amplitude=compute_hit_amplitude(float(integrals[i]), width, stored_amp),
-                    plane=int(planes[i]),
-                ))
+                amps = None
+                if have_amp:
+                    amps = ak.to_numpy(ak.flatten(chunk[amp_b[pfx_idx]][rel], axis=None)).astype(np.float64)
+                m = min(len(integrals), len(channels), len(times), len(planes), len(widths))
+                for i in range(m):
+                    c = int(channels[i])
+                    if c < 0:
+                        continue
+                    width = float(widths[i])
+                    key = (c, float(times[i]), float(integrals[i]), width)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    stored_amp = float(amps[i]) if amps is not None and i < len(amps) else None
+                    hits_by_channel.setdefault(c, []).append(dict(
+                        time=float(times[i]), width=width, integral=float(integrals[i]),
+                        amplitude=compute_hit_amplitude(float(integrals[i]), width, stored_amp),
+                        plane=int(planes[i]),
+                    ))
         return hits_by_channel
 
 
