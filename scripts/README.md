@@ -438,6 +438,75 @@ first, then a small real transfer, before mirroring the full dataset.
 | `--dry-run` | off | Print what would be copied / the exact `xrdcp` commands, copy nothing |
 | `--max-workers` | `4` | Parallel `xrdcp` transfers |
 
+## compare_hits_to_waveform.py
+
+Overlays hit-finder Gaussian fits on raw ADC waveforms, per channel, for one
+event — a direct visual check of how well hit-finding is performing. Takes
+two files describing the *same* event from two stages of the pipeline,
+matched by run/subrun/event:
+
+- `--raw-file` — the flat `rawdigits` ntuple from `dump_rawdigits.C`
+  (read via `sbn_anomaly.data.raw_digit_reader.RawDigitReader`)
+- `--hits-file` — the reco/caloskim ROOT file with hit-finder output (same
+  `hits0.h`/`hits1.h`/`hits2.h.*` branches `SparseWindowDatasetPyG.from_root`
+  reads — see [`data/README.md`](../data/README.md#sparse-event-format))
+
+```bash
+python scripts/compare_hits_to_waveform.py \
+    --raw-file good_raw_poc.root \
+    --hits-file /pnfs/sbnd/.../reco/run19305_evt0.root \
+    --run 19305 --subrun 1 --event 42 \
+    --output hit_check_run19305_evt42.root
+```
+
+For each active channel (has a hit, or a raw deviation `--activity-threshold`
+sigma above its own robust noise floor — `--all-channels` forces every
+channel), draws the pedestal-subtracted waveform with one Gaussian per hit,
+parameterized directly from the hit's own fields (mean = hit time, sigma =
+hit width; amplitude from a `.amplitude` branch if present, otherwise
+derived from `integral = amplitude * width * sqrt(2*pi)`). Output is one
+`TCanvas` per channel, grouped by plane:
+```
+event_run<r>_subrun<s>_evt<e>/plane<p>/ch<channel>
+```
+
+**Read this caveat before concluding hit-finding looks "bad":** the hit
+finder almost always fits the *deconvolved* wire signal, not raw ADC
+directly. Raw induction-plane waveforms are bipolar; the deconvolved signal
+the fit was performed on is approximately unipolar/Gaussian. A poor-looking
+overlay on an **induction** channel doesn't by itself mean hit-finding is
+malfunctioning — it may just be comparing two different signal
+representations. The comparison is most directly meaningful on the
+**collection** plane, where raw and deconvolved shapes are closer. This
+script does not deconvolve (it doesn't have the field/electronics response
+on hand) — it draws exactly what's in `--raw-file`, pedestal-subtracted and
+optionally coherent-noise-subtracted (`--remove-coherent`).
+
+### Requires
+
+**PyROOT** (drawing/writing `TCanvas`/`TF1`) **and uproot+awkward** (reading
+the hits tree). The amplitude-derivation math, activity detection (median-
+absolute-deviation noise floor), pedestal/coherent-noise preprocessing (via
+`raw_preprocess.py`), and run/subrun/event matching are unit-tested,
+including a round-trip check that the derived Gaussian amplitude reproduces
+the hit's stored integral exactly. **The PyROOT drawing section could not be
+exercised in this development environment** — smoke-test on one event
+before a larger run.
+
+| Option | Default | Description |
+|---|---|---|
+| `--raw-file` / `--hits-file` | *(required)* | See above |
+| `--run` / `--subrun` / `--event` | *(required unless `--event-index`)* | Event to match across both files |
+| `--event-index` | *(none)* | Alternative: match by entry order instead (only valid if both files share the same event ordering) |
+| `--output` | *(required)* | Output ROOT file |
+| `--tree-name` | `caloskim/TrackCaloSkim` | |
+| `--hit-branches` | matches `configs/graph_vae.yaml` | Used only to discover the `hits0.h`/etc. prefixes |
+| `--remove-coherent` | off | Also subtract common-mode noise per electronics group |
+| `--coherent-group-size` | `64` | |
+| `--activity-threshold` | `5.0` | Sigma above a channel's own noise floor to count as active when it has no hits |
+| `--all-channels` | off | Draw every channel, including inactive ones |
+| `--channel-range LO HI` | full detector | Restrict to a channel range |
+
 ## Other scripts
 
 | Script | Purpose |
