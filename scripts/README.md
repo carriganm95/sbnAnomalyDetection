@@ -459,6 +459,19 @@ python scripts/compare_hits_to_waveform.py \
     --output hit_check_run19305_evt42.root
 ```
 
+Not sure which run/event to pick? `--list-events` prints every
+`(run, subrun, event)` common to both files and exits without drawing
+anything — cheap, since it only reads the small scalar run/subrun/event
+branches, never the heavy waveform/hit arrays:
+```bash
+python scripts/compare_hits_to_waveform.py \
+    --raw-file good_raw_poc.root --hits-file .../run19305_evt0.root --list-events
+```
+If none of `--run`/`--subrun`/`--event`/`--event-index` are given at all, the
+first event common to both files is used automatically (logged, so you know
+which one you got) — a quick way to sanity-check the pipeline without
+picking a specific event first.
+
 For each active channel (has a hit, or a raw deviation `--activity-threshold`
 sigma above its own robust noise floor — `--all-channels` forces every
 channel), draws the pedestal-subtracted waveform with one Gaussian per hit,
@@ -496,9 +509,10 @@ before a larger run.
 | Option | Default | Description |
 |---|---|---|
 | `--raw-file` / `--hits-file` | *(required)* | See above |
-| `--run` / `--subrun` / `--event` | *(required unless `--event-index`)* | Event to match across both files |
+| `--run` / `--subrun` / `--event` | *(none — auto-picks the first common event if omitted)* | Event to match across both files; give all three or none |
 | `--event-index` | *(none)* | Alternative: match by entry order instead (only valid if both files share the same event ordering) |
-| `--output` | *(required)* | Output ROOT file |
+| `--list-events` | off | Print every `(run, subrun, event)` common to both files, then exit without drawing |
+| `--output` | *(required unless `--list-events`)* | Output ROOT file |
 | `--tree-name` | `caloskim/TrackCaloSkim` | |
 | `--hit-branches` | matches `configs/graph_vae.yaml` | Used only to discover the `hits0.h`/etc. prefixes |
 | `--remove-coherent` | off | Also subtract common-mode noise per electronics group |

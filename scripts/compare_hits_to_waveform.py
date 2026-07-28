@@ -55,6 +55,20 @@ Restrict to the flagged collection-plane channel range, force every channel
         --channel-range 4000 5500 --all-channels \\
         --output hit_check_collection_evt42.root
 
+Not sure which run/event to pick? List every (run, subrun, event) common to
+both files (cheap -- only reads the small scalar run/subrun/event branches,
+never the heavy waveform/hit arrays), then exit without drawing anything:
+    python scripts/compare_hits_to_waveform.py \\
+        --raw-file good_raw_poc.root --hits-file .../run19305_evt0.root \\
+        --list-events
+
+If none of --run/--subrun/--event/--event-index are given at all, the first
+event common to both files is used automatically (logged, so you know which
+one you got) -- handy for a quick first look:
+    python scripts/compare_hits_to_waveform.py \\
+        --raw-file good_raw_poc.root --hits-file .../run19305_evt0.root \\
+        --output hit_check_first_event.root
+
 Output layout: one TCanvas per channel, grouped by plane:
     event_run<r>_subrun<s>_evt<e>/plane<p>/ch<channel>
 
@@ -87,6 +101,47 @@ logger = logging.getLogger("compare_hits_to_waveform")
 # ---------------------------------------------------------------------------
 # Event lookup / hit extraction -- pure Python + numpy/awkward, no PyROOT.
 # ---------------------------------------------------------------------------
+
+def list_common_events(
+    raw_file: str,
+    hits_file: str,
+    tree_name: str = "caloskim/TrackCaloSkim",
+    raw_tree_name: str = "rawdigits",
+    hits_meta_branches=("meta.run", "meta.subrun", "meta.evt"),
+):
+    """(run, subrun, event) triples present in BOTH files, sorted.
+
+    Reads only the small per-event scalar run/subrun/event branches from
+    each file (never the heavy jagged adc/hit arrays), so this is cheap even
+    on a large production file -- safe to call just to print a menu.
+
+    Returns (common_sorted, n_only_in_raw, n_only_in_hits).
+    """
+    import uproot
+
+    with uproot.open(raw_file) as rf:
+        if raw_tree_name not in rf:
+            raise ValueError(f"Tree '{raw_tree_name}' not found in {raw_file}")
+        raw_arrs = rf[raw_tree_name].arrays(["run", "subrun", "event"], library="np")
+    raw_events = set(zip(raw_arrs["run"].tolist(), raw_arrs["subrun"].tolist(), raw_arrs["event"].tolist()))
+
+    with uproot.open(hits_file) as hf:
+        if tree_name not in hf:
+            raise ValueError(f"Tree '{tree_name}' not found in {hits_file}")
+        tree = hf[tree_name]
+        missing = [b for b in hits_meta_branches if b not in set(tree.keys())]
+        if missing:
+            raise ValueError(f"Missing meta branch(es) {missing} in {hits_file}")
+        hit_arrs = tree.arrays(list(hits_meta_branches), library="np")
+    hits_events = set(zip(
+        hit_arrs[hits_meta_branches[0]].tolist(),
+        hit_arrs[hits_meta_branches[1]].tolist(),
+        hit_arrs[hits_meta_branches[2]].tolist(),
+    ))
+
+    common = sorted(raw_events & hits_events)
+    return common, len(raw_events - hits_events), len(hits_events - raw_events)
+
 
 def find_raw_event(raw_file: str, run: Optional[int], subrun: Optional[int], event: Optional[int],
                     event_index: Optional[int] = None):
@@ -371,7 +426,10 @@ def _parse_args(argv):
     ap.add_argument("--event-index", type=int, default=None,
                      help="Alternative to --run/--subrun/--event: match by entry order in both files "
                           "instead (only valid if both files were produced with the same event ordering)")
-    ap.add_argument("--output", required=True)
+    ap.add_argument("--list-events", action="store_true",
+                     help="Print every (run, subrun, event) common to --raw-file and --hits-file, then exit "
+                          "without drawing anything -- use this to pick --run/--subrun/--event")
+    ap.add_argument("--output", default=None, help="Required unless --list-events is given")
     ap.add_argument("--tree-name", default="caloskim/TrackCaloSkim")
     ap.add_argument("--hit-branches", nargs="+",
                      default=["hits0.h.integral", "hits0.h.channel",
@@ -392,11 +450,44 @@ def _parse_args(argv):
 def main(argv=None):
     args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    if args.event_index is None and (args.run is None or args.subrun is None or args.event is None):
-        raise SystemExit("Provide either --event-index, or all of --run/--subrun/--event")
+
+    if args.list_events:
+        common, n_only_raw, n_only_hits = list_common_events(args.raw_file, args.hits_file, args.tree_name)
+        print(f"{len(common)} event(s) present in BOTH files "
+              f"({n_only_raw} only in --raw-file, {n_only_hits} only in --hits-file):")
+        for i, (r, s, e) in enumerate(common):
+            print(f"  [{i}] run={r} subrun={s} event={e}   "
+                  f"(--run {r} --subrun {s} --event {e}   or   --event-index {i})")
+        return
+
+    have_explicit = args.run is not None and args.subrun is not None and args.event is not None
+    have_partial = any(v is not None for v in (args.run, args.subrun, args.event)) and not have_explicit
+    if have_partial:
+        raise SystemExit("Provide all of --run/--subrun/--event together (or none, to auto-pick the "
+                          "first common event), or use --event-index instead")
+    if args.event_index is not None and have_explicit:
+        raise SystemExit("Provide --event-index OR --run/--subrun/--event, not both")
+
+    run_, subrun, event, event_index = args.run, args.subrun, args.event, args.event_index
+    if not have_explicit and event_index is None:
+        logger.info("No --run/--subrun/--event or --event-index given -- looking up the first "
+                    "event common to both files ...")
+        common, _, _ = list_common_events(args.raw_file, args.hits_file, args.tree_name)
+        if not common:
+            raise SystemExit(f"No events are common to {args.raw_file} and {args.hits_file} -- "
+                              f"nothing to draw. Re-run with --list-events to inspect both files.")
+        run_, subrun, event = common[0]
+        logger.info(
+            "Using the first common event: run=%d subrun=%d event=%d (%d common event(s) total -- "
+            "pass --run/--subrun/--event, --event-index, or --list-events to pick a different one)",
+            run_, subrun, event, len(common))
+
+    if not args.output:
+        raise SystemExit("--output is required (unless --list-events is given)")
+
     run(
         raw_file=args.raw_file, hits_file=args.hits_file, output=args.output,
-        run_=args.run, subrun=args.subrun, event=args.event, event_index=args.event_index,
+        run_=run_, subrun=subrun, event=event, event_index=event_index,
         tree_name=args.tree_name, hit_branches=args.hit_branches,
         remove_coherent=args.remove_coherent, coherent_group_size=args.coherent_group_size,
         activity_nsigma=args.activity_nsigma, all_channels=args.all_channels,
