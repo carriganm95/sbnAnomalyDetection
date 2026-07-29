@@ -38,7 +38,7 @@ SMOOTHING = True
 SMOOTHING_WINDOW = 1001
 
 # Larger value = less aggressive spike removal.
-SMOOTHING_THRESHOLD = 40.0
+SMOOTHING_THRESHOLD = 5
 
 
 # ============================================================

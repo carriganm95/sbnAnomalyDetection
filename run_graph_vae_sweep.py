@@ -73,9 +73,9 @@ DEFAULT_PER_CHANNEL_PLOT_NAME = "per_channel_scores.png"
 # sweep activity, including training, inference, evaluation, plotting, and
 # rewrite/repair modes. Add full model directory paths here.
 IGNORED: list[Path] = [
-    DEFAULT_RUNS_ROOT / "All_data",
+    DEFAULT_RUNS_ROOT / "All_data_v2",
+    DEFAULT_RUNS_ROOT / "All_data_v3",
     DEFAULT_RUNS_ROOT / "collection_plane",
-    DEFAULT_RUNS_ROOT / "collection_plane_200",
 ]
 
 
