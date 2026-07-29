@@ -35,12 +35,68 @@ import array
 import sys
 
 
-def _find_rawdigit_branch(tree) -> str | None:
-    for b in tree.GetListOfBranches():
+def _all_branch_names(branch_holder, _depth: int = 0, _max_depth: int = 6) -> list[str]:
+    """Recursively collect every branch name reachable from `branch_holder`
+    (a TTree or a TBranch), not just the top-level listing.
+
+    TTree.GetListOfBranches() only returns TOP-LEVEL branches. For a split
+    object (or an art product with sub-branches materialized per data
+    member), the members only show up via THAT branch's own
+    GetListOfBranches() -- exactly what TTree::Print()/Show() walk
+    recursively to produce their (longer) output. A single flat pass over
+    the tree's top-level list misses anything nested, which is the likely
+    reason a branch visible in a plain print was invisible here.
+    """
+    names: list[str] = []
+    blist = branch_holder.GetListOfBranches()
+    if not blist:
+        return names
+    for b in blist:
         n = b.GetName()
-        if "RawDigits_daq" in n and "Assns" not in n and "TimeStamp" not in n:
-            return n  # e.g. 'raw::RawDigits_daq__DECODE.'
-    return None
+        names.append(n)
+        if _depth < _max_depth:
+            names.extend(_all_branch_names(b, _depth + 1, _max_depth))
+    return names
+
+
+def _find_rawdigit_branch(tree, tag_contains: str = "RawDigits_daq", list_all: bool = False) -> str | None:
+    """Find the branch identifying the RawDigit product, matched against
+    `tag_contains` (the CLI --tag-contains value -- previously hardcoded and
+    ignored here, now actually used).
+
+    Branch discovery also forces the tree to resolve its full split-branch
+    structure first (GetEntry(0)) and searches recursively (see
+    _all_branch_names), not just the shallow top-level list -- either lazy
+    branch materialization or nested sub-branches of a split object can
+    otherwise hide the real branch from a naive GetListOfBranches() scan
+    even though it's visible in tree.Print()/Show().
+    """
+    if tree.GetEntries() > 0:
+        tree.GetEntry(0)  # force full branch-structure resolution before scanning
+
+    all_names = _all_branch_names(tree)
+    if list_all:
+        print(f"# {len(all_names)} branch name(s) found (recursive scan):")
+        for n in sorted(set(all_names)):
+            print(f"#   {n}")
+
+    candidates = [n for n in all_names if tag_contains in n and "Assns" not in n and "TimeStamp" not in n]
+    # Prefer an actual top-level product-wrapper branch over any nested
+    # sub-branch of the same product that happens to also match the substring.
+    top_level = {b.GetName() for b in tree.GetListOfBranches()}
+    top_level_candidates = [c for c in candidates if c in top_level]
+    if top_level_candidates:
+        candidates = top_level_candidates
+
+    candidates = sorted(set(candidates))
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        print(f"# WARNING: {len(candidates)} branches matched --tag-contains={tag_contains!r}; "
+              f"using the first. Pass a more specific --tag-contains to disambiguate:")
+        for c in candidates:
+            print(f"#   {c}")
+    return candidates[0]
 
 
 def _get_value(tree, base: str):
@@ -127,6 +183,10 @@ def main(argv: list[str]) -> int:
     p.add_argument("--nevents", type=int, default=0, help="0 = all events")
     p.add_argument("--tag-contains", default="RawDigits_daq",
                    help="substring identifying the RawDigit product branch")
+    p.add_argument("--list-branches", action="store_true",
+                   help="Print every branch name found (recursive scan) before searching -- "
+                        "use this to find the right --tag-contains value if the expected "
+                        "branch isn't being found")
     args = p.parse_args(argv)
 
     import numpy as np
@@ -143,9 +203,11 @@ def main(argv: list[str]) -> int:
         print("No 'Events' tree", file=sys.stderr)
         return 1
 
-    base = _find_rawdigit_branch(tree)
+    base = _find_rawdigit_branch(tree, args.tag_contains, list_all=args.list_branches)
     if base is None:
-        print("No raw::RawDigits_daq* branch found", file=sys.stderr)
+        print(f"No branch matching --tag-contains={args.tag_contains!r} found "
+              f"(excluding Assns/TimeStamp companions). Re-run with --list-branches "
+              f"to see every branch name and pick the right substring.", file=sys.stderr)
         return 1
     print(f"# RawDigit branch: {base}")
 

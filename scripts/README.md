@@ -388,6 +388,139 @@ should be double-checked against your ROOT version.
 | `--bins` / `--range-mode` / `--range-percentiles` | `60` / `percentile` / `0.1 99.9` | Same semantics as `compare_events_distributions.py` |
 | `--max-windows` | unlimited | Cap windows processed per file — fast first look |
 
+## xrootd_mirror_ci_data.py
+
+Mirrors `reco/` and `decode/` ROOT files from the `CI_build_lar_ci_*` DQM
+dCache area to a local directory via `xrdcp`, preserving the source
+directory structure (`<dest>/CI_build_lar_ci_<N>/reco/...`,
+`<dest>/CI_build_lar_ci_<N>/decode/...`).
+
+```bash
+python scripts/xrootd_mirror_ci_data.py \
+    --source-glob '/pnfs/sbnd/scratch/ci_validation/dqm/v09_93_01_02/CI_build_lar_ci*' \
+    --dest /exp/sbnd/data/users/<you>/DQM/ci_mirror \
+    --xrootd-door root://fndca1.fnal.gov:1094 \
+    --dry-run
+```
+Drop `--dry-run` once the file list/commands it prints look right.
+
+**You must supply `--xrootd-door` yourself** — the correct xrootd
+redirector/door for your dCache instance isn't something that could be
+confirmed from this environment; verify it (e.g. copy one small file first)
+before pointing this at the full dataset. `--subdirs` defaults to
+`reco decode`; pass `--subdirs raw_decode` etc. if your area uses a
+different name than `decode` (this project's `data/README.md` documents
+`raw_decode` elsewhere — check `ls` on your actual area first).
+
+Listing/globbing under `/pnfs` is normal POSIX filesystem access (dCache's
+NFS4 namespace mount); only the actual file copy goes through `xrdcp`, which
+is the correct way to move real data off dCache rather than a plain `cp`.
+Re-running the same command is safe and resumes automatically — files
+already present at the destination are skipped unless `--overwrite` is
+given, so a partially-failed run can just be re-launched. Failed transfers
+are logged individually and summarized at the end.
+
+File discovery, path-mirroring, URL construction, skip-existing behavior,
+and dry-run orchestration are unit-tested against a synthetic directory
+tree. The actual `xrdcp` subprocess call against a real dCache instance
+could not be exercised in this development environment — do a `--dry-run`
+first, then a small real transfer, before mirroring the full dataset.
+
+| Option | Default | Description |
+|---|---|---|
+| `--source-glob` | *(required)* | Glob matching per-build top-level directories |
+| `--dest` | *(required)* | Local destination root |
+| `--copy-method` | `xrdcp` | `xrdcp` (recommended for real dCache transfers) or `cp` — a plain filesystem copy (`shutil.copy2`) that bypasses xrootd entirely, for quick local testing or when `/pnfs` is directly POSIX-readable |
+| `--xrootd-door` | *(required unless `--copy-method cp`)* | e.g. `root://fndca1.fnal.gov:1094` — verify for your site |
+| `--subdirs` | `reco decode` | Subdirectory name(s) to mirror under each matched build dir |
+| `--exclude-dirs` | `log` | Directory name(s) to skip anywhere in the path under a subdir (e.g. `reco/log/foo.root` or a nested `.../some_job/log/foo.root` are both excluded) |
+| `--overwrite` | off | Re-copy files that already exist at the destination |
+| `--dry-run` | off | Print what would be copied / the exact `xrdcp` commands, copy nothing |
+| `--max-workers` | `4` | Parallel `xrdcp` transfers |
+
+## compare_hits_to_waveform.py
+
+Overlays hit-finder Gaussian fits on raw ADC waveforms, per channel, for one
+event — a direct visual check of how well hit-finding is performing. Takes
+two files describing the *same* event from two stages of the pipeline,
+matched by run/subrun/event:
+
+- `--raw-file` — the flat `rawdigits` ntuple from `dump_rawdigits.C`
+  (read via `sbn_anomaly.data.raw_digit_reader.RawDigitReader`)
+- `--hits-file` — the reco/caloskim ROOT file with hit-finder output (same
+  `hits0.h`/`hits1.h`/`hits2.h.*` branches `SparseWindowDatasetPyG.from_root`
+  reads — see [`data/README.md`](../data/README.md#sparse-event-format))
+
+```bash
+python scripts/compare_hits_to_waveform.py \
+    --raw-file good_raw_poc.root \
+    --hits-file /pnfs/sbnd/.../reco/run19305_evt0.root \
+    --run 19305 --subrun 1 --event 42 \
+    --output hit_check_run19305_evt42.root
+```
+
+Not sure which run/event to pick? `--list-events` prints every
+`(run, subrun, event)` common to both files and exits without drawing
+anything — cheap, since it only reads the small scalar run/subrun/event
+branches, never the heavy waveform/hit arrays:
+```bash
+python scripts/compare_hits_to_waveform.py \
+    --raw-file good_raw_poc.root --hits-file .../run19305_evt0.root --list-events
+```
+If none of `--run`/`--subrun`/`--event`/`--event-index` are given at all, the
+first event common to both files is used automatically (logged, so you know
+which one you got) — a quick way to sanity-check the pipeline without
+picking a specific event first.
+
+For each active channel (has a hit, or a raw deviation `--activity-threshold`
+sigma above its own robust noise floor — `--all-channels` forces every
+channel), draws the pedestal-subtracted waveform with one Gaussian per hit,
+parameterized directly from the hit's own fields (mean = hit time, sigma =
+hit width; amplitude from a `.amplitude` branch if present, otherwise
+derived from `integral = amplitude * width * sqrt(2*pi)`). Output is one
+`TCanvas` per channel, grouped by plane:
+```
+event_run<r>_subrun<s>_evt<e>/plane<p>/ch<channel>
+```
+
+**Read this caveat before concluding hit-finding looks "bad":** the hit
+finder almost always fits the *deconvolved* wire signal, not raw ADC
+directly. Raw induction-plane waveforms are bipolar; the deconvolved signal
+the fit was performed on is approximately unipolar/Gaussian. A poor-looking
+overlay on an **induction** channel doesn't by itself mean hit-finding is
+malfunctioning — it may just be comparing two different signal
+representations. The comparison is most directly meaningful on the
+**collection** plane, where raw and deconvolved shapes are closer. This
+script does not deconvolve (it doesn't have the field/electronics response
+on hand) — it draws exactly what's in `--raw-file`, pedestal-subtracted and
+optionally coherent-noise-subtracted (`--remove-coherent`).
+
+### Requires
+
+**PyROOT** (drawing/writing `TCanvas`/`TF1`) **and uproot+awkward** (reading
+the hits tree). The amplitude-derivation math, activity detection (median-
+absolute-deviation noise floor), pedestal/coherent-noise preprocessing (via
+`raw_preprocess.py`), and run/subrun/event matching are unit-tested,
+including a round-trip check that the derived Gaussian amplitude reproduces
+the hit's stored integral exactly. **The PyROOT drawing section could not be
+exercised in this development environment** — smoke-test on one event
+before a larger run.
+
+| Option | Default | Description |
+|---|---|---|
+| `--raw-file` / `--hits-file` | *(required)* | See above |
+| `--run` / `--subrun` / `--event` | *(none — auto-picks the first common event if omitted)* | Event to match across both files; give all three or none |
+| `--event-index` | *(none)* | Alternative: match by entry order instead (only valid if both files share the same event ordering) |
+| `--list-events` | off | Print every `(run, subrun, event)` common to both files, then exit without drawing |
+| `--output` | *(required unless `--list-events`)* | Output ROOT file |
+| `--tree-name` | `caloskim/TrackCaloSkim` | |
+| `--hit-branches` | matches `configs/graph_vae.yaml` | Used only to discover the `hits0.h`/etc. prefixes |
+| `--remove-coherent` | off | Also subtract common-mode noise per electronics group |
+| `--coherent-group-size` | `64` | |
+| `--activity-threshold` | `5.0` | Sigma above a channel's own noise floor to count as active when it has no hits |
+| `--all-channels` | off | Draw every channel, including inactive ones |
+| `--channel-range LO HI` | full detector | Restrict to a channel range |
+
 ## Other scripts
 
 | Script | Purpose |
