@@ -432,12 +432,11 @@ def plot_events_per_window_by_run(
     window_size_seconds: float,
     stride_seconds: float,
     output_dir: Path,
-    random_generator: np.random.Generator,
 ) -> Path:
-    """Create one scatter plot for one timed-window duration."""
+    """Create one box-and-whisker plot for one timed-window duration."""
     if counts.size == 0:
         raise ValueError(
-            "Cannot create a scatter plot with no timed windows."
+            "Cannot create a box plot with no timed windows."
         )
 
     output_dir.mkdir(
@@ -445,49 +444,36 @@ def plot_events_per_window_by_run(
         exist_ok=True,
     )
 
-    unique_runs = np.unique(
-        window_runs
+    unique_runs = np.unique(window_runs)
+
+    counts_by_run = [
+        counts[window_runs == run]
+        for run in unique_runs
+    ]
+
+    # Increase the width when many runs are present.
+    figure_width = max(
+        FIGURE_WIDTH,
+        0.45 * len(unique_runs),
     )
-
-    run_to_position = {
-        int(run): position
-        for position, run in enumerate(unique_runs)
-    }
-
-    x_positions = np.asarray(
-        [
-            run_to_position[int(run)]
-            for run in window_runs
-        ],
-        dtype=np.float64,
-    )
-
-    if USE_HORIZONTAL_JITTER:
-        jitter = random_generator.uniform(
-            -JITTER_WIDTH,
-            JITTER_WIDTH,
-            size=x_positions.size,
-        )
-
-        x_plot = (
-            x_positions
-            + jitter
-        )
-    else:
-        x_plot = x_positions
 
     figure, axis = plt.subplots(
         figsize=(
-            FIGURE_WIDTH,
+            figure_width,
             FIGURE_HEIGHT,
         )
     )
 
-    axis.scatter(
-        x_plot,
-        counts,
-        s=POINT_SIZE,
-        alpha=POINT_ALPHA,
+    axis.boxplot(
+        counts_by_run,
+        tick_labels=[
+            str(int(run))
+            for run in unique_runs
+        ],
+        showfliers=True,
+        showmeans=True,
+        meanline=False,
+        whis=1.5,
     )
 
     axis.set_xlabel(
@@ -499,33 +485,27 @@ def plot_events_per_window_by_run(
     )
 
     axis.set_title(
-        "Event Count per Timed Window by Run\n"
+        "Distribution of Event Counts per Timed Window by Run\n"
         f"Window duration: "
         f"{format_seconds(window_size_seconds)}, "
         f"stride: {format_seconds(stride_seconds)}"
     )
 
-    axis.set_xticks(
-        np.arange(unique_runs.size)
+    axis.tick_params(
+        axis="x",
+        labelrotation=60,
     )
 
-    axis.set_xticklabels(
-        [
-            str(int(run))
-            for run in unique_runs
-        ],
-        rotation=60,
-        ha="right",
-    )
+    for label in axis.get_xticklabels():
+        label.set_horizontalalignment("right")
 
     axis.grid(
         True,
+        axis="y",
         alpha=0.3,
     )
 
-    axis.set_axisbelow(
-        True
-    )
+    axis.set_axisbelow(True)
 
     figure.tight_layout()
 
@@ -536,7 +516,7 @@ def plot_events_per_window_by_run(
     output_path = (
         output_dir
         / (
-            "events_per_window_by_run_"
+            "events_per_window_by_run_boxplot_"
             f"{duration_label}.png"
         )
     )
@@ -547,9 +527,7 @@ def plot_events_per_window_by_run(
         bbox_inches="tight",
     )
 
-    plt.close(
-        figure
-    )
+    plt.close(figure)
 
     return output_path
 
@@ -592,10 +570,6 @@ def main() -> None:
         .resolve()
     )
 
-    random_generator = np.random.default_rng(
-        RANDOM_SEED
-    )
-
     generated_paths: list[Path] = []
 
     for window_size_seconds in TIME_WINDOW_SIZES_SECONDS:
@@ -625,7 +599,6 @@ def main() -> None:
             window_size_seconds=window_size_seconds,
             stride_seconds=TIME_WINDOW_STRIDE_SECONDS,
             output_dir=output_dir,
-            random_generator=random_generator,
         )
 
         generated_paths.append(
