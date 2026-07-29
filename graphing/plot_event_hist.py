@@ -11,7 +11,7 @@ import numpy as np
 # ============================================================
 
 NPZ_PATH = Path(
-    "/exp/sbnd/data/users/micarrig/DQM/tpc_data_v2/bad_runs.npz"
+    "/exp/sbnd/data/users/micarrig/DQM/tpc_data_v3/bad_runs.npz"
 )
 
 OUTPUT_PATH = Path(
