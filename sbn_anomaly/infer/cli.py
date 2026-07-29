@@ -521,16 +521,71 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
         ) from exc
     is_sparse = isinstance(arch, np.lib.npyio.NpzFile) and "channels_flat" in arch
     provenance = None
+    window_meta: dict | None = None
 
     if is_sparse:
         from sbn_anomaly.data.sparse_window_dataset import SparseWindowDatasetPyG
         logger.info("Loading sparse events for graph_vae from %s", input_path)
+        timed_window = bool(data_cfg.get("timed_window", False))
+        window_time_size = data_cfg.get("window_time_size")
+        window_time_stride = data_cfg.get("window_time_stride")
+
+        if timed_window:
+            if window_time_size is None:
+                raise ValueError(
+                    "data.timed_window=true requires data.window_time_size "
+                    "in seconds for graph_vae inference."
+                )
+            if window_time_stride is None:
+                raise ValueError(
+                    "data.timed_window=true requires data.window_time_stride "
+                    "in seconds for graph_vae inference."
+                )
+            if float(window_time_size) <= 0:
+                raise ValueError(
+                    "data.window_time_size must be greater than zero."
+                )
+            if float(window_time_stride) <= 0:
+                raise ValueError(
+                    "data.window_time_stride must be greater than zero."
+                )
+
+            logger.info(
+                "Using timed graph_vae inference windows: duration=%.6g s, "
+                "time stride=%.6g s, maximum events=%d, seed=%d. "
+                "Event-count stride=%s is ignored.",
+                float(window_time_size),
+                float(window_time_stride),
+                int(data_cfg.get("window_size", 20)),
+                int(data_cfg.get("timed_window_seed", 0)),
+                data_cfg.get("stride", 1),
+            )
+        else:
+            logger.info(
+                "Using event-count graph_vae inference windows: "
+                "window_size=%d, stride=%d.",
+                int(data_cfg.get("window_size", 20)),
+                int(data_cfg.get("stride", 1)),
+            )
+
         dataset = SparseWindowDatasetPyG.from_npz(
             input_path,
             n_channels=data_cfg.get("n_channels"),
             window_size=int(data_cfg.get("window_size", 20)),
             n_bins=int(data_cfg.get("n_temporal_bins", 4)),
             stride=int(data_cfg.get("stride", 1)),
+            timed_window=timed_window,
+            window_time_size=(
+                float(window_time_size)
+                if window_time_size is not None
+                else None
+            ),
+            window_time_stride=(
+                float(window_time_stride)
+                if window_time_stride is not None
+                else None
+            ),
+            timed_window_seed=int(data_cfg.get("timed_window_seed", 0)),
             radius=int(data_cfg.get("adjacency_radius", 4)),
             node_features=data_cfg.get("node_features") or None,
             prune_inactive=bool(data_cfg.get("prune_inactive", True)),
@@ -538,7 +593,8 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
             edge_mode=str(data_cfg.get("edge_mode", "sequential")),
             reconstruction=True,
             standardize=bool(data_cfg.get("standardize", True)),
-            feature_mean=feat_mean, feature_std=feat_std,
+            feature_mean=feat_mean,
+            feature_std=feat_std,
             log_features=data_cfg.get("log_features") or None,
         )
     else:
@@ -620,10 +676,15 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
 
     # Per-window provenance from the sparse events' metadata, when available.
     if is_sparse and provenance is None:
-        meta = dataset.window_metadata()
-        if meta:
+        window_meta = dataset.window_metadata()
+        if window_meta:
             provenance = np.stack(
-                [meta["first_run"], meta["first_subrun"], meta["first_event_num"]], axis=1
+                [
+                    window_meta["first_run"],
+                    window_meta["first_subrun"],
+                    window_meta["first_event_num"],
+                ],
+                axis=1,
             ).astype(np.int32)
 
     aggregator = str(infer_cfg.get("window_aggregator", "group_max_mean"))
@@ -660,6 +721,32 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
            "channel_active_frac": channel_active_frac}
     if provenance is not None:
         out["provenance"] = provenance
+
+    # Preserve detailed sparse-window metadata. Timed-window datasets provide
+    # the requested interval boundaries and the number of real selected events
+    # before zero padding; legacy event-count datasets provide the usual first/
+    # last event information.
+    if window_meta:
+        for key in (
+            "first_run",
+            "first_subrun",
+            "first_event_num",
+            "last_event_num",
+            "first_file_idx",
+            "last_file_idx",
+            "first_time",
+            "last_time",
+            "selected_event_count",
+            "time_window_start",
+            "time_window_end",
+        ):
+            if key in window_meta:
+                out[key] = window_meta[key]
+        if window_meta.get("filenames"):
+            out["filenames"] = np.asarray(
+                window_meta["filenames"], dtype="U512"
+            )
+
     threshold = _score_threshold_from_config(scores, infer_cfg, logger=logger)
     if threshold is not None:
         out["is_anomaly"] = (scores > threshold)

@@ -516,10 +516,65 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
     train_cfg = cfg.get("training", {})
 
     events_path = data_cfg.get("events_path")
+
+    # Optional fixed-duration windowing. Old configuration files remain fully
+    # compatible because timed_window defaults to False when the key is absent.
+    timed_window = bool(data_cfg.get("timed_window", False))
+    window_time_size = data_cfg.get("window_time_size")
+    window_time_stride = data_cfg.get("window_time_stride")
+    timed_window_seed = int(data_cfg.get("timed_window_seed", 0))
+
+    if timed_window:
+        if not root_files and not events_path:
+            raise ValueError(
+                "data.timed_window=true requires a sparse event source: set "
+                "data.events_path or supply --root-files/--root-file-list. "
+                "Timed windowing cannot be applied to data.windows_path because "
+                "those windows are already materialized."
+            )
+        if window_time_size is None:
+            raise ValueError(
+                "data.timed_window=true requires data.window_time_size in seconds."
+            )
+        if window_time_stride is None:
+            raise ValueError(
+                "data.timed_window=true requires data.window_time_stride in seconds."
+            )
+
+        window_time_size = float(window_time_size)
+        window_time_stride = float(window_time_stride)
+        if window_time_size <= 0:
+            raise ValueError("data.window_time_size must be greater than zero.")
+        if window_time_stride <= 0:
+            raise ValueError("data.window_time_stride must be greater than zero.")
+
+        logger.info(
+            "Using timed graph_vae windows: duration=%.6g s, time_stride=%.6g s, "
+            "max_events=%d, seed=%d. Event-count stride=%s is ignored.",
+            window_time_size,
+            window_time_stride,
+            int(data_cfg.get("window_size", 20)),
+            timed_window_seed,
+            data_cfg.get("stride", 1),
+        )
+    else:
+        # Ignore time-window fields completely in legacy event-count mode.
+        window_time_size = None
+        window_time_stride = None
+        logger.info(
+            "Using event-count graph_vae windows: window_size=%d, stride=%d.",
+            int(data_cfg.get("window_size", 20)),
+            int(data_cfg.get("stride", 1)),
+        )
+
     sparse_kwargs = dict(
         window_size=int(data_cfg.get("window_size", 20)),
         n_bins=int(data_cfg.get("n_temporal_bins", 4)),
         stride=int(data_cfg.get("stride", 1)),
+        timed_window=timed_window,
+        window_time_size=window_time_size,
+        window_time_stride=window_time_stride,
+        timed_window_seed=timed_window_seed,
         radius=int(data_cfg.get("adjacency_radius", 4)),
         node_features=data_cfg.get("node_features") or None,
         prune_inactive=bool(data_cfg.get("prune_inactive", True)),

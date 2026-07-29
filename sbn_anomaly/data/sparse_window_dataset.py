@@ -175,6 +175,10 @@ class SparseWindowDatasetPyG(Dataset):
         window_size: int = 20,
         n_bins: int = 4,
         stride: int = 1,
+        timed_window: bool = False,
+        window_time_size: Optional[float] = None,
+        window_time_stride: Optional[float] = None,
+        timed_window_seed: int = 0,
         radius: int = 4,
         node_features: Optional[List[str]] = None,
         prune_inactive: bool = True,
@@ -230,8 +234,28 @@ class SparseWindowDatasetPyG(Dataset):
         self.window_size = int(window_size)
         self.n_bins = int(n_bins)
         self.stride = int(stride)
+        self.timed_window = bool(timed_window)
+        self.window_time_size = (
+            float(window_time_size) if window_time_size is not None else None
+        )
+        self.window_time_stride = (
+            float(window_time_stride) if window_time_stride is not None else None
+        )
+        self.timed_window_seed = int(timed_window_seed)
         self.radius = int(radius)
         self.prune_inactive = bool(prune_inactive)
+
+        if self.window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {self.window_size}")
+        if self.n_bins <= 0:
+            raise ValueError(f"n_bins must be positive, got {self.n_bins}")
+        if self.n_bins > self.window_size:
+            raise ValueError(
+                "n_bins cannot exceed window_size because some temporal bins "
+                f"would be empty: n_bins={self.n_bins}, window_size={self.window_size}"
+            )
+        if not self.timed_window and self.stride <= 0:
+            raise ValueError(f"stride must be positive, got {self.stride}")
 
         if node_features is None:
             node_features = ["sum", "min", "max", "stdev", "count"]
@@ -282,15 +306,52 @@ class SparseWindowDatasetPyG(Dataset):
             raise ValueError(f"standardize_by must be 'global' or 'plane', got {standardize_by!r}")
         self.min_plane_samples = int(min_plane_samples)
 
-        n_events = len(self._offsets) - 1
-        if self.reconstruction:
-            self.events_per_sample = window_size
-            self._starts = list(range(0, n_events - window_size + 1, stride))
-        else:
-            self.events_per_sample = (history + 1) * window_size
-            self._starts = list(range(0, n_events - self.events_per_sample + 1, stride))
+        if self.timed_window:
+            if not self.reconstruction:
+                raise ValueError(
+                    "timed_window is currently supported only for reconstruction "
+                    "datasets such as graph_vae."
+                )
+            if self._evt_time is None:
+                raise ValueError(
+                    "timed_window=true requires evt_time in the events NPZ. "
+                    "Materialize the dataset with meta.time in tpc_branches."
+                )
+            if self.window_time_size is None or self.window_time_size <= 0:
+                raise ValueError(
+                    "timed_window=true requires a positive window_time_size in seconds."
+                )
+            if self.window_time_stride is None or self.window_time_stride <= 0:
+                raise ValueError(
+                    "timed_window=true requires a positive window_time_stride in seconds."
+                )
 
-        self._bin_splits = np.array_split(np.arange(window_size), n_bins)
+        n_events = len(self._offsets) - 1
+        self._timed_event_indices: Optional[List[np.ndarray]] = None
+        self._timed_interval_starts_ns: Optional[np.ndarray] = None
+        self._timed_interval_ends_ns: Optional[np.ndarray] = None
+        self._timed_candidate_counts: Optional[np.ndarray] = None
+
+        if self.timed_window:
+            self.events_per_sample = self.window_size
+            self._build_timed_windows()
+            assert self._timed_event_indices is not None
+            # In timed mode, entries in _starts are timed-window IDs, not event IDs.
+            self._starts = list(range(len(self._timed_event_indices)))
+        elif self.reconstruction:
+            self.events_per_sample = self.window_size
+            self._starts = list(
+                range(0, n_events - self.window_size + 1, self.stride)
+            )
+        else:
+            self.events_per_sample = (self.history + 1) * self.window_size
+            self._starts = list(
+                range(0, n_events - self.events_per_sample + 1, self.stride)
+            )
+
+        self._bin_splits = np.array_split(
+            np.arange(self.window_size, dtype=np.int64), self.n_bins
+        )
 
         self.channel_map = channel_map
         self.edge_mode = str(edge_mode)
@@ -343,11 +404,391 @@ class SparseWindowDatasetPyG(Dataset):
 
         logger.info(
             "SparseWindowDatasetPyG ready: %d samples, %d channels, "
-            "%d features/frame, mode=%s, window_size=%d, n_bins=%d",
+            "%d features/frame, mode=%s, window_size=%d, n_bins=%d, timed_window=%s",
             len(self._starts), self.num_nodes, self.node_feat_dim,
             "recon" if self.reconstruction else "forecast",
-            self.window_size, self.n_bins,
+            self.window_size, self.n_bins, self.timed_window,
         )
+
+    def _build_timed_windows(self) -> None:
+        """Build fixed-duration windows on a stitched continuous timeline.
+
+        Raw ``evt_time`` values are expected in nanoseconds.
+
+        Run changes and backward timestamp jumps are treated as timestamp resets,
+        not as real gaps. The new segment is shifted so its first event begins at
+        the virtual time of the previous segment's final event.
+
+        This allows one timed window to continue across run boundaries. For example,
+        if a 600-second window contains 300 seconds from run 1, events from run 2
+        may fill the remaining 300 seconds.
+
+        Each output window contains exactly ``window_size`` positions:
+
+        - fewer events: pad remaining positions with -1;
+        - exactly enough events: keep every event;
+        - too many events: deterministically select ``window_size`` events without
+        replacement and then restore chronological order.
+
+        The -1 positions are interpreted as zero-valued events by
+        ``_compute_frame()``.
+        """
+        if self._evt_time is None:
+            raise ValueError(
+                "timed_window=true requires evt_time in the events NPZ."
+            )
+
+        raw_time_ns = np.asarray(self._evt_time, dtype=np.float64)
+        n_events = len(self._offsets) - 1
+
+        if raw_time_ns.shape != (n_events,):
+            raise ValueError(
+                "evt_time length does not match the number of events: "
+                f"len(evt_time)={len(raw_time_ns)}, n_events={n_events}"
+            )
+
+        if n_events == 0:
+            self._timed_event_indices = []
+            self._timed_interval_starts_ns = np.empty(
+                0, dtype=np.float64
+            )
+            self._timed_interval_ends_ns = np.empty(
+                0, dtype=np.float64
+            )
+            self._timed_candidate_counts = np.empty(
+                0, dtype=np.int64
+            )
+            self._stitched_evt_time_ns = np.empty(
+                0, dtype=np.float64
+            )
+            return
+
+        finite_mask = np.isfinite(raw_time_ns)
+
+        if not finite_mask.all():
+            bad_indices = np.where(~finite_mask)[0]
+            preview = ", ".join(
+                str(int(i)) for i in bad_indices[:10]
+            )
+
+            raise ValueError(
+                "timed_window=true requires finite evt_time values for all "
+                f"events, but {bad_indices.size} invalid timestamp(s) were "
+                f"found. First invalid indices: {preview}"
+            )
+
+        if self.window_time_size is None:
+            raise ValueError(
+                "timed_window=true requires window_time_size."
+            )
+
+        if self.window_time_stride is None:
+            raise ValueError(
+                "timed_window=true requires window_time_stride."
+            )
+
+        duration_ns = float(self.window_time_size) * 1.0e9
+        stride_ns = float(self.window_time_stride) * 1.0e9
+
+        if duration_ns <= 0:
+            raise ValueError(
+                "window_time_size must be greater than zero."
+            )
+
+        if stride_ns <= 0:
+            raise ValueError(
+                "window_time_stride must be greater than zero."
+            )
+
+        # --------------------------------------------------------------
+        # Find timestamp-reset boundaries.
+        #
+        # A reset occurs when:
+        #   1. the run number changes; or
+        #   2. evt_time moves backward.
+        #
+        # We do not split the dataset into independent window sequences.
+        # Instead, every segment is shifted onto a continuous virtual
+        # timeline.
+        # --------------------------------------------------------------
+        reset_boundary = np.zeros(n_events, dtype=bool)
+        reset_boundary[0] = True
+
+        backward_jump = np.diff(raw_time_ns) < 0
+        reset_boundary[1:] |= backward_jump
+
+        if self._evt_run is not None:
+            evt_run = np.asarray(self._evt_run)
+
+            if evt_run.shape == (n_events,):
+                reset_boundary[1:] |= (
+                    evt_run[1:] != evt_run[:-1]
+                )
+
+        segment_starts = np.where(reset_boundary)[0]
+        segment_ends = np.concatenate(
+            [
+                segment_starts[1:],
+                np.array([n_events], dtype=np.int64),
+            ]
+        )
+
+        # --------------------------------------------------------------
+        # Construct a zero-based, continuous virtual timeline.
+        #
+        # Within each segment:
+        #   virtual_time = segment_base + raw_time - first_raw_time
+        #
+        # At a boundary:
+        #   next segment base = previous segment's final virtual time
+        #
+        # Therefore the boundary contributes zero artificial time gap.
+        # --------------------------------------------------------------
+        stitched_time_ns = np.empty(
+            n_events,
+            dtype=np.float64,
+        )
+
+        previous_virtual_end_ns = 0.0
+
+        for segment_idx, (seg_start, seg_end) in enumerate(
+            zip(segment_starts, segment_ends)
+        ):
+            seg_start = int(seg_start)
+            seg_end = int(seg_end)
+
+            segment_raw_time = raw_time_ns[seg_start:seg_end]
+
+            if segment_raw_time.size == 0:
+                continue
+
+            local_decreases = np.where(
+                np.diff(segment_raw_time) < 0
+            )[0]
+
+            if local_decreases.size:
+                local_idx = int(local_decreases[0])
+
+                raise ValueError(
+                    "evt_time remains non-monotonic inside stitched segment "
+                    f"{segment_idx}. Global indices "
+                    f"{seg_start + local_idx} and "
+                    f"{seg_start + local_idx + 1}: "
+                    f"{segment_raw_time[local_idx]} -> "
+                    f"{segment_raw_time[local_idx + 1]} ns."
+                )
+
+            relative_time_ns = (
+                segment_raw_time - segment_raw_time[0]
+            )
+
+            stitched_time_ns[seg_start:seg_end] = (
+                previous_virtual_end_ns + relative_time_ns
+            )
+
+            previous_virtual_end_ns = float(
+                stitched_time_ns[seg_end - 1]
+            )
+
+        self._stitched_evt_time_ns = stitched_time_ns
+
+        # The stitched timeline should now be nondecreasing. Equal times at
+        # run boundaries are intentional because the artificial gap is zero.
+        remaining_decreases = np.where(
+            np.diff(stitched_time_ns) < 0
+        )[0]
+
+        if remaining_decreases.size:
+            first_bad = int(remaining_decreases[0])
+
+            raise RuntimeError(
+                "Internal error: stitched evt_time is not nondecreasing "
+                f"between indices {first_bad} and {first_bad + 1}."
+            )
+
+        n_run_changes = 0
+
+        if self._evt_run is not None:
+            evt_run = np.asarray(self._evt_run)
+
+            if evt_run.shape == (n_events,):
+                n_run_changes = int(
+                    np.count_nonzero(
+                        evt_run[1:] != evt_run[:-1]
+                    )
+                )
+
+        logger.info(
+            "Stitched evt_time into one continuous timeline: "
+            "%d segment(s), %d run change(s), %d backward timestamp "
+            "jump(s), virtual duration=%.6g seconds.",
+            len(segment_starts),
+            n_run_changes,
+            int(np.count_nonzero(backward_jump)),
+            float(
+                (stitched_time_ns[-1] - stitched_time_ns[0])
+                / 1.0e9
+            ),
+        )
+
+        # --------------------------------------------------------------
+        # Build timed windows from the continuous virtual timeline.
+        # --------------------------------------------------------------
+        first_virtual_time_ns = float(stitched_time_ns[0])
+        last_virtual_time_ns = float(stitched_time_ns[-1])
+
+        n_windows = (
+            int(
+                np.floor(
+                    (
+                        last_virtual_time_ns
+                        - first_virtual_time_ns
+                    )
+                    / stride_ns
+                )
+            )
+            + 1
+        )
+
+        interval_starts_ns = (
+            first_virtual_time_ns
+            + np.arange(n_windows, dtype=np.float64)
+            * stride_ns
+        )
+
+        interval_ends_ns = (
+            interval_starts_ns + duration_ns
+        )
+
+        timed_event_indices = []
+        candidate_counts = np.zeros(
+            n_windows,
+            dtype=np.int64,
+        )
+
+        padded_window_count = 0
+        subsampled_window_count = 0
+
+        for window_idx, (start_ns, end_ns) in enumerate(
+            zip(interval_starts_ns, interval_ends_ns)
+        ):
+            # Use half-open intervals:
+            #
+            #     [start_ns, end_ns)
+            #
+            # Equal virtual times at a run boundary are valid. All boundary
+            # events that satisfy the interval are included as candidates.
+            left = int(
+                np.searchsorted(
+                    stitched_time_ns,
+                    start_ns,
+                    side="left",
+                )
+            )
+
+            right = int(
+                np.searchsorted(
+                    stitched_time_ns,
+                    end_ns,
+                    side="left",
+                )
+            )
+
+            candidates = np.arange(
+                left,
+                right,
+                dtype=np.int64,
+            )
+
+            n_candidates = int(candidates.size)
+            candidate_counts[window_idx] = n_candidates
+
+            if n_candidates > self.window_size:
+                # Use one deterministic random generator per window so the
+                # same events are selected during:
+                #
+                # - standardization fitting;
+                # - training;
+                # - validation;
+                # - inference;
+                # - different DataLoader worker configurations.
+                rng = np.random.default_rng(
+                    self.timed_window_seed + window_idx
+                )
+
+                selected = rng.choice(
+                    candidates,
+                    size=self.window_size,
+                    replace=False,
+                ).astype(np.int64, copy=False)
+
+                # Restore event/virtual-time order before splitting the
+                # selected events into temporal bins.
+                selected.sort()
+                subsampled_window_count += 1
+            else:
+                selected = candidates
+
+            padded_indices = np.full(
+                self.window_size,
+                -1,
+                dtype=np.int64,
+            )
+
+            padded_indices[: selected.size] = selected
+
+            if selected.size < self.window_size:
+                padded_window_count += 1
+
+            timed_event_indices.append(padded_indices)
+
+        self._timed_event_indices = timed_event_indices
+        self._timed_interval_starts_ns = interval_starts_ns
+        self._timed_interval_ends_ns = interval_ends_ns
+        self._timed_candidate_counts = candidate_counts
+
+        selected_counts = np.minimum(
+            candidate_counts,
+            self.window_size,
+        )
+
+        logger.info(
+            "Built %d timed windows on stitched timeline: "
+            "duration=%.6g s, time stride=%.6g s, "
+            "maximum events/window=%d.",
+            len(timed_event_indices),
+            self.window_time_size,
+            self.window_time_stride,
+            self.window_size,
+        )
+
+        if selected_counts.size:
+            logger.info(
+                "Timed-window event counts: "
+                "candidates min=%d, median=%.1f, max=%d; "
+                "selected min=%d, median=%.1f, max=%d; "
+                "padded=%d, subsampled=%d.",
+                int(candidate_counts.min()),
+                float(np.median(candidate_counts)),
+                int(candidate_counts.max()),
+                int(selected_counts.min()),
+                float(np.median(selected_counts)),
+                int(selected_counts.max()),
+                padded_window_count,
+                subsampled_window_count,
+            )
+
+    def _reconstruction_frame(self, sample_key: int) -> np.ndarray:
+        """Build one reconstruction frame for an entry in ``self._starts``."""
+        if self.timed_window:
+            if self._timed_event_indices is None:
+                raise RuntimeError("Timed-window indices were not initialized.")
+            return self._compute_frame(
+                event_indices=self._timed_event_indices[int(sample_key)]
+            )
+
+        start = int(sample_key)
+        return self._compute_frame(start, start + self.window_size)
 
     def _fit_standardization(self, max_frames: int = 500):
         """Fit per-feature mean/std from active channels over a sample of frames."""
@@ -357,7 +798,7 @@ class SparseWindowDatasetPyG(Dataset):
             starts = [starts[i] for i in rng.choice(len(starts), max_frames, replace=False)]
         rows = []
         for s in starts:
-            frame = self._compute_frame(s, s + self.window_size).reshape(self.num_nodes, -1)
+            frame = self._reconstruction_frame(s).reshape(self.num_nodes, -1)
             act = np.abs(frame).sum(axis=1) > 1e-6
             if act.any():
                 rows.append(frame[act])
@@ -424,7 +865,7 @@ class SparseWindowDatasetPyG(Dataset):
         pooled_rows = []
         plane_rows: dict = {}
         for s in starts:
-            frame = self._compute_frame(s, s + self.window_size).reshape(self.num_nodes, -1)
+            frame = self._reconstruction_frame(s).reshape(self.num_nodes, -1)
             act = np.abs(frame).sum(axis=1) > 1e-6
             if not act.any():
                 continue
@@ -820,7 +1261,7 @@ class SparseWindowDatasetPyG(Dataset):
         start = self._starts[idx]
 
         if self.reconstruction:
-            frame = self._compute_frame(start, start + self.window_size).reshape(
+            frame = self._reconstruction_frame(start).reshape(
                 self.num_nodes, -1).astype(np.float32)
             if self.standardize and self.feature_mean is not None:
                 feats = (frame - self.feature_mean) / self.feature_std
@@ -858,47 +1299,104 @@ class SparseWindowDatasetPyG(Dataset):
         return Data(x=x, y=target_flat, edge_index=self.edge_index_full)
 
     def window_metadata(self, indices=None) -> dict:
-        """Return per-window provenance for the given window indices (default: all).
+        """Return per-window provenance for selected dataset indices.
 
-        Returns an empty dict if the dataset was loaded without provenance data
-        (i.e. from an events NPZ that pre-dates metadata support).
-
-        Keys present when provenance is available
-        -----------------------------------------
-        first_run, first_subrun, first_event_num : (N,) int32
-            Run/subrun/event number of the first event in each window.
-        last_event_num : (N,) int32
-            Event number of the last event in each window.
-        first_file_idx, last_file_idx : (N,) int32
-            Index into ``filenames`` for the first and last event.
-        first_time, last_time : (N,) float64
-            Event timestamp (e.g. ``meta.time``) of the first/last event in
-            each window, when a time-like tpc branch was provided.
-        filenames : list[str]
-            Ordered list of source ROOT filenames.
+        In event-count mode, metadata describes the first and last contiguous
+        event in each sample. In timed mode, it describes the first and last
+        real event selected for each interval, plus the requested interval
+        boundaries and event counts before/after subsampling.
         """
         if self._evt_run is None:
             return {}
 
-        starts = np.array(self._starts, dtype=np.int64)
+        if self.timed_window:
+            if (
+                self._timed_event_indices is None
+                or self._timed_interval_starts_ns is None
+                or self._timed_interval_ends_ns is None
+                or self._timed_candidate_counts is None
+            ):
+                return {}
+
+            sample_indices = np.arange(
+                len(self._timed_event_indices), dtype=np.int64
+            )
+            if indices is not None:
+                sample_indices = sample_indices[np.asarray(indices, dtype=np.int64)]
+
+            first_indices = np.full(sample_indices.size, -1, dtype=np.int64)
+            last_indices = np.full(sample_indices.size, -1, dtype=np.int64)
+            selected_counts = np.zeros(sample_indices.size, dtype=np.int64)
+
+            for out_idx, sample_idx in enumerate(sample_indices):
+                selected = self._timed_event_indices[int(sample_idx)]
+                real = selected[selected >= 0]
+                selected_counts[out_idx] = real.size
+                if real.size:
+                    first_indices[out_idx] = int(real[0])
+                    last_indices[out_idx] = int(real[-1])
+
+            valid = first_indices >= 0
+            first_run = np.full(sample_indices.size, -1, dtype=np.int32)
+            first_subrun = np.full(sample_indices.size, -1, dtype=np.int32)
+            first_event_num = np.full(sample_indices.size, -1, dtype=np.int32)
+            last_event_num = np.full(sample_indices.size, -1, dtype=np.int32)
+
+            first_run[valid] = self._evt_run[first_indices[valid]]
+            if self._evt_subrun is not None:
+                first_subrun[valid] = self._evt_subrun[first_indices[valid]]
+            if self._evt_num is not None:
+                first_event_num[valid] = self._evt_num[first_indices[valid]]
+                last_event_num[valid] = self._evt_num[last_indices[valid]]
+
+            result: dict = {
+                "first_run": first_run,
+                "first_subrun": first_subrun,
+                "first_event_num": first_event_num,
+                "last_event_num": last_event_num,
+                "candidate_event_count": self._timed_candidate_counts[sample_indices],
+                "selected_event_count": selected_counts,
+                "time_window_start": self._timed_interval_starts_ns[sample_indices],
+                "time_window_end": self._timed_interval_ends_ns[sample_indices],
+                "filenames": list(self._filenames),
+            }
+
+            if self._evt_file_idx is not None:
+                first_file_idx = np.full(sample_indices.size, -1, dtype=np.int32)
+                last_file_idx = np.full(sample_indices.size, -1, dtype=np.int32)
+                first_file_idx[valid] = self._evt_file_idx[first_indices[valid]]
+                last_file_idx[valid] = self._evt_file_idx[last_indices[valid]]
+                result["first_file_idx"] = first_file_idx
+                result["last_file_idx"] = last_file_idx
+
+            if self._evt_time is not None:
+                first_time = np.full(sample_indices.size, np.nan, dtype=np.float64)
+                last_time = np.full(sample_indices.size, np.nan, dtype=np.float64)
+                first_time[valid] = self._evt_time[first_indices[valid]]
+                last_time[valid] = self._evt_time[last_indices[valid]]
+                result["first_time"] = first_time
+                result["last_time"] = last_time
+
+            return result
+
+        starts = np.asarray(self._starts, dtype=np.int64)
         if indices is not None:
-            starts = starts[np.asarray(indices)]
+            starts = starts[np.asarray(indices, dtype=np.int64)]
+        ends = starts + self.events_per_sample - 1
 
-        ends = starts + self.events_per_sample - 1  # inclusive last event index
-
-        result: dict = {
-            "first_run":       self._evt_run[starts],
-            "first_subrun":    self._evt_subrun[starts],
+        result = {
+            "first_run": self._evt_run[starts],
+            "first_subrun": self._evt_subrun[starts],
             "first_event_num": self._evt_num[starts],
-            "last_event_num":  self._evt_num[ends],
-            "filenames":       list(self._filenames),
+            "last_event_num": self._evt_num[ends],
+            "filenames": list(self._filenames),
         }
         if self._evt_file_idx is not None:
             result["first_file_idx"] = self._evt_file_idx[starts]
-            result["last_file_idx"]  = self._evt_file_idx[ends]
+            result["last_file_idx"] = self._evt_file_idx[ends]
         if self._evt_time is not None:
             result["first_time"] = self._evt_time[starts]
-            result["last_time"]  = self._evt_time[ends]
+            result["last_time"] = self._evt_time[ends]
         return result
 
     # ------------------------------------------------------------------
@@ -1008,13 +1506,34 @@ class SparseWindowDatasetPyG(Dataset):
         )
         self._agg_offsets = agg_offsets
 
-    def _compute_frame(self, evt_start: int, evt_end: int) -> np.ndarray:
-        """Aggregate events[evt_start:evt_end] into (n_channels, n_bins, n_features).
+    def _compute_frame(
+        self,
+        evt_start: Optional[int] = None,
+        evt_end: Optional[int] = None,
+        *,
+        event_indices: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Aggregate one event selection into ``(channels, bins, features)``.
 
-        Uses pre-aggregated per-event CSR data so each bin only needs
-        np.bincount / np.minimum.at on ~events_per_bin small arrays rather
-        than sorting all raw hits.
+        The legacy path passes a contiguous ``evt_start:evt_end`` range. Timed
+        windows pass an explicit array of ``window_size`` event indices, where
+        ``-1`` denotes a synthetic all-zero padded event.
         """
+        if event_indices is None:
+            if evt_start is None or evt_end is None:
+                raise ValueError(
+                    "Either event_indices or evt_start/evt_end must be provided."
+                )
+            event_indices = np.arange(evt_start, evt_end, dtype=np.int64)
+        else:
+            event_indices = np.asarray(event_indices, dtype=np.int64)
+
+        if event_indices.shape != (self.window_size,):
+            raise ValueError(
+                "A frame must contain exactly window_size event positions, "
+                f"got shape {event_indices.shape}; window_size={self.window_size}."
+            )
+
         N = self.num_nodes
         frame = np.zeros((N, self.n_bins, self.n_node_features), dtype=np.float32)
 
@@ -1036,7 +1555,11 @@ class SparseWindowDatasetPyG(Dataset):
             ch_parts = []
             feat_parts = []
             for i in split:
-                e = evt_start + int(i)
+                e = int(event_indices[int(i)])
+                # -1 is a zero-padded event. It contributes no hits, while
+                # remaining in n_events_bin for occupancy/rate denominators.
+                if e < 0:
+                    continue
                 a_start = int(self._agg_offsets[e])
                 a_end = int(self._agg_offsets[e + 1])
                 if a_end > a_start:
