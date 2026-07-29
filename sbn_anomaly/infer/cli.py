@@ -773,9 +773,12 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
         try:
             from sbn_anomaly.infer.window_score import max_score
             from sbn_anomaly.utils.plotting import (
+                save_node_mse_plot,
                 save_score_distribution_plot,
                 save_score_over_time_plot,
-                save_node_mse_plot,
+            )
+            from sbn_anomaly.utils.timed_plotting import (
+                save_timed_score_over_time_plot,
             )
             plot_dir = out_path.parent
             thr = float(threshold) if threshold is not None else None
@@ -783,11 +786,59 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
                 scores, plot_dir, filename=out_path.stem + "_score_distribution.png",
                 threshold=thr, title=f"Window score distribution ({aggregator})",
             )
-            save_score_over_time_plot(
-                scores, max_score(node_scores), plot_dir,
-                filename=out_path.stem + "_score_over_time.png", threshold=thr,
-                title="Window anomaly score over time",
-            )
+            timed_window = bool(data_cfg.get("timed_window", False))
+
+            if (
+                timed_window
+                and window_meta
+                and "time_window_start" in window_meta
+            ):
+                starts_ns = np.asarray(
+                    window_meta["time_window_start"],
+                    dtype=np.float64,
+                ).reshape(-1)
+
+                if starts_ns.size != scores.size:
+                    raise ValueError(
+                        "Timed-window start metadata length does not match "
+                        f"the number of scores: {starts_ns.size} != {scores.size}"
+                    )
+
+                elapsed_seconds = (starts_ns - starts_ns[0]) / 1.0e9
+                total_elapsed_seconds = (
+                    float(elapsed_seconds[-1]) if elapsed_seconds.size else 0.0
+                )
+
+                if total_elapsed_seconds >= 7200.0:
+                    elapsed_values = elapsed_seconds / 3600.0
+                    elapsed_unit = "hours"
+                elif total_elapsed_seconds >= 120.0:
+                    elapsed_values = elapsed_seconds / 60.0
+                    elapsed_unit = "minutes"
+                else:
+                    elapsed_values = elapsed_seconds
+                    elapsed_unit = "seconds"
+
+                save_timed_score_over_time_plot(
+                    scores,
+                    max_score(node_scores),
+                    elapsed_values,
+                    plot_dir,
+                    filename=out_path.stem + "_score_over_time_timed.png",
+                    threshold=thr,
+                    title="Window anomaly score over elapsed time",
+                    time_unit=elapsed_unit,
+                )
+            else:
+                # Preserve the original event-count/window-index plot exactly.
+                save_score_over_time_plot(
+                    scores,
+                    max_score(node_scores),
+                    plot_dir,
+                    filename=out_path.stem + "_score_over_time.png",
+                    threshold=thr,
+                    title="Window anomaly score over time",
+                )
             save_node_mse_plot(
                 channel_mean_error, plot_dir,
                 filename=out_path.stem + "_channel_error.png",

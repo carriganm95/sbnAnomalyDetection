@@ -21,7 +21,11 @@ from sbn_anomaly.utils.logging import setup_logging
 
 
 def _split_dataset_for_validation(dataset, validation_split: float, seed: int):
-    """Split a map-style dataset into train/validation subsets when requested."""
+    """Use the original random train/validation split.
+
+    This remains the default for every legacy/event-count dataset and for all
+    non-Graph-VAE training paths.
+    """
     if validation_split <= 0.0 or validation_split >= 1.0:
         return dataset, None
     try:
@@ -630,7 +634,15 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
 
     validation_split = float(train_cfg.get("validation_split", 0.0) or 0.0)
     validation_seed = int(train_cfg.get("validation_seed", 42))
-    train_dataset, val_dataset = _split_dataset_for_validation(dataset, validation_split, validation_seed)
+
+    # Only timed-window Graph-VAE training uses the chronological purged split.
+    # Every old configuration, including configs without a timed_window key,
+    # continues to use the original seeded random split.
+    train_dataset, val_dataset = _split_dataset_for_validation(
+        dataset,
+        validation_split,
+        validation_seed,
+    )
 
     batch_size = int(train_cfg.get("batch_size", 16))
     num_workers = int(train_cfg.get("num_workers", 4))
