@@ -575,10 +575,9 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
         window_size=int(data_cfg.get("window_size", 20)),
         n_bins=int(data_cfg.get("n_temporal_bins", 4)),
         stride=int(data_cfg.get("stride", 1)),
-        timed_window=timed_window,
-        window_time_size=window_time_size,
-        window_time_stride=window_time_stride,
-        timed_window_seed=timed_window_seed,
+        window_mode=str(data_cfg.get("window_mode", "event")),
+        window_duration=data_cfg.get("window_duration"),
+        stride_duration=data_cfg.get("stride_duration"),
         radius=int(data_cfg.get("adjacency_radius", 4)),
         node_features=data_cfg.get("node_features") or None,
         prune_inactive=bool(data_cfg.get("prune_inactive", True)),
@@ -589,6 +588,7 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
         standardize_by=str(data_cfg.get("standardize_by", "global")),
         min_plane_samples=int(data_cfg.get("min_plane_samples", 20)),
         log_features=data_cfg.get("log_features") or None,
+        graph_features=data_cfg.get("graph_features") or None,
     )
 
     if root_files:
@@ -664,6 +664,11 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
         dropout=float(model_cfg.get("dropout", 0.1)),
         mask_ratio=float(model_cfg.get("mask_ratio", 0.15)),
         use_channel_idx=bool(model_cfg.get("use_channel_idx", True)),
+        # Derived from the dataset (not a separate model config key) so the
+        # model always matches whatever data.graph_features actually produced
+        # -- GraphReconDataset (dense/legacy path) has no graph_feat_dim, so
+        # getattr defaults it to 0 (conditioning disabled) there.
+        graph_dim=getattr(dataset, "graph_feat_dim", 0),
         conv=str(model_cfg.get("conv", "sage")),
     )
 
@@ -672,7 +677,7 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
     logger.info(
         "GraphVAE params=%d  in_dim=%d  latent_dim=%d  "
         "encoder_hidden_dims=%s  decoder_hidden_dims=%s  "
-        "dropout=%.3f  mask_ratio=%.3f  use_channel_idx=%s  conv=%s",
+        "dropout=%.3f  mask_ratio=%.3f  use_channel_idx=%s  graph_dim=%d  conv=%s",
         n_params,
         dataset.node_feat_dim,
         int(model_cfg.get("latent_dim", 12)),
@@ -681,6 +686,7 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
         float(model_cfg.get("dropout", 0.1)),
         float(model_cfg.get("mask_ratio", 0.15)),
         bool(model_cfg.get("use_channel_idx", True)),
+        model.graph_dim,
         str(model_cfg.get("conv", "sage")),
     )
 

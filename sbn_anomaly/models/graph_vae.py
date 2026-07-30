@@ -22,6 +22,10 @@ Expected PyG ``Data``/``Batch`` fields (from GraphReconDataset):
     y:          (N, F)     — reconstruction target (clean features)
     edge_index: (2, E)
     batch:      (N,)       — graph id per node (added by the PyG DataLoader)
+    graph_attr: (num_graphs, graph_dim) — optional per-window conditioning
+                vector (e.g. event count), only required when the model is
+                constructed with graph_dim > 0 (see SparseWindowDatasetPyG's
+                graph_features).
 """
 
 from __future__ import annotations
@@ -62,6 +66,21 @@ class GraphVAE(nn.Module):
     use_channel_idx:
         Concatenate the normalized channel-index column as a conditioning input
         (lets the model learn per-channel baselines).
+    graph_dim:
+        Size of the per-graph (per-window) conditioning vector, e.g. event
+        count / trigger rate for that window (see
+        ``SparseWindowDatasetPyG(graph_features=...)``). 0 (default) disables
+        it entirely -- existing configs/checkpoints are unaffected. When > 0,
+        every ``Data`` the model sees must carry a ``graph_attr`` tensor of
+        shape ``(1, graph_dim)`` (``(num_graphs, graph_dim)`` after PyG
+        batching); it's broadcast to every node in its graph (via
+        ``data.batch``) and concatenated into both the encoder and decoder
+        inputs, the same way ``channel_idx`` already is -- letting the model
+        learn "what a channel should look like *given this window's rate*"
+        instead of forcing rate-driven variation to be explained away as
+        per-channel anomaly. Conditioning both encode and decode (not just
+        decode) means the latent code itself can factor out rate-driven
+        variation rather than smuggling it into z.
     conv:
         ``"sage"`` (default, self-preserving) or ``"gcn"``.
     """
@@ -75,6 +94,7 @@ class GraphVAE(nn.Module):
         dropout: float = 0.1,
         mask_ratio: float = 0.15,
         use_channel_idx: bool = True,
+        graph_dim: int = 0,
         conv: str = "sage",
     ) -> None:
         super().__init__()
@@ -85,6 +105,9 @@ class GraphVAE(nn.Module):
         self.dropout = float(dropout)
         self.mask_ratio = float(mask_ratio)
         self.use_channel_idx = bool(use_channel_idx)
+        self.graph_dim = int(graph_dim)
+        if self.graph_dim < 0:
+            raise ValueError(f"graph_dim must be >= 0, got {graph_dim}")
 
         if conv == "sage":
             Conv = SAGEConv
@@ -117,7 +140,7 @@ class GraphVAE(nn.Module):
             allow_empty=True,
         )
 
-        enc_in = self.in_dim + (1 if self.use_channel_idx else 0)
+        enc_in = self.in_dim + (1 if self.use_channel_idx else 0) + self.graph_dim
 
         # Variable-width graph encoder.
         # Example: encoder_hidden_dims = [128, 64, 32]
@@ -133,7 +156,7 @@ class GraphVAE(nn.Module):
         self.fc_mu = nn.Linear(encoder_out_dim, self.latent_dim)
         self.fc_logvar = nn.Linear(encoder_out_dim, self.latent_dim)
 
-        dec_in = self.latent_dim + (1 if self.use_channel_idx else 0)
+        dec_in = self.latent_dim + (1 if self.use_channel_idx else 0) + self.graph_dim
 
         # Variable-width decoder MLP.
         # Example: decoder_hidden_dims = [64, 32]
@@ -153,8 +176,39 @@ class GraphVAE(nn.Module):
             return x[:, :1], x[:, 1:]
         return None, x
 
-    def encode(self, feats, channel_idx, edge_index):
-        h = torch.cat([channel_idx, feats], dim=1) if self.use_channel_idx else feats
+    def _broadcast_graph_cond(self, data, num_nodes: int):
+        """Return the per-graph conditioning vector broadcast to (num_nodes, graph_dim).
+
+        ``data.graph_attr`` is (num_graphs, graph_dim) after PyG batching (or
+        (1, graph_dim) for a single un-batched Data). ``data.batch`` maps each
+        node to its graph id; a raw single Data has no ``batch`` attribute, in
+        which case every node belongs to graph 0.
+        """
+        graph_attr = getattr(data, "graph_attr", None)
+        if graph_attr is None:
+            raise ValueError(
+                f"GraphVAE was constructed with graph_dim={self.graph_dim} but this "
+                "batch has no 'graph_attr' attribute. Build the dataset with "
+                "data.graph_features set so every window carries the expected "
+                "per-graph conditioning vector, or construct the model with "
+                "graph_dim=0 to disable conditioning."
+            )
+        if graph_attr.shape[-1] != self.graph_dim:
+            raise ValueError(
+                f"graph_attr has width {graph_attr.shape[-1]} but the model expects "
+                f"graph_dim={self.graph_dim}; data.graph_features must match the "
+                "model config exactly (same list, same order)."
+            )
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            batch = torch.zeros(num_nodes, dtype=torch.long, device=graph_attr.device)
+        return graph_attr[batch]
+
+    def encode(self, feats, channel_idx, edge_index, graph_cond=None):
+        parts = [channel_idx, feats] if self.use_channel_idx else [feats]
+        if self.graph_dim > 0:
+            parts.append(graph_cond)
+        h = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
         for conv in self.convs:
             h = conv(h, edge_index)
             h = F.relu(h)
@@ -168,13 +222,18 @@ class GraphVAE(nn.Module):
             return mu + torch.randn_like(std) * std
         return mu
 
-    def decode(self, z, channel_idx):
-        h = torch.cat([channel_idx, z], dim=1) if self.use_channel_idx else z
+    def decode(self, z, channel_idx, graph_cond=None):
+        parts = [channel_idx, z] if self.use_channel_idx else [z]
+        if self.graph_dim > 0:
+            parts.append(graph_cond)
+        h = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
         return self.decoder(h)
 
     def forward(self, data):
         channel_idx, feats = self._split(data.x)
         edge_index = data.edge_index
+
+        graph_cond = self._broadcast_graph_cond(data, feats.shape[0]) if self.graph_dim > 0 else None
 
         feats_in = feats
         if self.training and self.mask_ratio > 0:
@@ -182,9 +241,9 @@ class GraphVAE(nn.Module):
             feats_in = feats.clone()
             feats_in[mask] = 0.0
 
-        mu, logvar = self.encode(feats_in, channel_idx, edge_index)
+        mu, logvar = self.encode(feats_in, channel_idx, edge_index, graph_cond)
         z = self.reparameterize(mu, logvar)
-        x_hat = self.decode(z, channel_idx)
+        x_hat = self.decode(z, channel_idx, graph_cond)
         return x_hat, mu, logvar, z
 
     # ------------------------------------------------------------------

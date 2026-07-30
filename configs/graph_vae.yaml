@@ -27,16 +27,29 @@ data:
   # windows_path: data/windows_train.npz   # alternative: dense (num_windows, num_nodes, F)
 
   # Window definition (how events are grouped into one reconstruction frame).
-  window_size: 500
-
-  # When false, windows use the original event-count-based behavior.
-  # When true, windows cover fixed intervals of wall-clock time.
-  timed_window: false
-  window_time_size: 600      # seconds
-  window_time_stride: 15     # seconds
-
+  #
+  # window_mode: event (default) | time
+  #   event: a fixed number of events per window (window_size), split into
+  #     n_temporal_bins equal-sized groups by event index. stride advances by
+  #     that many events between windows.
+  #   time: a fixed elapsed-time span per window (window_duration, same units
+  #     as the "time" tpc_branch below -- meta.time here), holding however
+  #     many events actually occurred in that span. Makes a changing trigger
+  #     rate a directly visible signal (event count/occupancy/hit_rate per
+  #     bin) instead of always packing the same event count regardless of how
+  #     long that took to collect. Requires a time-like tpc_branches entry
+  #     (already set below) and reconstruction=True (this config). n_bins
+  #     split window_duration into equal time slices; stride_duration (default
+  #     = window_duration, i.e. non-overlapping) advances the window start.
+  #   window_size/stride below are ignored in time mode; window_duration/
+  #   stride_duration are ignored in event mode -- flip window_mode to switch,
+  #   no other config changes needed.
+  window_mode: event
+  window_size: 100
   n_temporal_bins: 4
   stride: 100
+  # window_duration: 5.0      # only used when window_mode: time
+  # stride_duration: 5.0      # only used when window_mode: time (default: window_duration)
 
   adjacency_radius: 4
   prune_inactive: true
@@ -102,6 +115,22 @@ data:
   # them; width_mean/sp_fraction are bounded/well-behaved and don't need it.
   # Must be a subset of node_features. Use the SAME list for train and inference.
   log_features: [sum, min, max, mean]
+
+  # Per-graph (per-window) conditioning features -- distinct from node_features
+  # (per-channel-per-bin): these describe the WHOLE window and are fed into the
+  # model as an extra conditioning input (model.graph_dim is set automatically
+  # from len(graph_features), no need to set it separately), so the model can
+  # learn "what a channel should look like given how busy this window was"
+  # instead of a rate change only ever showing up as reconstruction error.
+  #   event_count:       raw number of events aggregated into the window.
+  #   log1p_event_count: log1p(event_count) -- use this instead of/alongside
+  #     event_count when window_mode: time, since event count can range from
+  #     0 (quiet gap) to many in a burst; log-compresses that tail the same
+  #     way log_features does for heavy-tailed node features.
+  # Standardized the same way as node_features (fit from good-run windows,
+  # persisted in standardization.npz). Empty/unset = no conditioning (default,
+  # fully backward compatible -- graph_dim=0).
+  graph_features: [log1p_event_count]
 
 model:
   latent_dim: 12          # per-node bottleneck

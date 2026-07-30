@@ -497,9 +497,12 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
     # Load training standardization (saved next to the checkpoint).
     std_path = data_cfg.get("standardization_path") or str(Path(checkpoint).parent / "standardization.npz")
     feat_mean = feat_std = None
+    graph_feat_mean = graph_feat_std = None
     if Path(std_path).exists():
         s = np.load(std_path)
         feat_mean, feat_std = s["feature_mean"], s["feature_std"]
+        if "graph_feature_mean" in s:
+            graph_feat_mean, graph_feat_std = s["graph_feature_mean"], s["graph_feature_std"]
         logger.info("Loaded standardization from %s", std_path)
     else:
         logger.warning("No standardization.npz at %s; standardizing from input.", std_path)
@@ -574,18 +577,9 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
             window_size=int(data_cfg.get("window_size", 20)),
             n_bins=int(data_cfg.get("n_temporal_bins", 4)),
             stride=int(data_cfg.get("stride", 1)),
-            timed_window=timed_window,
-            window_time_size=(
-                float(window_time_size)
-                if window_time_size is not None
-                else None
-            ),
-            window_time_stride=(
-                float(window_time_stride)
-                if window_time_stride is not None
-                else None
-            ),
-            timed_window_seed=int(data_cfg.get("timed_window_seed", 0)),
+            window_mode=str(data_cfg.get("window_mode", "event")),
+            window_duration=data_cfg.get("window_duration"),
+            stride_duration=data_cfg.get("stride_duration"),
             radius=int(data_cfg.get("adjacency_radius", 4)),
             node_features=data_cfg.get("node_features") or None,
             prune_inactive=bool(data_cfg.get("prune_inactive", True)),
@@ -596,6 +590,8 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
             feature_mean=feat_mean,
             feature_std=feat_std,
             log_features=data_cfg.get("log_features") or None,
+            graph_features=data_cfg.get("graph_features") or None,
+            graph_feature_mean=graph_feat_mean, graph_feature_std=graph_feat_std,
         )
     else:
         windows = arch["windows"] if (isinstance(arch, np.lib.npyio.NpzFile) and "windows" in arch) \
@@ -629,6 +625,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
         dropout=float(model_cfg.get("dropout", 0.1)),
         mask_ratio=0.0,  # no masking at inference
         use_channel_idx=bool(model_cfg.get("use_channel_idx", True)),
+        graph_dim=getattr(dataset, "graph_feat_dim", 0),
         conv=str(model_cfg.get("conv", "sage")),
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -636,7 +633,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
     logger.info(
         "GraphVAE inference model params=%d  in_dim=%d  latent_dim=%d  "
         "encoder_hidden_dims=%s  decoder_hidden_dims=%s  "
-        "dropout=%.3f  mask_ratio=%.3f  use_channel_idx=%s  conv=%s",
+        "dropout=%.3f  mask_ratio=%.3f  use_channel_idx=%s  graph_dim=%d  conv=%s",
         n_params,
         dataset.node_feat_dim,
         int(model_cfg.get("latent_dim", 12)),
@@ -645,6 +642,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
         float(model_cfg.get("dropout", 0.1)),
         0.0,
         bool(model_cfg.get("use_channel_idx", True)),
+        model.graph_dim,
         str(model_cfg.get("conv", "sage")),
     )
 
@@ -675,9 +673,14 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
     node_scores = np.stack(rows, axis=0) if rows else np.zeros((0, num_channels), np.float32)
 
     # Per-window provenance from the sparse events' metadata, when available.
-    if is_sparse and provenance is None:
-        window_meta = dataset.window_metadata()
-        if window_meta:
+    # event_count needs no provenance data (just window bounds), so it's always
+    # present; the run/subrun/event triple requires provenance and is only
+    # added when present, hence the explicit key check rather than `if meta:`.
+    event_count = None
+    if is_sparse:
+        meta = dataset.window_metadata()
+        event_count = meta.get("event_count")
+        if provenance is None and "first_run" in meta:
             provenance = np.stack(
                 [
                     window_meta["first_run"],
@@ -721,32 +724,10 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
            "channel_active_frac": channel_active_frac}
     if provenance is not None:
         out["provenance"] = provenance
-
-    # Preserve detailed sparse-window metadata. Timed-window datasets provide
-    # the requested interval boundaries and the number of real selected events
-    # before zero padding; legacy event-count datasets provide the usual first/
-    # last event information.
-    if window_meta:
-        for key in (
-            "first_run",
-            "first_subrun",
-            "first_event_num",
-            "last_event_num",
-            "first_file_idx",
-            "last_file_idx",
-            "first_time",
-            "last_time",
-            "selected_event_count",
-            "time_window_start",
-            "time_window_end",
-        ):
-            if key in window_meta:
-                out[key] = window_meta[key]
-        if window_meta.get("filenames"):
-            out["filenames"] = np.asarray(
-                window_meta["filenames"], dtype="U512"
-            )
-
+    if event_count is not None:
+        # Trigger count per window -- lets scores.npz be correlated against
+        # the rate directly (e.g. does anomaly score track a rate change).
+        out["event_count"] = event_count
     threshold = _score_threshold_from_config(scores, infer_cfg, logger=logger)
     if threshold is not None:
         out["is_anomaly"] = (scores > threshold)
@@ -1001,10 +982,15 @@ def _infer_gnn(cfg: dict, checkpoint: str, output: str, input_override: str | No
     if node_feat_names:
         save_dict["node_feature_names"] = np.asarray(node_feat_names, dtype=str)
 
-    # Attach per-window provenance (run/subrun/event/filename) when available
+    # Attach per-window provenance (run/subrun/event/filename) when available.
+    # event_count needs no provenance data (just window bounds) so it's
+    # attached separately from the has-real-provenance check below.
     if hasattr(base_dataset, "window_metadata"):
         provenance = base_dataset.window_metadata(indices=scored_indices)
-        if provenance:
+        if "event_count" in provenance:
+            save_dict["event_count"] = provenance["event_count"]
+        has_provenance = "first_run" in provenance
+        if has_provenance:
             for key in ("first_run", "first_subrun", "first_event_num", "last_event_num",
                         "first_file_idx", "last_file_idx"):
                 if key in provenance:

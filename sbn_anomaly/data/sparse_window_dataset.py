@@ -63,6 +63,22 @@ _HASSP_FEATURES = {"sp_fraction"}  # fraction of a channel's hits with a matched
 _ALLOWED_FEATURES |= _WIDTH_FEATURES | _SUMADC_FEATURES | _MULT_FEATURES | _HASSP_FEATURES
 _N_AGG_COLS = 20  # 0-6 existing (integral/count/time), 7-18 width/sumadc/mult, 19 hasSP
 
+# Per-graph (per-window) conditioning features -- distinct from _ALLOWED_FEATURES
+# (per-channel-per-bin). These describe the whole window, get packed into
+# Data.graph_attr (standardized like node features), and are meant to be fed
+# into GraphVAE(graph_dim=...) so the model can condition on "how busy was
+# this window" instead of that variation only showing up as reconstruction
+# error. Add new names here (and a branch in
+# SparseWindowDatasetPyG._raw_graph_feature_vector) as more per-graph
+# variables become interesting -- e.g. a future "prev_window_gap" or
+# "run_number" would follow the same pattern.
+_GRAPH_ALLOWED_FEATURES = {
+    "event_count",         # raw number of events aggregated into this window
+    "log1p_event_count",   # log1p(event_count) -- compresses the heavy tail,
+                           # most useful in window_mode='time' where event
+                           # count can vary a lot between quiet and busy windows
+}
+
 
 def _run_subrun_evt_key(meta: dict, tpc_branches: List[str]) -> tuple:
     """Return a (run, subrun, evt) sort key from a per-event meta dict."""
@@ -154,6 +170,38 @@ class SparseWindowDatasetPyG(Dataset):
     Each frame is computed by splitting window_size events into n_bins temporal
     bins and aggregating hit integrals per channel per bin.
 
+    window_mode: "event" (default) | "time"
+        "event" (unchanged legacy behavior): windows are a fixed number of
+        events (window_size), and each window's n_bins split the same fixed
+        set of relative event indices every time.
+
+        "time": windows span a fixed elapsed duration (``window_duration``,
+        same units as evt_time) with however many events happened to occur in
+        that span -- the point being to make trigger-rate changes visible as
+        a first-class signal (event count/occupancy/hit_rate per bin) rather
+        than baking a fixed event count into every window regardless of how
+        long it took to collect. Requires per-event timestamps (evt_time) and
+        currently only supports reconstruction=True. Bin assignment is
+        per-window (via evt_time), computed in ``_time_bin_splits`` instead of
+        the constant ``_bin_splits`` used by "event" mode. ``stride_duration``
+        (default: ``window_duration``, i.e. non-overlapping windows) controls
+        how far the window start advances between samples.
+
+    graph_features : list[str], optional
+        Per-window (graph-level) conditioning features -- see
+        _GRAPH_ALLOWED_FEATURES (e.g. "event_count"). Distinct from
+        node_features (per-channel-per-bin): these describe the whole window
+        and get packed into a single standardized ``Data.graph_attr`` tensor
+        of shape (1, len(graph_features)), meant to be fed into
+        ``GraphVAE(graph_dim=len(graph_features))`` so the model can
+        condition on things like "how busy was this window" instead of that
+        variation only ever showing up as reconstruction error. Empty list
+        (default) means no graph_attr is attached at all -- fully backward
+        compatible with graph_dim=0 models. Standardized the same way as
+        node_features (via graph_feature_mean/graph_feature_std, fit from a
+        sample of windows unless pre-fit stats are passed in -- same pattern
+        as feature_mean/feature_std, and included in `standardization()`).
+
     Attributes
     ----------
     hit_branches : list[str]
@@ -163,6 +211,8 @@ class SparseWindowDatasetPyG(Dataset):
         Total channel count (including inactive channels).
     node_feat_dim : int
         Features per frame = n_bins * n_node_features.
+    graph_feat_dim : int
+        Length of graph_features (0 when not configured).
     """
 
     def __init__(
@@ -175,10 +225,9 @@ class SparseWindowDatasetPyG(Dataset):
         window_size: int = 20,
         n_bins: int = 4,
         stride: int = 1,
-        timed_window: bool = False,
-        window_time_size: Optional[float] = None,
-        window_time_stride: Optional[float] = None,
-        timed_window_seed: int = 0,
+        window_mode: str = "event",
+        window_duration: Optional[float] = None,
+        stride_duration: Optional[float] = None,
         radius: int = 4,
         node_features: Optional[List[str]] = None,
         prune_inactive: bool = True,
@@ -205,6 +254,9 @@ class SparseWindowDatasetPyG(Dataset):
         feature_mean: Optional[np.ndarray] = None,
         feature_std: Optional[np.ndarray] = None,
         log_features: Optional[List[str]] = None,
+        graph_features: Optional[List[str]] = None,
+        graph_feature_mean: Optional[np.ndarray] = None,
+        graph_feature_std: Optional[np.ndarray] = None,
     ) -> None:
         self._channels_flat = np.asarray(channels_flat, dtype=np.int64)
         self._integrals_flat = np.asarray(integrals_flat, dtype=np.float32)
@@ -245,17 +297,13 @@ class SparseWindowDatasetPyG(Dataset):
         self.radius = int(radius)
         self.prune_inactive = bool(prune_inactive)
 
-        if self.window_size <= 0:
-            raise ValueError(f"window_size must be positive, got {self.window_size}")
-        if self.n_bins <= 0:
-            raise ValueError(f"n_bins must be positive, got {self.n_bins}")
-        if self.n_bins > self.window_size:
-            raise ValueError(
-                "n_bins cannot exceed window_size because some temporal bins "
-                f"would be empty: n_bins={self.n_bins}, window_size={self.window_size}"
-            )
-        if not self.timed_window and self.stride <= 0:
-            raise ValueError(f"stride must be positive, got {self.stride}")
+        self.window_mode = str(window_mode)
+        if self.window_mode not in ("event", "time"):
+            raise ValueError(f"window_mode must be 'event' or 'time', got {window_mode!r}")
+        self.window_duration = float(window_duration) if window_duration is not None else None
+        self.stride_duration = (
+            float(stride_duration) if stride_duration is not None else self.window_duration
+        )
 
         if node_features is None:
             node_features = ["sum", "min", "max", "stdev", "count"]
@@ -297,6 +345,20 @@ class SparseWindowDatasetPyG(Dataset):
             if self.log_features else None
         )
 
+        # Per-graph (per-window) conditioning features -- see _GRAPH_ALLOWED_FEATURES.
+        # Packed into Data.graph_attr for GraphVAE(graph_dim=...) to condition on.
+        self.graph_features = list(graph_features) if graph_features else []
+        invalid_graph = set(self.graph_features) - _GRAPH_ALLOWED_FEATURES
+        if invalid_graph:
+            raise ValueError(f"Unknown graph_features: {invalid_graph}")
+        self.graph_feat_dim = len(self.graph_features)
+        self._graph_feature_mean_arg = (
+            np.asarray(graph_feature_mean, dtype=np.float32) if graph_feature_mean is not None else None
+        )
+        self._graph_feature_std_arg = (
+            np.asarray(graph_feature_std, dtype=np.float32) if graph_feature_std is not None else None
+        )
+
         # Reconstruction mode: each sample is ONE window (frame), target = itself
         # (graph autoencoder). Forecasting mode: history past frames + 1 target.
         self.reconstruction = bool(reconstruction)
@@ -306,52 +368,65 @@ class SparseWindowDatasetPyG(Dataset):
             raise ValueError(f"standardize_by must be 'global' or 'plane', got {standardize_by!r}")
         self.min_plane_samples = int(min_plane_samples)
 
-        if self.timed_window:
+        n_events = len(self._offsets) - 1
+        self._window_ends: Optional[List[int]] = None
+
+        if self.window_mode == "time":
+            # Fixed-time / variable-event-count windows: window boundaries are
+            # derived from evt_time rather than a fixed event count, so
+            # events_per_sample and _bin_splits (both constant-per-window in
+            # "event" mode) no longer apply -- see _time_bin_splits and the
+            # per-item bounds computed in __getitem__ / _fit_standardization*.
             if not self.reconstruction:
-                raise ValueError(
-                    "timed_window is currently supported only for reconstruction "
-                    "datasets such as graph_vae."
+                raise NotImplementedError(
+                    "window_mode='time' currently only supports reconstruction=True "
+                    "(single-window graph-VAE samples). The forecasting history/"
+                    "target path assumes a fixed event-count window_size and hasn't "
+                    "been extended to elapsed-time windows."
                 )
             if self._evt_time is None:
                 raise ValueError(
-                    "timed_window=true requires evt_time in the events NPZ. "
-                    "Materialize the dataset with meta.time in tpc_branches."
+                    "window_mode='time' requires per-event timestamps. Materialize "
+                    "events with a tpc_branches entry whose name contains 'time' "
+                    "(SparseWindowDatasetPyG.from_root extracts evt_time "
+                    "automatically when such a branch is present)."
                 )
-            if self.window_time_size is None or self.window_time_size <= 0:
+            if self.window_duration is None or self.window_duration <= 0:
                 raise ValueError(
-                    "timed_window=true requires a positive window_time_size in seconds."
+                    "window_mode='time' requires a positive 'window_duration' "
+                    "(same units as evt_time)."
                 )
-            if self.window_time_stride is None or self.window_time_stride <= 0:
+            if n_events > 1 and np.any(np.diff(self._evt_time) < 0):
                 raise ValueError(
-                    "timed_window=true requires a positive window_time_stride in seconds."
+                    "window_mode='time' requires evt_time to be non-decreasing. "
+                    "Load events with sort_events=True (from_root) so they are "
+                    "time-ordered."
                 )
-
-        n_events = len(self._offsets) - 1
-        self._timed_event_indices: Optional[List[np.ndarray]] = None
-        self._timed_interval_starts_ns: Optional[np.ndarray] = None
-        self._timed_interval_ends_ns: Optional[np.ndarray] = None
-        self._timed_candidate_counts: Optional[np.ndarray] = None
-
-        if self.timed_window:
-            self.events_per_sample = self.window_size
-            self._build_timed_windows()
-            assert self._timed_event_indices is not None
-            # In timed mode, entries in _starts are timed-window IDs, not event IDs.
-            self._starts = list(range(len(self._timed_event_indices)))
-        elif self.reconstruction:
-            self.events_per_sample = self.window_size
-            self._starts = list(
-                range(0, n_events - self.window_size + 1, self.stride)
-            )
+            self.events_per_sample = None  # variable event count per window
+            starts: List[int] = []
+            ends: List[int] = []
+            if n_events > 0:
+                t = float(self._evt_time[0])
+                last_t = float(self._evt_time[-1])
+                while t <= last_t:
+                    s = int(np.searchsorted(self._evt_time, t, side="left"))
+                    e = int(np.searchsorted(self._evt_time, t + self.window_duration, side="left"))
+                    if s < n_events:
+                        starts.append(s)
+                        ends.append(e)
+                    t += self.stride_duration
+            self._starts = starts
+            self._window_ends = ends
+            self._bin_splits = None  # per-window, computed by _time_bin_splits
         else:
-            self.events_per_sample = (self.history + 1) * self.window_size
-            self._starts = list(
-                range(0, n_events - self.events_per_sample + 1, self.stride)
-            )
+            if self.reconstruction:
+                self.events_per_sample = window_size
+                self._starts = list(range(0, n_events - window_size + 1, stride))
+            else:
+                self.events_per_sample = (history + 1) * window_size
+                self._starts = list(range(0, n_events - self.events_per_sample + 1, stride))
 
-        self._bin_splits = np.array_split(
-            np.arange(self.window_size, dtype=np.int64), self.n_bins
-        )
+            self._bin_splits = np.array_split(np.arange(window_size), n_bins)
 
         self.channel_map = channel_map
         self.edge_mode = str(edge_mode)
@@ -402,13 +477,116 @@ class SparseWindowDatasetPyG(Dataset):
             self.feature_std = np.where(self.feature_std < 1e-6, 1.0,
                                         self.feature_std).astype(np.float32)
 
-        logger.info(
-            "SparseWindowDatasetPyG ready: %d samples, %d channels, "
-            "%d features/frame, mode=%s, window_size=%d, n_bins=%d, timed_window=%s",
-            len(self._starts), self.num_nodes, self.node_feat_dim,
-            "recon" if self.reconstruction else "forecast",
-            self.window_size, self.n_bins, self.timed_window,
-        )
+        # Standardize graph-level conditioning features the same way (same
+        # standardize flag) -- unnormalized scalars of very different scales
+        # (event_count could be O(1)-O(1000) depending on window_duration)
+        # would otherwise dominate/destabilize the concatenated encoder/decoder
+        # input relative to the already-standardized node features.
+        self.graph_feature_mean = None
+        self.graph_feature_std = None
+        if self.reconstruction and self.standardize and self.graph_feat_dim > 0:
+            if self._graph_feature_mean_arg is not None and self._graph_feature_std_arg is not None:
+                self.graph_feature_mean = self._graph_feature_mean_arg
+                self.graph_feature_std = self._graph_feature_std_arg
+            else:
+                self.graph_feature_mean, self.graph_feature_std = self._fit_graph_standardization()
+            self.graph_feature_std = np.where(
+                self.graph_feature_std < 1e-6, 1.0, self.graph_feature_std
+            ).astype(np.float32)
+
+        if self.window_mode == "time":
+            logger.info(
+                "SparseWindowDatasetPyG ready: %d samples, %d channels, "
+                "%d features/frame, mode=%s, window_mode=time, "
+                "window_duration=%s, stride_duration=%s, n_bins=%d",
+                len(self._starts), self.num_nodes, self.node_feat_dim,
+                "recon" if self.reconstruction else "forecast",
+                self.window_duration, self.stride_duration, self.n_bins,
+            )
+        else:
+            logger.info(
+                "SparseWindowDatasetPyG ready: %d samples, %d channels, "
+                "%d features/frame, mode=%s, window_mode=event, "
+                "window_size=%d, n_bins=%d",
+                len(self._starts), self.num_nodes, self.node_feat_dim,
+                "recon" if self.reconstruction else "forecast",
+                self.window_size, self.n_bins,
+            )
+
+    def _window_bounds(self) -> List[tuple]:
+        """Return (evt_start, evt_end) event-index pairs for every window/sample.
+
+        In "event" mode every window has the same width (window_size), so the
+        end is derived from a constant offset. In "time" mode the width is
+        variable (elapsed-time windows), so the precomputed ends are used
+        directly.
+        """
+        if self.window_mode == "time":
+            return list(zip(self._starts, self._window_ends))
+        return [(s, s + self.window_size) for s in self._starts]
+
+    def _frame_for_bounds(self, s: int, e: int) -> np.ndarray:
+        """Compute one window's frame, using time-based bin assignment when needed."""
+        bin_splits = self._time_bin_splits(s, e) if self.window_mode == "time" else None
+        return self._compute_frame(s, e, bin_splits=bin_splits)
+
+    def _time_bin_splits(self, evt_start: int, evt_end: int) -> List[np.ndarray]:
+        """Assign events in [evt_start, evt_end) to n_bins by elapsed evt_time.
+
+        Returns relative (0-based, relative to evt_start) index arrays, one per
+        bin -- the same shape/semantics _compute_frame expects from
+        self._bin_splits in "event" mode, just computed per-window instead of
+        once for the whole dataset (since window width/composition varies).
+        """
+        n = evt_end - evt_start
+        if n <= 0:
+            return [np.empty(0, dtype=np.int64) for _ in range(self.n_bins)]
+        t0 = float(self._evt_time[evt_start])
+        bin_width = self.window_duration / self.n_bins
+        rel_t = self._evt_time[evt_start:evt_end] - t0
+        bin_idx = np.clip((rel_t / bin_width).astype(np.int64), 0, self.n_bins - 1)
+        return [np.where(bin_idx == b)[0] for b in range(self.n_bins)]
+
+    # ------------------------------------------------------------------
+    # Per-graph (per-window) conditioning features -- see _GRAPH_ALLOWED_FEATURES.
+    # ------------------------------------------------------------------
+
+    def _raw_graph_feature_vector(self, event_count: float) -> np.ndarray:
+        """Unstandardized graph-level feature vector for one window, in
+        ``self.graph_features`` order. ``event_count`` is the same value
+        stored standalone as ``Data.event_count``/``window_metadata()``."""
+        vals = []
+        for name in self.graph_features:
+            if name == "event_count":
+                vals.append(float(event_count))
+            elif name == "log1p_event_count":
+                vals.append(float(np.log1p(max(event_count, 0.0))))
+            else:  # pragma: no cover - already validated in __init__
+                raise ValueError(f"Unknown graph_feature {name!r}")
+        return np.array(vals, dtype=np.float32)
+
+    def _fit_graph_standardization(self, max_frames: int = 500):
+        """Fit per-feature mean/std for graph_features over a sample of windows."""
+        bounds = self._window_bounds()
+        if len(bounds) > max_frames:
+            rng = np.random.default_rng(0)
+            bounds = [bounds[i] for i in rng.choice(len(bounds), max_frames, replace=False)]
+        if not bounds:
+            return (np.zeros(self.graph_feat_dim, np.float32),
+                    np.ones(self.graph_feat_dim, np.float32))
+        rows = [self._raw_graph_feature_vector(e - s) for s, e in bounds]
+        flat = np.stack(rows, axis=0)
+        return flat.mean(axis=0).astype(np.float32), flat.std(axis=0).astype(np.float32)
+
+    def _compute_graph_attr(self, event_count: float) -> Optional[torch.Tensor]:
+        """Standardized graph_attr tensor, shape (1, graph_feat_dim), or None
+        when no graph_features are configured (GraphVAE(graph_dim=0))."""
+        if self.graph_feat_dim == 0:
+            return None
+        raw = self._raw_graph_feature_vector(event_count)
+        if self.graph_feature_mean is not None:
+            raw = (raw - self.graph_feature_mean) / self.graph_feature_std
+        return torch.from_numpy(raw.reshape(1, -1).astype(np.float32))
 
     def _build_timed_windows(self) -> None:
         """Build fixed-duration windows on a stitched continuous timeline.
@@ -792,13 +970,13 @@ class SparseWindowDatasetPyG(Dataset):
 
     def _fit_standardization(self, max_frames: int = 500):
         """Fit per-feature mean/std from active channels over a sample of frames."""
-        starts = self._starts
-        if len(starts) > max_frames:
+        bounds = self._window_bounds()
+        if len(bounds) > max_frames:
             rng = np.random.default_rng(0)
-            starts = [starts[i] for i in rng.choice(len(starts), max_frames, replace=False)]
+            bounds = [bounds[i] for i in rng.choice(len(bounds), max_frames, replace=False)]
         rows = []
-        for s in starts:
-            frame = self._reconstruction_frame(s).reshape(self.num_nodes, -1)
+        for s, e in bounds:
+            frame = self._frame_for_bounds(s, e).reshape(self.num_nodes, -1)
             act = np.abs(frame).sum(axis=1) > 1e-6
             if act.any():
                 rows.append(frame[act])
@@ -857,15 +1035,15 @@ class SparseWindowDatasetPyG(Dataset):
         noisy per-plane estimate or crashing on a small dataset.
         """
         channel_plane = self._channel_plane_lut()
-        starts = self._starts
-        if len(starts) > max_frames:
+        bounds = self._window_bounds()
+        if len(bounds) > max_frames:
             rng = np.random.default_rng(0)
-            starts = [starts[i] for i in rng.choice(len(starts), max_frames, replace=False)]
+            bounds = [bounds[i] for i in rng.choice(len(bounds), max_frames, replace=False)]
 
         pooled_rows = []
         plane_rows: dict = {}
-        for s in starts:
-            frame = self._reconstruction_frame(s).reshape(self.num_nodes, -1)
+        for s, e in bounds:
+            frame = self._frame_for_bounds(s, e).reshape(self.num_nodes, -1)
             act = np.abs(frame).sum(axis=1) > 1e-6
             if not act.any():
                 continue
@@ -918,7 +1096,17 @@ class SparseWindowDatasetPyG(Dataset):
     def standardization(self) -> dict:
         mean = self.feature_mean if self.feature_mean is not None else np.zeros(self.node_feat_dim, np.float32)
         std = self.feature_std if self.feature_std is not None else np.ones(self.node_feat_dim, np.float32)
-        return {"feature_mean": mean, "feature_std": std}
+        out = {"feature_mean": mean, "feature_std": std}
+        if self.graph_feat_dim > 0:
+            out["graph_feature_mean"] = (
+                self.graph_feature_mean if self.graph_feature_mean is not None
+                else np.zeros(self.graph_feat_dim, np.float32)
+            )
+            out["graph_feature_std"] = (
+                self.graph_feature_std if self.graph_feature_std is not None
+                else np.ones(self.graph_feat_dim, np.float32)
+            )
+        return out
 
     # ------------------------------------------------------------------
     # Class-method constructors
@@ -1261,7 +1449,13 @@ class SparseWindowDatasetPyG(Dataset):
         start = self._starts[idx]
 
         if self.reconstruction:
-            frame = self._reconstruction_frame(start).reshape(
+            if self.window_mode == "time":
+                end = self._window_ends[idx]
+            else:
+                end = start + self.window_size
+            event_count = float(end - start)  # graph-level: raw trigger count for this window
+            graph_attr = self._compute_graph_attr(event_count)
+            frame = self._frame_for_bounds(start, end).reshape(
                 self.num_nodes, -1).astype(np.float32)
             if self.standardize and self.feature_mean is not None:
                 feats = (frame - self.feature_mean) / self.feature_std
@@ -1275,10 +1469,16 @@ class SparseWindowDatasetPyG(Dataset):
                 if active.size == 0:
                     active = np.zeros(1, dtype=np.int64)
                 active_idx = torch.from_numpy(active.astype(np.int64))
-                return self._make_pruned_data(x, feats_t, active_idx)
-            return Data(x=x, y=feats_t, edge_index=self.edge_index_full,
+                return self._make_pruned_data(
+                    x, feats_t, active_idx, event_count=event_count, graph_attr=graph_attr,
+                )
+            data = Data(x=x, y=feats_t, edge_index=self.edge_index_full,
                         active_mask=torch.arange(self.num_nodes),
                         num_nodes_original=self.num_nodes)
+            data.event_count = torch.tensor([event_count], dtype=torch.float32)
+            if graph_attr is not None:
+                data.graph_attr = graph_attr
+            return data
 
         frames = []
         for w in range(self.history + 1):
@@ -1301,96 +1501,64 @@ class SparseWindowDatasetPyG(Dataset):
     def window_metadata(self, indices=None) -> dict:
         """Return per-window provenance for selected dataset indices.
 
-        In event-count mode, metadata describes the first and last contiguous
-        event in each sample. In timed mode, it describes the first and last
-        real event selected for each interval, plus the requested interval
-        boundaries and event counts before/after subsampling.
+        ``event_count`` is always present (it needs no provenance data, just
+        the window bounds already tracked by this dataset). The
+        run/subrun/event/time keys below are only present when the dataset
+        was loaded with provenance data (i.e. not from an events NPZ that
+        pre-dates metadata support) -- callers should check for those keys
+        individually rather than assuming a non-empty dict means all of them
+        are present.
+
+        Keys
+        ----
+        event_count : (N,) int64
+            Number of events aggregated into each window. Constant
+            (window_size) in "event" mode; variable in "time" mode -- this is
+            the same quantity stored as the graph-level ``event_count``
+            attribute on each reconstruction Data object.
+        first_run, first_subrun, first_event_num : (N,) int32
+            Run/subrun/event number of the first event in each window.
+        last_event_num : (N,) int32
+            Event number of the last event in each window.
+        first_file_idx, last_file_idx : (N,) int32
+            Index into ``filenames`` for the first and last event.
+        first_time, last_time : (N,) float64
+            Event timestamp (e.g. ``meta.time``) of the first/last event in
+            each window, when a time-like tpc branch was provided.
+        filenames : list[str]
+            Ordered list of source ROOT filenames.
         """
+        starts = np.array(self._starts, dtype=np.int64)
+        if self.window_mode == "time":
+            window_ends = np.array(self._window_ends, dtype=np.int64)
+            event_count = (window_ends - starts).astype(np.int64)
+            # Variable event count per window -- last event index is
+            # window_end - 1, clipped so a zero-event (fully quiet) window
+            # doesn't produce an out-of-range / before-window index.
+            ends = np.maximum(window_ends - 1, starts)
+        else:
+            # "event" mode: every window (or, in forecasting mode, every
+            # frame within a multi-frame sample) is a constant window_size.
+            event_count = np.full(len(starts), self.window_size, dtype=np.int64)
+            ends = starts + self.events_per_sample - 1  # inclusive last event index
+
+        if indices is not None:
+            idx = np.asarray(indices)
+            starts = starts[idx]
+            ends = ends[idx]
+            event_count = event_count[idx]
+
+        result: dict = {"event_count": event_count}
         if self._evt_run is None:
-            return {}
-
-        if self.timed_window:
-            if (
-                self._timed_event_indices is None
-                or self._timed_interval_starts_ns is None
-                or self._timed_interval_ends_ns is None
-                or self._timed_candidate_counts is None
-            ):
-                return {}
-
-            sample_indices = np.arange(
-                len(self._timed_event_indices), dtype=np.int64
-            )
-            if indices is not None:
-                sample_indices = sample_indices[np.asarray(indices, dtype=np.int64)]
-
-            first_indices = np.full(sample_indices.size, -1, dtype=np.int64)
-            last_indices = np.full(sample_indices.size, -1, dtype=np.int64)
-            selected_counts = np.zeros(sample_indices.size, dtype=np.int64)
-
-            for out_idx, sample_idx in enumerate(sample_indices):
-                selected = self._timed_event_indices[int(sample_idx)]
-                real = selected[selected >= 0]
-                selected_counts[out_idx] = real.size
-                if real.size:
-                    first_indices[out_idx] = int(real[0])
-                    last_indices[out_idx] = int(real[-1])
-
-            valid = first_indices >= 0
-            first_run = np.full(sample_indices.size, -1, dtype=np.int32)
-            first_subrun = np.full(sample_indices.size, -1, dtype=np.int32)
-            first_event_num = np.full(sample_indices.size, -1, dtype=np.int32)
-            last_event_num = np.full(sample_indices.size, -1, dtype=np.int32)
-
-            first_run[valid] = self._evt_run[first_indices[valid]]
-            if self._evt_subrun is not None:
-                first_subrun[valid] = self._evt_subrun[first_indices[valid]]
-            if self._evt_num is not None:
-                first_event_num[valid] = self._evt_num[first_indices[valid]]
-                last_event_num[valid] = self._evt_num[last_indices[valid]]
-
-            result: dict = {
-                "first_run": first_run,
-                "first_subrun": first_subrun,
-                "first_event_num": first_event_num,
-                "last_event_num": last_event_num,
-                "candidate_event_count": self._timed_candidate_counts[sample_indices],
-                "selected_event_count": selected_counts,
-                "time_window_start": self._timed_interval_starts_ns[sample_indices],
-                "time_window_end": self._timed_interval_ends_ns[sample_indices],
-                "filenames": list(self._filenames),
-            }
-
-            if self._evt_file_idx is not None:
-                first_file_idx = np.full(sample_indices.size, -1, dtype=np.int32)
-                last_file_idx = np.full(sample_indices.size, -1, dtype=np.int32)
-                first_file_idx[valid] = self._evt_file_idx[first_indices[valid]]
-                last_file_idx[valid] = self._evt_file_idx[last_indices[valid]]
-                result["first_file_idx"] = first_file_idx
-                result["last_file_idx"] = last_file_idx
-
-            if self._evt_time is not None:
-                first_time = np.full(sample_indices.size, np.nan, dtype=np.float64)
-                last_time = np.full(sample_indices.size, np.nan, dtype=np.float64)
-                first_time[valid] = self._evt_time[first_indices[valid]]
-                last_time[valid] = self._evt_time[last_indices[valid]]
-                result["first_time"] = first_time
-                result["last_time"] = last_time
-
             return result
 
-        starts = np.asarray(self._starts, dtype=np.int64)
-        if indices is not None:
-            starts = starts[np.asarray(indices, dtype=np.int64)]
-        ends = starts + self.events_per_sample - 1
-
-        result = {
-            "first_run": self._evt_run[starts],
-            "first_subrun": self._evt_subrun[starts],
+        result.update({
+            "first_run":       self._evt_run[starts],
+            "first_subrun":    self._evt_subrun[starts],
             "first_event_num": self._evt_num[starts],
-            "last_event_num": self._evt_num[ends],
-            "filenames": list(self._filenames),
-        }
+            "last_event_num":  self._evt_num[ends],
+            "filenames":       list(self._filenames),
+        })
         if self._evt_file_idx is not None:
             result["first_file_idx"] = self._evt_file_idx[starts]
             result["last_file_idx"] = self._evt_file_idx[ends]
@@ -1507,17 +1675,17 @@ class SparseWindowDatasetPyG(Dataset):
         self._agg_offsets = agg_offsets
 
     def _compute_frame(
-        self,
-        evt_start: Optional[int] = None,
-        evt_end: Optional[int] = None,
-        *,
-        event_indices: Optional[np.ndarray] = None,
+        self, evt_start: int, evt_end: int, bin_splits: Optional[List[np.ndarray]] = None
     ) -> np.ndarray:
-        """Aggregate one event selection into ``(channels, bins, features)``.
+        """Aggregate events[evt_start:evt_end] into (n_channels, n_bins, n_features).
 
-        The legacy path passes a contiguous ``evt_start:evt_end`` range. Timed
-        windows pass an explicit array of ``window_size`` event indices, where
-        ``-1`` denotes a synthetic all-zero padded event.
+        Uses pre-aggregated per-event CSR data so each bin only needs
+        np.bincount / np.minimum.at on ~events_per_bin small arrays rather
+        than sorting all raw hits.
+
+        ``bin_splits`` overrides ``self._bin_splits`` (relative-index arrays,
+        one per bin) -- used in "time" mode where bin membership is computed
+        per-window from evt_time instead of being a fixed, dataset-wide split.
         """
         if event_indices is None:
             if evt_start is None or evt_end is None:
@@ -1536,6 +1704,7 @@ class SparseWindowDatasetPyG(Dataset):
 
         N = self.num_nodes
         frame = np.zeros((N, self.n_bins, self.n_node_features), dtype=np.float32)
+        splits = bin_splits if bin_splits is not None else self._bin_splits
 
         features = set(self.node_features)
         need_min = "min" in features
@@ -1550,7 +1719,7 @@ class SparseWindowDatasetPyG(Dataset):
             if features & {f"{prefix}_{s}" for s in _GROUP_STATS}
         }
 
-        for b_idx, split in enumerate(self._bin_splits):
+        for b_idx, split in enumerate(splits):
             n_events_bin = max(1, len(split))  # events in this bin (occupancy/rate denom)
             ch_parts = []
             feat_parts = []
@@ -1662,7 +1831,12 @@ class SparseWindowDatasetPyG(Dataset):
         return frame
 
     def _make_pruned_data(
-        self, x: torch.Tensor, y: torch.Tensor, active_idx: torch.Tensor
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        active_idx: torch.Tensor,
+        event_count: Optional[float] = None,
+        graph_attr: Optional[torch.Tensor] = None,
     ) -> Data:
         m = active_idx.numel()
         active_np = active_idx.numpy()
@@ -1682,10 +1856,20 @@ class SparseWindowDatasetPyG(Dataset):
         else:
             edge_index = torch.zeros((2, 0), dtype=torch.long)
 
-        return Data(
+        data = Data(
             x=x_pruned,
             y=y_pruned,
             edge_index=edge_index,
             active_mask=active_idx,
             num_nodes_original=self.num_nodes,
         )
+        if event_count is not None:
+            # Graph-level scalar (not per-node): PyG's default Batch collation
+            # concatenates a (1,)-shaped per-Data attribute into (num_graphs,),
+            # the same idiom used for graph-level `y` in graph-regression tasks.
+            data.event_count = torch.tensor([float(event_count)], dtype=torch.float32)
+        if graph_attr is not None:
+            # (1, graph_dim) -> concatenates to (num_graphs, graph_dim) after
+            # batching, same idiom, one extra column dimension.
+            data.graph_attr = graph_attr
+        return data

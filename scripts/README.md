@@ -472,6 +472,32 @@ first event common to both files is used automatically (logged, so you know
 which one you got) — a quick way to sanity-check the pipeline without
 picking a specific event first.
 
+If `--tree-name`/`--meta-branches` don't match what's actually in
+`--hits-file` (e.g. `ValueError: Missing meta branch(es) ...`), `--list-branches`
+prints every branch (recursive — includes branches nested under a parent
+branch, which a shallow listing misses) so you can find the real names:
+```bash
+python scripts/compare_hits_to_waveform.py \
+    --raw-file good_raw_poc.root --hits-file .../run19305_evt0.root --list-branches
+```
+The default `--meta-branches` (`trk/meta/meta.run trk/meta/meta.subrun
+trk/meta/meta.evt`) matches the observed SBND caloskim layout, where these
+are nested *two* levels deep under a `trk` wrapper branch — override with
+whatever `--list-branches` shows if your file differs.
+
+**Caveat — `caloskim/TrackCaloSkim` only has track-associated hits.** This
+tree stores one row per *reconstructed track* (that's what the `trk/...`
+nesting means), not one row per event: an event with N tracks has N entries
+sharing the same run/subrun/event. `load_hits_for_event` merges hits from
+every matching entry for the requested event (deduplicating any hit shared
+identically between tracks) so you get all of that event's track-associated
+hits, not just the first track's — but hits that never got attached to any
+track (isolated/unclustered hits) still won't appear here, because they're
+never in this tree at all. If you need every hit the hit-finder produced,
+independent of tracking, use `dump_hits_pyroot.py` to dump the full
+`recob::Hit` collection from `Events` instead and pass that npz's provenance
+to compare against (see below).
+
 For each active channel (has a hit, or a raw deviation `--activity-threshold`
 sigma above its own robust noise floor — `--all-channels` forces every
 channel), draws the pedestal-subtracted waveform with one Gaussian per hit,
@@ -512,7 +538,9 @@ before a larger run.
 | `--run` / `--subrun` / `--event` | *(none — auto-picks the first common event if omitted)* | Event to match across both files; give all three or none |
 | `--event-index` | *(none)* | Alternative: match by entry order instead (only valid if both files share the same event ordering) |
 | `--list-events` | off | Print every `(run, subrun, event)` common to both files, then exit without drawing |
-| `--output` | *(required unless `--list-events`)* | Output ROOT file |
+| `--list-branches` | off | Print every branch (recursive) in `--tree-name` of `--hits-file`, then exit |
+| `--meta-branches RUN SUBRUN EVT` | `trk/meta/meta.run trk/meta/meta.subrun trk/meta/meta.evt` | Per-event provenance branch names in `--hits-file` |
+| `--output` | *(required unless `--list-events`/`--list-branches`)* | Output ROOT file |
 | `--tree-name` | `caloskim/TrackCaloSkim` | |
 | `--hit-branches` | matches `configs/graph_vae.yaml` | Used only to discover the `hits0.h`/etc. prefixes |
 | `--remove-coherent` | off | Also subtract common-mode noise per electronics group |
@@ -520,6 +548,92 @@ before a larger run.
 | `--activity-threshold` | `5.0` | Sigma above a channel's own noise floor to count as active when it has no hits |
 | `--all-channels` | off | Draw every channel, including inactive ones |
 | `--channel-range LO HI` | full detector | Restrict to a channel range |
+
+## dump_hits_pyroot.py
+
+Dumps a `recob::Hit` collection straight from an art `Events` tree into the
+same sparse CSR `.npz` format `SparseWindowDatasetPyG.save_events()` writes
+(see [`data/README.md`](../data/README.md#sparse-event-format)) — e.g. for a
+branch like:
+```
+*Br  375 :recob::Hits_fasthit__Reco1.obj : vector<recob::Hit>          *
+```
+
+**Why this exists:** `caloskim/TrackCaloSkim` (what `compare_hits_to_waveform.py`
+and the rest of this repo normally read hits from) only stores hits that got
+associated with a reconstructed track, one tree row per *track* rather than
+per event. That silently misses hits that never got attached to any track.
+This script reads the hit collection directly off `Events` instead, giving
+every hit the hit-finder produced for that event regardless of downstream
+tracking — a fair "all hits" baseline to materialize and compare against.
+
+Like `dump_rawdigits_pyroot.py`, this uses PyROOT's **emulated-class**
+reading: art files embed their StreamerInfo, so ROOT builds an emulated
+`recob::Hit` at runtime and exposes its data members (`fChannel`,
+`fPeakTime`, `fRMS`, `fPeakAmplitude`, `fIntegral`, `fMultiplicity`,
+`fWireID`, ...) without needing the real lardataobj/LArSoft dictionaries.
+Every field accessor tries the real C++ method first (`Channel()`,
+`PeakTime()`, `RMS()`, ...) and falls back to the raw data member if the
+method isn't callable in the emulated environment.
+
+```bash
+python scripts/dump_hits_pyroot.py \
+    /pnfs/.../reco/run19305_evt0.root \
+    --output data/hits_run19305_evt0.npz
+```
+
+If the default `--tag-contains` doesn't match your file's branch name, find
+the right one first:
+```bash
+python scripts/dump_hits_pyroot.py in.root --output out.npz --list-branches
+```
+
+Dump one npz per input file, then combine them the normal way:
+```bash
+python -m sbn_anomaly.data.merge_events --output combined.npz \
+    --glob 'data/hits_*.npz'
+```
+
+### Field mapping
+
+| `recob::Hit` field | npz key |
+|---|---|
+| channel | `channels_flat` |
+| `Integral()` | `integrals_flat` |
+| `PeakTime()` | `times_flat` |
+| `RMS()` | `widths_flat` (Gaussian sigma — same "width" convention used elsewhere in this repo) |
+| `SummedADC()` (falls back to `ROISummedADC()`) | `sumadcs_flat` |
+| `Multiplicity()` | `mults_flat` |
+| `WireID().Plane` / `.Wire` / `.TPC` | `planes_flat` / `wires_flat` / `tpcs_flat` |
+
+**`hassps_flat` is zero-filled.** Whether a hit has a matched 3-D space
+point requires the `recob::Hit` &harr; `recob::SpacePoint` art `Assn`, which
+this script does not read — the same fallback `SparseWindowDatasetPyG`
+already uses for productions/files missing this optional array (see
+[`data/README.md`](../data/README.md#sparse-event-format)), so a
+`node_features` entry needing `sp_fraction` just sees 0 everywhere rather
+than failing.
+
+### Requires
+
+**PyROOT only** (no gallery/LArSoft needed) — run in your ROOT environment.
+Branch discovery, the method/data-member accessor fallback for both
+`recob::Hit` and its `WireID` sub-object, empty-hit events, and negative/
+invalid channel filtering are all unit-tested against duck-typed emulated
+objects covering both the real-accessor and emulated-data-member-only code
+paths. **Not exercised against a real ROOT file in this development
+environment** — smoke-test on one file before a larger run, and diff its
+per-plane hit counts against a `TrackCaloSkim`-derived npz for the same
+event to see how many un-tracked hits it recovers.
+
+| Option | Default | Description |
+|---|---|---|
+| `input` | *(required)* | art ROOT file (reco) |
+| `--output` | *(required unless `--list-branches`)* | Output sparse-events `.npz` |
+| `--nevents` | `0` (all) | Stop after this many events |
+| `--tree-name` | `Events` | |
+| `--tag-contains` | `recob::Hits_fasthit__Reco1` | Substring identifying the `recob::Hit` product branch |
+| `--list-branches` | off | Print every branch name found (recursive scan), then exit |
 
 ## Other scripts
 
