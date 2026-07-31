@@ -286,14 +286,6 @@ class SparseWindowDatasetPyG(Dataset):
         self.window_size = int(window_size)
         self.n_bins = int(n_bins)
         self.stride = int(stride)
-        self.timed_window = bool(timed_window)
-        self.window_time_size = (
-            float(window_time_size) if window_time_size is not None else None
-        )
-        self.window_time_stride = (
-            float(window_time_stride) if window_time_stride is not None else None
-        )
-        self.timed_window_seed = int(timed_window_seed)
         self.radius = int(radius)
         self.prune_inactive = bool(prune_inactive)
 
@@ -587,386 +579,6 @@ class SparseWindowDatasetPyG(Dataset):
         if self.graph_feature_mean is not None:
             raw = (raw - self.graph_feature_mean) / self.graph_feature_std
         return torch.from_numpy(raw.reshape(1, -1).astype(np.float32))
-
-    def _build_timed_windows(self) -> None:
-        """Build fixed-duration windows on a stitched continuous timeline.
-
-        Raw ``evt_time`` values are expected in nanoseconds.
-
-        Run changes and backward timestamp jumps are treated as timestamp resets,
-        not as real gaps. The new segment is shifted so its first event begins at
-        the virtual time of the previous segment's final event.
-
-        This allows one timed window to continue across run boundaries. For example,
-        if a 600-second window contains 300 seconds from run 1, events from run 2
-        may fill the remaining 300 seconds.
-
-        Each output window contains exactly ``window_size`` positions:
-
-        - fewer events: pad remaining positions with -1;
-        - exactly enough events: keep every event;
-        - too many events: deterministically select ``window_size`` events without
-        replacement and then restore chronological order.
-
-        The -1 positions are interpreted as zero-valued events by
-        ``_compute_frame()``.
-        """
-        if self._evt_time is None:
-            raise ValueError(
-                "timed_window=true requires evt_time in the events NPZ."
-            )
-
-        raw_time_ns = np.asarray(self._evt_time, dtype=np.float64)
-        n_events = len(self._offsets) - 1
-
-        if raw_time_ns.shape != (n_events,):
-            raise ValueError(
-                "evt_time length does not match the number of events: "
-                f"len(evt_time)={len(raw_time_ns)}, n_events={n_events}"
-            )
-
-        if n_events == 0:
-            self._timed_event_indices = []
-            self._timed_interval_starts_ns = np.empty(
-                0, dtype=np.float64
-            )
-            self._timed_interval_ends_ns = np.empty(
-                0, dtype=np.float64
-            )
-            self._timed_candidate_counts = np.empty(
-                0, dtype=np.int64
-            )
-            self._stitched_evt_time_ns = np.empty(
-                0, dtype=np.float64
-            )
-            return
-
-        finite_mask = np.isfinite(raw_time_ns)
-
-        if not finite_mask.all():
-            bad_indices = np.where(~finite_mask)[0]
-            preview = ", ".join(
-                str(int(i)) for i in bad_indices[:10]
-            )
-
-            raise ValueError(
-                "timed_window=true requires finite evt_time values for all "
-                f"events, but {bad_indices.size} invalid timestamp(s) were "
-                f"found. First invalid indices: {preview}"
-            )
-
-        if self.window_time_size is None:
-            raise ValueError(
-                "timed_window=true requires window_time_size."
-            )
-
-        if self.window_time_stride is None:
-            raise ValueError(
-                "timed_window=true requires window_time_stride."
-            )
-
-        duration_ns = float(self.window_time_size) * 1.0e9
-        stride_ns = float(self.window_time_stride) * 1.0e9
-
-        if duration_ns <= 0:
-            raise ValueError(
-                "window_time_size must be greater than zero."
-            )
-
-        if stride_ns <= 0:
-            raise ValueError(
-                "window_time_stride must be greater than zero."
-            )
-
-        # --------------------------------------------------------------
-        # Find timestamp-reset boundaries.
-        #
-        # A reset occurs when:
-        #   1. the run number changes; or
-        #   2. evt_time moves backward.
-        #
-        # We do not split the dataset into independent window sequences.
-        # Instead, every segment is shifted onto a continuous virtual
-        # timeline.
-        # --------------------------------------------------------------
-        reset_boundary = np.zeros(n_events, dtype=bool)
-        reset_boundary[0] = True
-
-        backward_jump = np.diff(raw_time_ns) < 0
-        reset_boundary[1:] |= backward_jump
-
-        if self._evt_run is not None:
-            evt_run = np.asarray(self._evt_run)
-
-            if evt_run.shape == (n_events,):
-                reset_boundary[1:] |= (
-                    evt_run[1:] != evt_run[:-1]
-                )
-
-        segment_starts = np.where(reset_boundary)[0]
-        segment_ends = np.concatenate(
-            [
-                segment_starts[1:],
-                np.array([n_events], dtype=np.int64),
-            ]
-        )
-
-        # --------------------------------------------------------------
-        # Construct a zero-based, continuous virtual timeline.
-        #
-        # Within each segment:
-        #   virtual_time = segment_base + raw_time - first_raw_time
-        #
-        # At a boundary:
-        #   next segment base = previous segment's final virtual time
-        #
-        # Therefore the boundary contributes zero artificial time gap.
-        # --------------------------------------------------------------
-        stitched_time_ns = np.empty(
-            n_events,
-            dtype=np.float64,
-        )
-
-        previous_virtual_end_ns = 0.0
-
-        for segment_idx, (seg_start, seg_end) in enumerate(
-            zip(segment_starts, segment_ends)
-        ):
-            seg_start = int(seg_start)
-            seg_end = int(seg_end)
-
-            segment_raw_time = raw_time_ns[seg_start:seg_end]
-
-            if segment_raw_time.size == 0:
-                continue
-
-            local_decreases = np.where(
-                np.diff(segment_raw_time) < 0
-            )[0]
-
-            if local_decreases.size:
-                local_idx = int(local_decreases[0])
-
-                raise ValueError(
-                    "evt_time remains non-monotonic inside stitched segment "
-                    f"{segment_idx}. Global indices "
-                    f"{seg_start + local_idx} and "
-                    f"{seg_start + local_idx + 1}: "
-                    f"{segment_raw_time[local_idx]} -> "
-                    f"{segment_raw_time[local_idx + 1]} ns."
-                )
-
-            relative_time_ns = (
-                segment_raw_time - segment_raw_time[0]
-            )
-
-            stitched_time_ns[seg_start:seg_end] = (
-                previous_virtual_end_ns + relative_time_ns
-            )
-
-            previous_virtual_end_ns = float(
-                stitched_time_ns[seg_end - 1]
-            )
-
-        self._stitched_evt_time_ns = stitched_time_ns
-
-        # The stitched timeline should now be nondecreasing. Equal times at
-        # run boundaries are intentional because the artificial gap is zero.
-        remaining_decreases = np.where(
-            np.diff(stitched_time_ns) < 0
-        )[0]
-
-        if remaining_decreases.size:
-            first_bad = int(remaining_decreases[0])
-
-            raise RuntimeError(
-                "Internal error: stitched evt_time is not nondecreasing "
-                f"between indices {first_bad} and {first_bad + 1}."
-            )
-
-        n_run_changes = 0
-
-        if self._evt_run is not None:
-            evt_run = np.asarray(self._evt_run)
-
-            if evt_run.shape == (n_events,):
-                n_run_changes = int(
-                    np.count_nonzero(
-                        evt_run[1:] != evt_run[:-1]
-                    )
-                )
-
-        logger.info(
-            "Stitched evt_time into one continuous timeline: "
-            "%d segment(s), %d run change(s), %d backward timestamp "
-            "jump(s), virtual duration=%.6g seconds.",
-            len(segment_starts),
-            n_run_changes,
-            int(np.count_nonzero(backward_jump)),
-            float(
-                (stitched_time_ns[-1] - stitched_time_ns[0])
-                / 1.0e9
-            ),
-        )
-
-        # --------------------------------------------------------------
-        # Build timed windows from the continuous virtual timeline.
-        # --------------------------------------------------------------
-        first_virtual_time_ns = float(stitched_time_ns[0])
-        last_virtual_time_ns = float(stitched_time_ns[-1])
-
-        n_windows = (
-            int(
-                np.floor(
-                    (
-                        last_virtual_time_ns
-                        - first_virtual_time_ns
-                    )
-                    / stride_ns
-                )
-            )
-            + 1
-        )
-
-        interval_starts_ns = (
-            first_virtual_time_ns
-            + np.arange(n_windows, dtype=np.float64)
-            * stride_ns
-        )
-
-        interval_ends_ns = (
-            interval_starts_ns + duration_ns
-        )
-
-        timed_event_indices = []
-        candidate_counts = np.zeros(
-            n_windows,
-            dtype=np.int64,
-        )
-
-        padded_window_count = 0
-        subsampled_window_count = 0
-
-        for window_idx, (start_ns, end_ns) in enumerate(
-            zip(interval_starts_ns, interval_ends_ns)
-        ):
-            # Use half-open intervals:
-            #
-            #     [start_ns, end_ns)
-            #
-            # Equal virtual times at a run boundary are valid. All boundary
-            # events that satisfy the interval are included as candidates.
-            left = int(
-                np.searchsorted(
-                    stitched_time_ns,
-                    start_ns,
-                    side="left",
-                )
-            )
-
-            right = int(
-                np.searchsorted(
-                    stitched_time_ns,
-                    end_ns,
-                    side="left",
-                )
-            )
-
-            candidates = np.arange(
-                left,
-                right,
-                dtype=np.int64,
-            )
-
-            n_candidates = int(candidates.size)
-            candidate_counts[window_idx] = n_candidates
-
-            if n_candidates > self.window_size:
-                # Use one deterministic random generator per window so the
-                # same events are selected during:
-                #
-                # - standardization fitting;
-                # - training;
-                # - validation;
-                # - inference;
-                # - different DataLoader worker configurations.
-                rng = np.random.default_rng(
-                    self.timed_window_seed + window_idx
-                )
-
-                selected = rng.choice(
-                    candidates,
-                    size=self.window_size,
-                    replace=False,
-                ).astype(np.int64, copy=False)
-
-                # Restore event/virtual-time order before splitting the
-                # selected events into temporal bins.
-                selected.sort()
-                subsampled_window_count += 1
-            else:
-                selected = candidates
-
-            padded_indices = np.full(
-                self.window_size,
-                -1,
-                dtype=np.int64,
-            )
-
-            padded_indices[: selected.size] = selected
-
-            if selected.size < self.window_size:
-                padded_window_count += 1
-
-            timed_event_indices.append(padded_indices)
-
-        self._timed_event_indices = timed_event_indices
-        self._timed_interval_starts_ns = interval_starts_ns
-        self._timed_interval_ends_ns = interval_ends_ns
-        self._timed_candidate_counts = candidate_counts
-
-        selected_counts = np.minimum(
-            candidate_counts,
-            self.window_size,
-        )
-
-        logger.info(
-            "Built %d timed windows on stitched timeline: "
-            "duration=%.6g s, time stride=%.6g s, "
-            "maximum events/window=%d.",
-            len(timed_event_indices),
-            self.window_time_size,
-            self.window_time_stride,
-            self.window_size,
-        )
-
-        if selected_counts.size:
-            logger.info(
-                "Timed-window event counts: "
-                "candidates min=%d, median=%.1f, max=%d; "
-                "selected min=%d, median=%.1f, max=%d; "
-                "padded=%d, subsampled=%d.",
-                int(candidate_counts.min()),
-                float(np.median(candidate_counts)),
-                int(candidate_counts.max()),
-                int(selected_counts.min()),
-                float(np.median(selected_counts)),
-                int(selected_counts.max()),
-                padded_window_count,
-                subsampled_window_count,
-            )
-
-    def _reconstruction_frame(self, sample_key: int) -> np.ndarray:
-        """Build one reconstruction frame for an entry in ``self._starts``."""
-        if self.timed_window:
-            if self._timed_event_indices is None:
-                raise RuntimeError("Timed-window indices were not initialized.")
-            return self._compute_frame(
-                event_indices=self._timed_event_indices[int(sample_key)]
-            )
-
-        start = int(sample_key)
-        return self._compute_frame(start, start + self.window_size)
 
     def _fit_standardization(self, max_frames: int = 500):
         """Fit per-feature mean/std from active channels over a sample of frames."""
@@ -1499,7 +1111,7 @@ class SparseWindowDatasetPyG(Dataset):
         return Data(x=x, y=target_flat, edge_index=self.edge_index_full)
 
     def window_metadata(self, indices=None) -> dict:
-        """Return per-window provenance for selected dataset indices.
+        """Return per-window provenance for the given window indices (default: all).
 
         ``event_count`` is always present (it needs no provenance data, just
         the window bounds already tracked by this dataset). The
@@ -1561,10 +1173,10 @@ class SparseWindowDatasetPyG(Dataset):
         })
         if self._evt_file_idx is not None:
             result["first_file_idx"] = self._evt_file_idx[starts]
-            result["last_file_idx"] = self._evt_file_idx[ends]
+            result["last_file_idx"]  = self._evt_file_idx[ends]
         if self._evt_time is not None:
             result["first_time"] = self._evt_time[starts]
-            result["last_time"] = self._evt_time[ends]
+            result["last_time"]  = self._evt_time[ends]
         return result
 
     # ------------------------------------------------------------------
@@ -1687,21 +1299,6 @@ class SparseWindowDatasetPyG(Dataset):
         one per bin) -- used in "time" mode where bin membership is computed
         per-window from evt_time instead of being a fixed, dataset-wide split.
         """
-        if event_indices is None:
-            if evt_start is None or evt_end is None:
-                raise ValueError(
-                    "Either event_indices or evt_start/evt_end must be provided."
-                )
-            event_indices = np.arange(evt_start, evt_end, dtype=np.int64)
-        else:
-            event_indices = np.asarray(event_indices, dtype=np.int64)
-
-        if event_indices.shape != (self.window_size,):
-            raise ValueError(
-                "A frame must contain exactly window_size event positions, "
-                f"got shape {event_indices.shape}; window_size={self.window_size}."
-            )
-
         N = self.num_nodes
         frame = np.zeros((N, self.n_bins, self.n_node_features), dtype=np.float32)
         splits = bin_splits if bin_splits is not None else self._bin_splits
@@ -1724,11 +1321,7 @@ class SparseWindowDatasetPyG(Dataset):
             ch_parts = []
             feat_parts = []
             for i in split:
-                e = int(event_indices[int(i)])
-                # -1 is a zero-padded event. It contributes no hits, while
-                # remaining in n_events_bin for occupancy/rate denominators.
-                if e < 0:
-                    continue
+                e = evt_start + int(i)
                 a_start = int(self._agg_offsets[e])
                 a_end = int(self._agg_offsets[e + 1])
                 if a_end > a_start:

@@ -524,53 +524,10 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
         ) from exc
     is_sparse = isinstance(arch, np.lib.npyio.NpzFile) and "channels_flat" in arch
     provenance = None
-    window_meta: dict | None = None
 
     if is_sparse:
         from sbn_anomaly.data.sparse_window_dataset import SparseWindowDatasetPyG
         logger.info("Loading sparse events for graph_vae from %s", input_path)
-        timed_window = bool(data_cfg.get("timed_window", False))
-        window_time_size = data_cfg.get("window_time_size")
-        window_time_stride = data_cfg.get("window_time_stride")
-
-        if timed_window:
-            if window_time_size is None:
-                raise ValueError(
-                    "data.timed_window=true requires data.window_time_size "
-                    "in seconds for graph_vae inference."
-                )
-            if window_time_stride is None:
-                raise ValueError(
-                    "data.timed_window=true requires data.window_time_stride "
-                    "in seconds for graph_vae inference."
-                )
-            if float(window_time_size) <= 0:
-                raise ValueError(
-                    "data.window_time_size must be greater than zero."
-                )
-            if float(window_time_stride) <= 0:
-                raise ValueError(
-                    "data.window_time_stride must be greater than zero."
-                )
-
-            logger.info(
-                "Using timed graph_vae inference windows: duration=%.6g s, "
-                "time stride=%.6g s, maximum events=%d, seed=%d. "
-                "Event-count stride=%s is ignored.",
-                float(window_time_size),
-                float(window_time_stride),
-                int(data_cfg.get("window_size", 20)),
-                int(data_cfg.get("timed_window_seed", 0)),
-                data_cfg.get("stride", 1),
-            )
-        else:
-            logger.info(
-                "Using event-count graph_vae inference windows: "
-                "window_size=%d, stride=%d.",
-                int(data_cfg.get("window_size", 20)),
-                int(data_cfg.get("stride", 1)),
-            )
-
         dataset = SparseWindowDatasetPyG.from_npz(
             input_path,
             n_channels=data_cfg.get("n_channels"),
@@ -587,8 +544,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
             edge_mode=str(data_cfg.get("edge_mode", "sequential")),
             reconstruction=True,
             standardize=bool(data_cfg.get("standardize", True)),
-            feature_mean=feat_mean,
-            feature_std=feat_std,
+            feature_mean=feat_mean, feature_std=feat_std,
             log_features=data_cfg.get("log_features") or None,
             graph_features=data_cfg.get("graph_features") or None,
             graph_feature_mean=graph_feat_mean, graph_feature_std=graph_feat_std,
@@ -682,12 +638,7 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
         event_count = meta.get("event_count")
         if provenance is None and "first_run" in meta:
             provenance = np.stack(
-                [
-                    window_meta["first_run"],
-                    window_meta["first_subrun"],
-                    window_meta["first_event_num"],
-                ],
-                axis=1,
+                [meta["first_run"], meta["first_subrun"], meta["first_event_num"]], axis=1
             ).astype(np.int32)
 
     aggregator = str(infer_cfg.get("window_aggregator", "group_max_mean"))
@@ -754,12 +705,9 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
         try:
             from sbn_anomaly.infer.window_score import max_score
             from sbn_anomaly.utils.plotting import (
-                save_node_mse_plot,
                 save_score_distribution_plot,
                 save_score_over_time_plot,
-            )
-            from sbn_anomaly.utils.timed_plotting import (
-                save_timed_score_over_time_plot,
+                save_node_mse_plot,
             )
             plot_dir = out_path.parent
             thr = float(threshold) if threshold is not None else None
@@ -767,59 +715,11 @@ def _infer_graph_vae(cfg: dict, checkpoint: str, output: str, input_override: st
                 scores, plot_dir, filename=out_path.stem + "_score_distribution.png",
                 threshold=thr, title=f"Window score distribution ({aggregator})",
             )
-            timed_window = bool(data_cfg.get("timed_window", False))
-
-            if (
-                timed_window
-                and window_meta
-                and "time_window_start" in window_meta
-            ):
-                starts_ns = np.asarray(
-                    window_meta["time_window_start"],
-                    dtype=np.float64,
-                ).reshape(-1)
-
-                if starts_ns.size != scores.size:
-                    raise ValueError(
-                        "Timed-window start metadata length does not match "
-                        f"the number of scores: {starts_ns.size} != {scores.size}"
-                    )
-
-                elapsed_seconds = (starts_ns - starts_ns[0]) / 1.0e9
-                total_elapsed_seconds = (
-                    float(elapsed_seconds[-1]) if elapsed_seconds.size else 0.0
-                )
-
-                if total_elapsed_seconds >= 7200.0:
-                    elapsed_values = elapsed_seconds / 3600.0
-                    elapsed_unit = "hours"
-                elif total_elapsed_seconds >= 120.0:
-                    elapsed_values = elapsed_seconds / 60.0
-                    elapsed_unit = "minutes"
-                else:
-                    elapsed_values = elapsed_seconds
-                    elapsed_unit = "seconds"
-
-                save_timed_score_over_time_plot(
-                    scores,
-                    max_score(node_scores),
-                    elapsed_values,
-                    plot_dir,
-                    filename=out_path.stem + "_score_over_time_timed.png",
-                    threshold=thr,
-                    title="Window anomaly score over elapsed time",
-                    time_unit=elapsed_unit,
-                )
-            else:
-                # Preserve the original event-count/window-index plot exactly.
-                save_score_over_time_plot(
-                    scores,
-                    max_score(node_scores),
-                    plot_dir,
-                    filename=out_path.stem + "_score_over_time.png",
-                    threshold=thr,
-                    title="Window anomaly score over time",
-                )
+            save_score_over_time_plot(
+                scores, max_score(node_scores), plot_dir,
+                filename=out_path.stem + "_score_over_time.png", threshold=thr,
+                title="Window anomaly score over time",
+            )
             save_node_mse_plot(
                 channel_mean_error, plot_dir,
                 filename=out_path.stem + "_channel_error.png",

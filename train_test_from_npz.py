@@ -173,6 +173,208 @@ def concatenate_arrays(
         ) from exc
 
 
+def reorder_output_events(
+    output: dict[str, np.ndarray],
+    event_order: np.ndarray,
+    name: str,
+) -> dict[str, np.ndarray]:
+    """
+    Reorder complete events while keeping all event-level and flat hit arrays
+    synchronized. No event is sliced: every event's full flat-data interval is
+    moved as one unit, and ``offsets`` is rebuilt.
+    """
+    if "offsets" not in output:
+        raise KeyError(f"{name}: required array 'offsets' is missing.")
+
+    offsets = np.asarray(output["offsets"], dtype=np.int64)
+    event_order = np.asarray(event_order, dtype=np.int64)
+    n_events = offsets.size - 1
+
+    if offsets.ndim != 1 or offsets.size == 0:
+        raise ValueError(f"{name}: invalid offsets shape {offsets.shape}.")
+    if event_order.ndim != 1:
+        raise ValueError(f"{name}: event order must be one-dimensional.")
+    if event_order.size and (
+        int(event_order.min()) < 0 or int(event_order.max()) >= n_events
+    ):
+        raise IndexError(f"{name}: event order contains an out-of-range index.")
+
+    flat_indices, reordered_offsets = build_flat_indices(offsets, event_order)
+    total_flat_entries = int(offsets[-1])
+
+    reordered: dict[str, np.ndarray] = {}
+
+    for key, value in output.items():
+        array = np.asarray(value)
+
+        if key == "offsets":
+            reordered[key] = reordered_offsets
+        elif (
+            key in FLAT_KEYS
+            and array.ndim > 0
+            and array.shape[0] == total_flat_entries
+        ):
+            reordered[key] = array[flat_indices]
+        elif (
+            key in EVENT_KEYS
+            and array.ndim > 0
+            and array.shape[0] == n_events
+        ):
+            reordered[key] = array[event_order]
+        else:
+            reordered[key] = value
+
+    return reordered
+
+
+def sort_output_by_evt_time(
+    output: dict[str, np.ndarray],
+    name: str,
+) -> dict[str, np.ndarray]:
+    """
+    Stably sort complete events by ``evt_time``.
+
+    ``evt_run``, ``evt_subrun``, and ``evt_num`` are deterministic tie-breakers.
+    Every event-level array and every event's complete flat hit interval is moved
+    together, so no event is sliced or desynchronized.
+    """
+    required = ("evt_time", "evt_run", "offsets")
+    missing = [key for key in required if key not in output]
+    if missing:
+        raise KeyError(f"{name}: missing required arrays: {missing}")
+
+    evt_time = np.asarray(output["evt_time"])
+    evt_run = np.asarray(output["evt_run"])
+    n_events = evt_time.size
+
+    if evt_time.ndim != 1:
+        raise ValueError(
+            f"{name}: 'evt_time' must be one-dimensional, got {evt_time.shape}."
+        )
+    if evt_run.ndim != 1 or evt_run.size != n_events:
+        raise ValueError(
+            f"{name}: 'evt_run' shape {evt_run.shape} is inconsistent with "
+            f"{n_events:,} event times."
+        )
+    if not np.all(np.isfinite(evt_time)):
+        bad = np.flatnonzero(~np.isfinite(evt_time))
+        raise ValueError(
+            f"{name}: evt_time contains {bad.size:,} non-finite value(s)."
+        )
+
+    evt_subrun = np.asarray(
+        output.get("evt_subrun", np.zeros(n_events, dtype=np.int64))
+    )
+    evt_num = np.asarray(
+        output.get("evt_num", np.arange(n_events, dtype=np.int64))
+    )
+
+    # np.lexsort uses the last key as the primary key.
+    event_order = np.lexsort((evt_num, evt_subrun, evt_run, evt_time))
+    sorted_output = reorder_output_events(output, event_order, name)
+
+    sorted_time = np.asarray(sorted_output["evt_time"])
+    if sorted_time.size > 1 and np.any(np.diff(sorted_time) < 0):
+        raise RuntimeError(f"{name}: evt_time sorting verification failed.")
+
+    print(
+        f"{name}: sorted {n_events:,} complete events by evt_time; "
+        "verified non-decreasing timestamps."
+    )
+    return sorted_output
+
+
+def split_output_by_complete_runs(
+    output: dict[str, np.ndarray],
+    requested_first_count: int,
+    first_name: str,
+    second_name: str,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """
+    Split a time-sorted output without dividing any run between outputs.
+
+    Runs are ordered by their earliest ``evt_time``. The cutoff is chosen at the
+    complete-run boundary nearest ``requested_first_count``. All events from a
+    run are assigned to exactly one output, even if that run appears in multiple
+    source files.
+    """
+    evt_run = np.asarray(output["evt_run"])
+    evt_time = np.asarray(output["evt_time"])
+    n_events = evt_run.size
+
+    if n_events < 2:
+        raise ValueError("At least two events are required for the split.")
+    if not 0 < requested_first_count < n_events:
+        raise ValueError(
+            f"Requested first-output size must be between 1 and {n_events - 1}."
+        )
+
+    unique_runs, inverse, run_counts = np.unique(
+        evt_run,
+        return_inverse=True,
+        return_counts=True,
+    )
+
+    if unique_runs.size < 2:
+        raise RuntimeError(
+            "Cannot create two outputs without splitting a run: "
+            f"all {n_events:,} events belong to run {unique_runs[0]}."
+        )
+
+    run_first_times = np.full(unique_runs.size, np.inf, dtype=np.float64)
+    np.minimum.at(run_first_times, inverse, evt_time.astype(np.float64))
+
+    # Chronological run order, with run number as a deterministic tie-breaker.
+    run_order = np.lexsort((unique_runs, run_first_times))
+    ordered_runs = unique_runs[run_order]
+    ordered_counts = run_counts[run_order]
+    cumulative = np.cumsum(ordered_counts)
+
+    # Valid boundaries leave at least one complete run in each output.
+    candidates = cumulative[:-1]
+    boundary_index = int(np.argmin(np.abs(candidates - requested_first_count)))
+    actual_first_count = int(candidates[boundary_index])
+    first_runs = ordered_runs[: boundary_index + 1]
+
+    first_mask = np.isin(evt_run, first_runs)
+    first_indices = np.flatnonzero(first_mask)
+    second_indices = np.flatnonzero(~first_mask)
+
+    first_output = reorder_output_events(output, first_indices, first_name)
+    second_output = reorder_output_events(output, second_indices, second_name)
+
+    first_run_set = set(np.asarray(first_output["evt_run"]).tolist())
+    second_run_set = set(np.asarray(second_output["evt_run"]).tolist())
+    overlap = first_run_set.intersection(second_run_set)
+    if overlap:
+        raise RuntimeError(
+            "Run-preserving split failed; runs appear in both outputs: "
+            f"{sorted(overlap)}"
+        )
+
+    for split_name, split_output in (
+        (first_name, first_output),
+        (second_name, second_output),
+    ):
+        times = np.asarray(split_output["evt_time"])
+        if times.size > 1 and np.any(np.diff(times) < 0):
+            raise RuntimeError(
+                f"{split_name}: evt_time is not non-decreasing after split."
+            )
+
+    print(
+        f"Run-preserving split: requested {requested_first_count:,} events for "
+        f"{first_name}; assigned {actual_first_count:,} events from "
+        f"{len(first_run_set):,} complete run(s)."
+    )
+    print(
+        f"{second_name}: assigned {n_events - actual_first_count:,} events from "
+        f"{len(second_run_set):,} complete run(s)."
+    )
+
+    return first_output, second_output
+
+
 def build_flat_indices(
     offsets: np.ndarray,
     event_indices: np.ndarray,
@@ -615,8 +817,9 @@ def main() -> None:
     print()
     print("Second pass: splitting and collecting events...")
 
-    good_output = OutputAccumulator("good_runs")
-    train_output = OutputAccumulator("windows_train")
+    # Collect all eligible non-bad events first. Sorting and splitting happen
+    # only after the complete dataset has been assembled.
+    eligible_output = OutputAccumulator("eligible_non_bad")
 
     events_seen = 0
 
@@ -639,6 +842,11 @@ def main() -> None:
             event_keys = keys.intersection(EVENT_KEYS)
             scalar_keys = keys.intersection(SCALAR_KEYS)
 
+            if "evt_time" not in event_keys:
+                raise KeyError(
+                    f"{path.name}: required event array 'evt_time' is missing."
+                )
+
             for key in sorted(flat_keys):
                 array = np.asarray(data[key])
                 if array.ndim == 0 or array.shape[0] != n_flat_entries:
@@ -657,55 +865,22 @@ def main() -> None:
                         f"{n_events:,}."
                     )
 
-            global_start = events_seen
-            global_stop = events_seen + n_events
+            all_event_indices = np.arange(n_events, dtype=np.int64)
 
-            # Events before good_event_target go to good_runs.
-            local_good_stop = max(
-                0,
-                min(n_events, good_event_target - global_start),
-            )
-
-            good_indices = np.arange(
-                0,
-                local_good_stop,
-                dtype=np.int64,
-            )
-            train_indices = np.arange(
-                local_good_stop,
-                n_events,
-                dtype=np.int64,
-            )
-
-            good_output.add_selected_events(
+            eligible_output.add_selected_events(
                 path=path,
                 file_number=file_number,
                 data=data,
                 offsets=offsets,
-                event_indices=good_indices,
+                event_indices=all_event_indices,
                 flat_keys=flat_keys,
                 event_keys=event_keys,
                 scalar_keys=scalar_keys,
             )
 
-            train_output.add_selected_events(
-                path=path,
-                file_number=file_number,
-                data=data,
-                offsets=offsets,
-                event_indices=train_indices,
-                flat_keys=flat_keys,
-                event_keys=event_keys,
-                scalar_keys=scalar_keys,
-            )
+            events_seen += n_events
 
-            events_seen = global_stop
-
-            print(
-                f"    total events={n_events:,}, "
-                f"good_runs={good_indices.size:,}, "
-                f"windows_train={train_indices.size:,}"
-            )
+            print(f"    collected {n_events:,} complete events")
 
     if events_seen != total_eligible_events:
         raise RuntimeError(
@@ -782,9 +957,24 @@ def main() -> None:
     print()
     print("Combining arrays...")
 
-    good_npz = good_output.make_output(GOOD_RUNS_FRACTION)
-    train_npz = train_output.make_output(GOOD_RUNS_FRACTION)
-    bad_npz = bad_output.make_output(None) if bad_output is not None else None
+    combined_npz = eligible_output.make_output(GOOD_RUNS_FRACTION)
+    combined_npz = sort_output_by_evt_time(
+        combined_npz,
+        "eligible_non_bad",
+    )
+
+    good_npz, train_npz = split_output_by_complete_runs(
+        combined_npz,
+        requested_first_count=good_event_target,
+        first_name="good_runs",
+        second_name="windows_train",
+    )
+
+    bad_npz = (
+        sort_output_by_evt_time(bad_output.make_output(None), "bad_runs")
+        if bad_output is not None
+        else None
+    )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -798,24 +988,29 @@ def main() -> None:
         print(f"Writing {BAD_RUNS_PATH}...")
         np.savez_compressed(BAD_RUNS_PATH, **bad_npz)
 
+    good_events = int(np.asarray(good_npz["evt_run"]).size)
+    train_events = int(np.asarray(train_npz["evt_run"]).size)
+    good_flat = int(np.asarray(good_npz["offsets"])[-1])
+    train_flat = int(np.asarray(train_npz["offsets"])[-1])
+
     print()
     print("Finished.")
     print(
-        f"good_runs.npz:     {good_output.total_events:,} events, "
-        f"{good_output.total_flat_entries:,} flat entries, "
-        f"{len(good_output.loaded_filenames):,} contributing files"
+        f"good_runs.npz:     {good_events:,} events, "
+        f"{good_flat:,} flat entries"
     )
     print(
-        f"windows_train.npz: {train_output.total_events:,} events, "
-        f"{train_output.total_flat_entries:,} flat entries, "
-        f"{len(train_output.loaded_filenames):,} contributing files"
+        f"windows_train.npz: {train_events:,} events, "
+        f"{train_flat:,} flat entries"
     )
-    if bad_output is not None:
+    if bad_npz is not None:
+        bad_events = int(np.asarray(bad_npz["evt_run"]).size)
+        bad_flat = int(np.asarray(bad_npz["offsets"])[-1])
         print(
-            f"bad_runs.npz:      {bad_output.total_events:,} events, "
-            f"{bad_output.total_flat_entries:,} flat entries, "
-            f"{len(bad_output.loaded_filenames):,} contributing files"
+            f"bad_runs.npz:      {bad_events:,} events, "
+            f"{bad_flat:,} flat entries"
         )
+
     print(f"Good-runs output: {GOOD_RUNS_PATH}")
     if args.with_bad:
         print(f"Bad-runs output:  {BAD_RUNS_PATH}")

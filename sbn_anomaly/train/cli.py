@@ -21,11 +21,7 @@ from sbn_anomaly.utils.logging import setup_logging
 
 
 def _split_dataset_for_validation(dataset, validation_split: float, seed: int):
-    """Use the original random train/validation split.
-
-    This remains the default for every legacy/event-count dataset and for all
-    non-Graph-VAE training paths.
-    """
+    """Split a map-style dataset into train/validation subsets when requested."""
     if validation_split <= 0.0 or validation_split >= 1.0:
         return dataset, None
     try:
@@ -520,57 +516,6 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
     train_cfg = cfg.get("training", {})
 
     events_path = data_cfg.get("events_path")
-
-    # Optional fixed-duration windowing. Old configuration files remain fully
-    # compatible because timed_window defaults to False when the key is absent.
-    timed_window = bool(data_cfg.get("timed_window", False))
-    window_time_size = data_cfg.get("window_time_size")
-    window_time_stride = data_cfg.get("window_time_stride")
-    timed_window_seed = int(data_cfg.get("timed_window_seed", 0))
-
-    if timed_window:
-        if not root_files and not events_path:
-            raise ValueError(
-                "data.timed_window=true requires a sparse event source: set "
-                "data.events_path or supply --root-files/--root-file-list. "
-                "Timed windowing cannot be applied to data.windows_path because "
-                "those windows are already materialized."
-            )
-        if window_time_size is None:
-            raise ValueError(
-                "data.timed_window=true requires data.window_time_size in seconds."
-            )
-        if window_time_stride is None:
-            raise ValueError(
-                "data.timed_window=true requires data.window_time_stride in seconds."
-            )
-
-        window_time_size = float(window_time_size)
-        window_time_stride = float(window_time_stride)
-        if window_time_size <= 0:
-            raise ValueError("data.window_time_size must be greater than zero.")
-        if window_time_stride <= 0:
-            raise ValueError("data.window_time_stride must be greater than zero.")
-
-        logger.info(
-            "Using timed graph_vae windows: duration=%.6g s, time_stride=%.6g s, "
-            "max_events=%d, seed=%d. Event-count stride=%s is ignored.",
-            window_time_size,
-            window_time_stride,
-            int(data_cfg.get("window_size", 20)),
-            timed_window_seed,
-            data_cfg.get("stride", 1),
-        )
-    else:
-        # Ignore time-window fields completely in legacy event-count mode.
-        window_time_size = None
-        window_time_stride = None
-        logger.info(
-            "Using event-count graph_vae windows: window_size=%d, stride=%d.",
-            int(data_cfg.get("window_size", 20)),
-            int(data_cfg.get("stride", 1)),
-        )
-
     sparse_kwargs = dict(
         window_size=int(data_cfg.get("window_size", 20)),
         n_bins=int(data_cfg.get("n_temporal_bins", 4)),
@@ -634,15 +579,7 @@ def _train_graph_vae(cfg: dict, root_files: list[str] | None = None) -> None:
 
     validation_split = float(train_cfg.get("validation_split", 0.0) or 0.0)
     validation_seed = int(train_cfg.get("validation_seed", 42))
-
-    # Only timed-window Graph-VAE training uses the chronological purged split.
-    # Every old configuration, including configs without a timed_window key,
-    # continues to use the original seeded random split.
-    train_dataset, val_dataset = _split_dataset_for_validation(
-        dataset,
-        validation_split,
-        validation_seed,
-    )
+    train_dataset, val_dataset = _split_dataset_for_validation(dataset, validation_split, validation_seed)
 
     batch_size = int(train_cfg.get("batch_size", 16))
     num_workers = int(train_cfg.get("num_workers", 4))
