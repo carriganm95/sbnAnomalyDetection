@@ -33,7 +33,7 @@ BAD_FILENAME = "scores_bad.npz"
 # This is used whenever no window selection is supplied by the caller.
 # Comma-separated zero-based window indices and inclusive ranges are accepted.
 # Examples: "1200", "1200,1205", "1200-1210".
-DEFAULT_WINDOW_SPEC = "1200-1250"
+DEFAULT_WINDOW_SPEC = "0-10"
 DEFAULT_DATASETS = "both"  # "good", "bad", or "both"
 
 # CHANNEL_START <= channel < CHANNEL_END.  None means all available channels.

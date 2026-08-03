@@ -61,7 +61,7 @@ PER_CHANNEL_PLOT_SCRIPT = (
 # Selected-window per-channel node-score plotting script. Each selected row in
 # node_scores is one window; multiple selected windows are averaged per channel.
 PER_CHANNEL_PER_WINDOW_PLOT_SCRIPT = (
-    PROJECT_DIR / "graphing" / "plot_per_channel_scores_per_window.py"
+    PROJECT_DIR / "graphing" / "plot_per_channel_per_window_scores.py"
 )
 DEFAULT_PER_CHANNEL_WINDOW_DATASETS = "both"
 DEFAULT_PER_CHANNEL_PER_WINDOW_PLOT_NAME = (
@@ -1657,6 +1657,7 @@ def run_sweep(args: argparse.Namespace) -> int:
     # --force-replot always reruns plotting, even when the plot already exists.
     if args.missing_plot or args.force_replot:
         args.per_channel_plot = True
+        args.per_channel_per_window_plot = True
 
     if args.missing_plot and args.force_replot:
         raise ValueError(
@@ -1822,6 +1823,9 @@ def run_sweep(args: argparse.Namespace) -> int:
         good_score_npz_path = inference_dir / "scores_good.npz"
         bad_score_npz_path = inference_dir / "scores_bad.npz"
         eval_plot_path = inference_dir / args.eval_plot_name
+        per_channel_per_window_plot_path = (
+            inference_dir / args.per_channel_per_window_plot_name
+        )
         eval_log_path = inference_dir / args.eval_log_name
         eval_json_path = inference_dir / args.eval_json_name
 
@@ -1856,6 +1860,10 @@ def run_sweep(args: argparse.Namespace) -> int:
             need_per_channel_plot = (
                 args.force_replot or not per_channel_plot_path.exists()
             )
+            need_per_channel_per_window_plot = (
+                args.force_replot
+                or not per_channel_per_window_plot_path.exists()
+            )
             need_goodvsbad_plot = (
                 args.force_replot or not eval_plot_path.exists()
             )
@@ -1885,6 +1893,54 @@ def run_sweep(args: argparse.Namespace) -> int:
             else:
                 print("Per-channel plot already exists; no replot needed.")
                 print(f"Existing per-channel plot: {per_channel_plot_path}")
+
+            if need_per_channel_per_window_plot:
+                if (
+                    args.force_replot
+                    and per_channel_per_window_plot_path.exists()
+                ):
+                    print(
+                        "Existing selected-window per-channel plot found; "
+                        "rerunning because --force-replot was set."
+                    )
+                else:
+                    print(
+                        "Selected-window per-channel plot is missing; "
+                        "generating it now."
+                    )
+                print(
+                    "Expected selected-window per-channel plot: "
+                    f"{per_channel_per_window_plot_path}"
+                )
+
+                run_per_channel_per_window_score_plot(
+                    plot_script_path=PER_CHANNEL_PER_WINDOW_PLOT_SCRIPT,
+                    inference_dir=inference_dir,
+                    window_spec=args.per_channel_window_indices,
+                    datasets=args.per_channel_window_datasets,
+                    output_name=args.per_channel_per_window_plot_name,
+                )
+
+                if per_channel_per_window_plot_path.exists():
+                    print(
+                        "Created selected-window per-channel plot: "
+                        f"{per_channel_per_window_plot_path}"
+                    )
+                else:
+                    print(
+                        "WARNING: plotting finished, but the expected "
+                        "selected-window per-channel plot was not found: "
+                        f"{per_channel_per_window_plot_path}"
+                    )
+            else:
+                print(
+                    "Selected-window per-channel plot already exists; "
+                    "no replot needed."
+                )
+                print(
+                    "Existing selected-window per-channel plot: "
+                    f"{per_channel_per_window_plot_path}"
+                )
 
             if need_goodvsbad_plot:
                 if args.force_replot and eval_plot_path.exists():
@@ -2734,9 +2790,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Plot-only repair mode. For each model directory under --runs-root, "
-            "independently check whether the per-channel plot and goodvsbad.png "
-            "exist. Recreate either missing plot from scores_good.npz and "
-            "scores_bad.npz. No training or inference is run."
+            "independently check whether the all-window per-channel plot, the "
+            "selected-window per-channel plot, and goodvsbad.png exist. Recreate "
+            "any missing plot from scores_good.npz and scores_bad.npz. No training "
+            "or inference is run."
         ),
     )
     parser.add_argument(
@@ -2746,9 +2803,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Standalone plot-only mode. For each model directory under --runs-root, "
-            "rerun both the per-channel plot and good-vs-bad plot whenever "
-            "scores_good.npz and scores_bad.npz exist, even if both plots already exist. "
-            "No training or inference is run."
+            "rerun the all-window per-channel plot, selected-window per-channel "
+            "plot, and good-vs-bad plot whenever scores_good.npz and "
+            "scores_bad.npz exist, even if the plots already exist. No training or "
+            "inference is run."
         ),
     )
     parser.add_argument(
