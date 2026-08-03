@@ -73,9 +73,6 @@ DEFAULT_PER_CHANNEL_PLOT_NAME = "per_channel_scores.png"
 # sweep activity, including training, inference, evaluation, plotting, and
 # rewrite/repair modes. Add full model directory paths here.
 IGNORED: list[Path] = [
-    DEFAULT_RUNS_ROOT / "All_data_v2",
-    DEFAULT_RUNS_ROOT / "All_data_v3",
-    DEFAULT_RUNS_ROOT / "collection_plane",
 ]
 
 
@@ -158,10 +155,34 @@ def value_to_str(v: Any) -> str:
 # Database
 # ============================================================
 
+SQLITE_TIMEOUT_SEC = 120.0
+SQLITE_BUSY_TIMEOUT_MS = 120_000
+SQLITE_WRITE_RETRIES = 12
+SQLITE_RETRY_BASE_DELAY_SEC = 1.0
+
+
+def is_database_locked_error(exc: BaseException) -> bool:
+    """Return True for SQLite busy/locked errors that are safe to retry."""
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
+
+
 def init_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
+
+    conn = sqlite3.connect(
+        str(db_path),
+        timeout=120.0,
+        isolation_level=None,
+    )
+
+    # Wait for temporary write locks instead of failing immediately.
+    conn.execute("PRAGMA busy_timeout = 120000")
+
+    # Do not change journal_mode here. Changing it requires an exclusive lock,
+    # which can fail when the database is on shared storage.
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA foreign_keys = ON")
 
     conn.execute(
         """
@@ -195,7 +216,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             error TEXT,
             config_json TEXT,
             metrics_json TEXT
-        );
+        )
         """
     )
 
@@ -207,7 +228,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             value TEXT,
             PRIMARY KEY (experiment_id, key),
             FOREIGN KEY (experiment_id) REFERENCES experiments(id)
-        );
+        )
         """
     )
 
@@ -220,13 +241,17 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             value_text TEXT,
             PRIMARY KEY (experiment_id, key),
             FOREIGN KEY (experiment_id) REFERENCES experiments(id)
-        );
+        )
         """
     )
 
-    # Existing databases created by older versions of this script will not pick up
-    # new columns from CREATE TABLE IF NOT EXISTS, so add them explicitly.
-    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(experiments)").fetchall()}
+    existing_cols = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(experiments)"
+        ).fetchall()
+    }
+
     needed_cols = {
         "eval_cmd": "TEXT",
         "eval_returncode": "INTEGER",
@@ -234,11 +259,13 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         "eval_log_path": "TEXT",
         "eval_json_path": "TEXT",
     }
+
     for col, col_type in needed_cols.items():
         if col not in existing_cols:
-            conn.execute(f"ALTER TABLE experiments ADD COLUMN {col} {col_type}")
+            conn.execute(
+                f"ALTER TABLE experiments ADD COLUMN {col} {col_type}"
+            )
 
-    conn.commit()
     return conn
 
 
@@ -295,28 +322,85 @@ def delete_existing_experiment(
     *,
     reason: str,
 ) -> None:
-    rows = conn.execute(
-        "SELECT id, status FROM experiments WHERE run_name = ?",
-        (run_name,),
-    ).fetchall()
+    """Atomically delete one run's DB rows, retrying transient SQLite locks."""
 
-    if not rows:
-        return
+    # End any transaction accidentally left open by an earlier operation. With
+    # isolation_level=None this is normally a no-op, but it also makes this
+    # function safe if the connection settings are changed later.
+    if conn.in_transaction:
+        conn.commit()
 
-    ids = [int(row[0]) for row in rows]
-    statuses = [str(row[1]) for row in rows]
-    placeholders = ",".join("?" for _ in ids)
+    for attempt in range(1, SQLITE_WRITE_RETRIES + 1):
+        try:
+            # Acquire the write lock before reading the IDs. This prevents the
+            # rows from changing between SELECT and DELETE.
+            conn.execute("BEGIN IMMEDIATE")
 
-    print(
-        f"Existing DB record(s) for run_name={run_name!r} found "
-        f"with status={statuses}; {reason}, overwriting.",
-        flush=True,
-    )
+            rows = conn.execute(
+                "SELECT id, status FROM experiments WHERE run_name = ?",
+                (run_name,),
+            ).fetchall()
 
-    conn.execute(f"DELETE FROM params WHERE experiment_id IN ({placeholders})", ids)
-    conn.execute(f"DELETE FROM metrics WHERE experiment_id IN ({placeholders})", ids)
-    conn.execute(f"DELETE FROM experiments WHERE id IN ({placeholders})", ids)
-    conn.commit()
+            if not rows:
+                conn.commit()
+                return
+
+            ids = [int(row[0]) for row in rows]
+            statuses = [str(row[1]) for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+
+            if attempt == 1:
+                print(
+                    f"Existing DB record(s) for run_name={run_name!r} found "
+                    f"with status={statuses}; {reason}, overwriting.",
+                    flush=True,
+                )
+
+            conn.execute(
+                f"DELETE FROM params WHERE experiment_id IN ({placeholders})",
+                ids,
+            )
+            conn.execute(
+                f"DELETE FROM metrics WHERE experiment_id IN ({placeholders})",
+                ids,
+            )
+            conn.execute(
+                f"DELETE FROM experiments WHERE id IN ({placeholders})",
+                ids,
+            )
+            conn.commit()
+            return
+
+        except sqlite3.OperationalError as exc:
+            if conn.in_transaction:
+                conn.rollback()
+
+            if not is_database_locked_error(exc):
+                raise
+
+            if attempt >= SQLITE_WRITE_RETRIES:
+                raise RuntimeError(
+                    f"SQLite database remained locked after "
+                    f"{SQLITE_WRITE_RETRIES} attempts while deleting "
+                    f"run_name={run_name!r}."
+                ) from exc
+
+            delay = min(
+                SQLITE_RETRY_BASE_DELAY_SEC * attempt,
+                10.0,
+            )
+            print(
+                f"SQLite is locked while rewriting {run_name!r}; "
+                f"retrying in {delay:.1f} s "
+                f"({attempt}/{SQLITE_WRITE_RETRIES})...",
+                flush=True,
+            )
+            time.sleep(delay)
+
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
 
 
 def run_directory_needs_rewrite(run_dir: Path) -> tuple[bool, str]:
@@ -1608,20 +1692,9 @@ def run_sweep(args: argparse.Namespace) -> int:
             if args.export_summary:
                 export_summary(conn, db_path.parent)
 
-            conn.commit()
-            checkpoint_result = conn.execute(
-                "PRAGMA wal_checkpoint(TRUNCATE);"
-            ).fetchone()
-
-            if checkpoint_result is not None:
-                busy, log_pages, checkpointed_pages = checkpoint_result
-                print(
-                    f"SQLite checkpoint: busy={busy}, "
-                    f"log_pages={log_pages}, "
-                    f"checkpointed_pages={checkpointed_pages}",
-                    flush=True,
-                )
-
+            if conn.in_transaction:
+                conn.commit()
+            conn.execute("PRAGMA optimize")
             return 0
         finally:
             conn.close()
@@ -2287,24 +2360,14 @@ def run_sweep(args: argparse.Namespace) -> int:
     else:
         print("Skipping CSV/XLSX summary export because --export-summary was not set.")
 
-    print("Checkpointing SQLite WAL before closing...", flush=True)
+    print("Finalizing SQLite database before closing...", flush=True)
 
-    conn.commit()
+    if conn.in_transaction:
+        conn.commit()
 
-    checkpoint_result = conn.execute(
-        "PRAGMA wal_checkpoint(TRUNCATE);"
-    ).fetchone()
-
-    if checkpoint_result is not None:
-        busy, log_pages, checkpointed_pages = checkpoint_result
-
-        print(
-            f"SQLite checkpoint: busy={busy}, "
-            f"log_pages={log_pages}, "
-            f"checkpointed_pages={checkpointed_pages}",
-            flush=True,
-        )
-
+    # The fixed connection uses journal_mode=DELETE, so there is no WAL to
+    # checkpoint. optimize is safe and updates SQLite's query-planner metadata.
+    conn.execute("PRAGMA optimize")
     conn.close()
     return 0
 
