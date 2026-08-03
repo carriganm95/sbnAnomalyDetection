@@ -276,6 +276,30 @@ def _plot_overlay(score_lists, labels, path, aggregator, threshold=None, nbins=6
                    label=f"threshold = {threshold:.4g}")
         ax.text(threshold, ax.get_ylim()[1], f" thr={threshold:.4g}",
                 rotation=90, va="top", ha="left", fontsize=8, color="k")
+
+        # For a good-vs-bad overlay, show the window-level classification
+        # metrics at the same operating threshold used by _confusion().
+        # The first distribution is the negative (good) class and the second
+        # distribution is the positive (bad) class.
+        if len(finite) >= 2:
+            good_scores, bad_scores = finite[0], finite[1]
+            tp = int(np.sum(bad_scores > threshold))
+            fn = int(bad_scores.size - tp)
+            fp = int(np.sum(good_scores > threshold))
+
+            precision = tp / (tp + fp) if (tp + fp) else float("nan")
+            recall = tp / (tp + fn) if (tp + fn) else float("nan")
+
+            ax.text(
+                0.98,
+                0.95,
+                f"Precision: {precision:.3f}\nRecall: {recall:.3f}",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=10,
+                bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.85},
+            )
     ax.set_xlabel(f"window score ({aggregator})")
     ax.set_ylabel("density")
     ax.set_yscale("log")
