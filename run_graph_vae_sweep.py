@@ -58,6 +58,16 @@ PER_CHANNEL_PLOT_SCRIPT = (
     PROJECT_DIR / "graphing" / "plot_per_channel_scores.py"
 )
 
+# Selected-window per-channel node-score plotting script. Each selected row in
+# node_scores is one window; multiple selected windows are averaged per channel.
+PER_CHANNEL_PER_WINDOW_PLOT_SCRIPT = (
+    PROJECT_DIR / "graphing" / "plot_per_channel_scores_per_window.py"
+)
+DEFAULT_PER_CHANNEL_WINDOW_DATASETS = "both"
+DEFAULT_PER_CHANNEL_PER_WINDOW_PLOT_NAME = (
+    "channel_node_scores_selected_windows.png"
+)
+
 # Fallback filename used by --missing-plot if the plotting script does not
 # expose its output filename/path as a global variable.
 DEFAULT_PER_CHANNEL_PLOT_NAME = "per_channel_scores.png"
@@ -1247,6 +1257,60 @@ def run_per_channel_score_plot(
     print("Per-channel node-score plot finished.")
 
 
+def run_per_channel_per_window_score_plot(
+    *,
+    plot_script_path: Path,
+    inference_dir: Path,
+    window_spec: str | None,
+    datasets: str,
+    output_name: str,
+) -> None:
+    """Run the selected-window per-channel plotter for one model."""
+    plot_script_path = Path(plot_script_path).expanduser().resolve()
+    inference_dir = Path(inference_dir).expanduser().resolve()
+
+    required_score_paths = []
+    if datasets in {"good", "both"}:
+        required_score_paths.append(inference_dir / "scores_good.npz")
+    if datasets in {"bad", "both"}:
+        required_score_paths.append(inference_dir / "scores_bad.npz")
+
+    missing_inputs = [path for path in required_score_paths if not path.exists()]
+    if missing_inputs:
+        raise FileNotFoundError(
+            "Cannot run selected-window per-channel plotting because required "
+            "score file(s) are missing: "
+            + ", ".join(str(path) for path in missing_inputs)
+        )
+
+    print("Selected-window per-channel node-score plotting...")
+    print(f"  Plot script:      {plot_script_path}")
+    print(f"  Inference result: {inference_dir}")
+    if window_spec is None:
+        print("  Window indices:   plotter default")
+    else:
+        print(f"  Window indices:   {window_spec}")
+    print(f"  Dataset(s):       {datasets}")
+
+    namespace = load_per_channel_plot_namespace(
+        plot_script_path=plot_script_path,
+        inference_dir=inference_dir,
+    )
+    plot_main = namespace.get("main")
+    if not callable(plot_main):
+        raise RuntimeError(
+            f"Plotting script does not define a callable main(): {plot_script_path}"
+        )
+
+    output_path = plot_main(
+        inference_dir,
+        window_spec=window_spec,
+        datasets=datasets,
+        output=output_name,
+    )
+    print(f"Selected-window per-channel plot finished: {output_path}")
+
+
 # ============================================================
 # Result parsing
 # ============================================================
@@ -1712,6 +1776,16 @@ def run_sweep(args: argparse.Namespace) -> int:
     print(f"Infer-only mode: {args.infer_only}")
     print(f"Missing-infer-only mode: {args.missing_infer_only}")
     print(f"Per-channel plotting: {args.per_channel_plot}")
+    print(
+        "Selected-window per-channel plotting: "
+        f"{args.per_channel_per_window_plot}"
+    )
+    if args.per_channel_per_window_plot:
+        if args.per_channel_window_indices is None:
+            print("Selected window indices: plotter default")
+        else:
+            print(f"Selected window indices: {args.per_channel_window_indices}")
+        print(f"Selected window datasets: {args.per_channel_window_datasets}")
     print(f"Missing-plot mode: {args.missing_plot}")
     print(f"Force-replot mode: {args.force_replot}")
     print(f"Skip evaluation: {args.skip_eval}")
@@ -2208,6 +2282,15 @@ def run_sweep(args: argparse.Namespace) -> int:
                             inference_dir=inference_dir,
                         )
 
+                    if args.per_channel_per_window_plot:
+                        run_per_channel_per_window_score_plot(
+                            plot_script_path=PER_CHANNEL_PER_WINDOW_PLOT_SCRIPT,
+                            inference_dir=inference_dir,
+                            window_spec=args.per_channel_window_indices,
+                            datasets=args.per_channel_window_datasets,
+                            output_name=args.per_channel_per_window_plot_name,
+                        )
+
                     if args.skip_eval:
                         print("Skipping good-vs-bad evaluation because --skip-eval was set.")
                     else:
@@ -2267,6 +2350,15 @@ def run_sweep(args: argparse.Namespace) -> int:
                         run_per_channel_score_plot(
                             plot_script_path=PER_CHANNEL_PLOT_SCRIPT,
                             inference_dir=inference_dir,
+                        )
+
+                    if args.per_channel_per_window_plot:
+                        run_per_channel_per_window_score_plot(
+                            plot_script_path=PER_CHANNEL_PER_WINDOW_PLOT_SCRIPT,
+                            inference_dir=inference_dir,
+                            window_spec=args.per_channel_window_indices,
+                            datasets=args.per_channel_window_datasets,
+                            output_name=args.per_channel_per_window_plot_name,
                         )
 
                     if args.skip_eval:
@@ -2589,6 +2681,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "carried out, including normal train+infer, --infer-only, and "
             "--missing-infer-only reruns. It does not run in --evaluate-only mode "
             "because no inference is performed there."
+        ),
+    )
+    parser.add_argument(
+        "--per-channel-per-window-plot",
+        "--per_channel_per_window_plot",
+        dest="per_channel_per_window_plot",
+        action="store_true",
+        help=(
+            "Run graphing/plot_per_channel_scores_per_window.py after every "
+            "successful pair of good/bad inference jobs. The selected rows of "
+            "node_scores are controlled by --per-channel-window-indices."
+        ),
+    )
+    parser.add_argument(
+        "--per-channel-window-indices",
+        "--per_channel_window_indices",
+        dest="per_channel_window_indices",
+        default=None,
+        help=(
+            "Zero-based window indices/ranges for "
+            "--per-channel-per-window-plot, e.g. '1200', '1,4,8', or "
+            "'1200-1210'. Ranges are inclusive. If omitted, the plotter's "
+            "DEFAULT_WINDOW_SPEC variable is used."
+        ),
+    )
+    parser.add_argument(
+        "--per-channel-window-datasets",
+        "--per_channel_window_datasets",
+        dest="per_channel_window_datasets",
+        choices=("good", "bad", "both"),
+        default=DEFAULT_PER_CHANNEL_WINDOW_DATASETS,
+        help=(
+            "Score file(s) used by --per-channel-per-window-plot. "
+            "Default: %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--per-channel-per-window-plot-name",
+        "--per_channel_per_window_plot_name",
+        dest="per_channel_per_window_plot_name",
+        default=DEFAULT_PER_CHANNEL_PER_WINDOW_PLOT_NAME,
+        help=(
+            "Selected-window plot filename inside each inference_result "
+            "directory. Default: %(default)s."
         ),
     )
     parser.add_argument(
