@@ -60,7 +60,7 @@ BASE_YAML_PATH = Path("configs/graph_vae.yaml")
 OUTPUT_YAML_DIR = Path("tuning_configs/graph_vae_sweep")
 
 # Starting index for generated YAML names and run directories.
-START_INDEX = 0
+START_INDEX = 15
 
 # Select which type of window sweep to generate:
 #   "event" -> sweep EVENT_WINDOW_SIZES and EVENT_STRIDES
@@ -79,8 +79,8 @@ EVENT_STRIDES = [10, 20, 50, 80, 100]
 # Examples:
 #   0.00004 seconds = 40,000 ns
 #   0.0004  seconds = 400,000 ns
-TIME_WINDOW_DURATIONS_SECONDS = [2000, 20000, 40000, 80000, 100000]
-TIME_STRIDE_DURATIONS_SECONDS = [200, 400, 1000]
+TIME_WINDOW_DURATIONS_SECONDS = [5000, 8000, 10000]
+TIME_STRIDE_DURATIONS_SECONDS = [125, 200, 250]
 
 # Conversion used when writing the generated YAML.
 NANOSECONDS_PER_SECOND = 1_000_000_000
