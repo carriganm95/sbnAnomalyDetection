@@ -14,20 +14,24 @@ import numpy as np
 #   1. One .npz file
 #   2. A directory containing .npz files
 INPUT_PATH = Path(
-    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/scratch/bad_events_test.npz"
+    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/scratch/good_events_test.npz"
 )
 
 OUTPUT_DIR = Path(
-    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/graphing/plot_time_window_scatter_output"
+    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/graphing/plot_time_window_box_whisker_output"
 )
 
 # Timed-window durations to test, in seconds.
 TIME_WINDOW_SIZES_SECONDS = [
-    1800
+    3*60*60,
 ]
 
 # Distance between consecutive window starts, in seconds.
 TIME_WINDOW_STRIDE_SECONDS = 15.0
+
+# Draw a dotted horizontal line at this event count.
+# Set this to None if you do not want a target line.
+EVENT_NUM_TARGET = 500
 
 # True:
 #   Do not include completely empty time windows in the plot.
@@ -36,7 +40,7 @@ TIME_WINDOW_STRIDE_SECONDS = 15.0
 #   Include empty windows as points at y = 0.
 SKIP_EMPTY_WINDOWS = False
 
-# Scatter-plot appearance.
+# Box-and-whisker plot appearance.
 POINT_SIZE = 12
 POINT_ALPHA = 0.45
 FIGURE_WIDTH = 14
@@ -475,6 +479,17 @@ def plot_events_per_window_by_run(
         meanline=False,
         whis=1.5,
     )
+
+    if EVENT_NUM_TARGET is not None:
+        axis.axhline(
+            y=EVENT_NUM_TARGET,
+            color="tab:red",
+            linestyle=":",
+            linewidth=2,
+            label=f"Target: {EVENT_NUM_TARGET:,} events",
+        )
+
+        axis.legend()
 
     axis.set_xlabel(
         "Run Number"
