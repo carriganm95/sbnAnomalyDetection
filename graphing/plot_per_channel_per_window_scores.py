@@ -3,9 +3,9 @@
 """Plot per-channel GraphVAE score distributions for selected windows.
 
 Each row of ``node_scores`` is one window and each column is one channel. For
-every channel, the box spans Q1-Q3, the center line is the median, and the
-whiskers extend to the most extreme values within 1.5 IQR. Six PNG files are
-written using plane membership read from the detector channel-map CSV.
+every channel, the distribution can be shown either as a mean with a standard-
+deviation band or as a box-and-whisker plot. Six PNG files are written using
+plane membership read from the detector channel-map CSV.
 """
 
 import argparse
@@ -42,7 +42,7 @@ BAD_FILENAME = "scores_bad.npz"
 
 # Used when no window selection is supplied by the caller.
 # Examples: "1200", "1200,1205", "1200-1210", or "all".
-DEFAULT_WINDOW_SPEC = "0-10"
+DEFAULT_WINDOW_SPEC = "all"
 DEFAULT_DATASETS = "both"  # "good", "bad", or "both"
 
 # Leave these as None for automatic CSV-header detection. Set an exact header
@@ -55,6 +55,12 @@ EXPECTED_NUM_PLANES = 6
 
 # This is a base filename. The plotter adds _plane_1 through _plane_6.
 OUTPUT_FILENAME = "channel_node_scores_selected_windows.png"
+
+# Plot-style switch:
+#   "mean_std" -> mean line with a shaded mean +/- N standard deviations band
+#   "box"      -> original box-and-whisker plot
+PLOT_STYLE = "mean_std"
+STD_BAND_SIGMAS = 1.0
 
 WHISKER_IQR = 1.5
 SHOW_FLIERS = True
@@ -105,6 +111,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Base output filename/path. '_plane_N' is added before the suffix. "
             "Default: %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--plot-style",
+        choices=("mean_std", "box"),
+        default=PLOT_STYLE,
+        help=(
+            "Distribution display: a mean line with a shaded standard-deviation "
+            "band, or the original boxplot. Default: %(default)s."
         ),
     )
     return parser
@@ -580,6 +595,59 @@ def draw_boxplots(
         )
 
 
+def calculate_mean_std(
+    selected_scores: np.ndarray,
+    channel_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Calculate the finite-value mean and population std per channel."""
+    plane_scores = selected_scores[:, channel_ids]
+    means = np.full(channel_ids.size, np.nan, dtype=np.float64)
+    stds = np.full(channel_ids.size, np.nan, dtype=np.float64)
+
+    for channel_index in range(channel_ids.size):
+        values = plane_scores[:, channel_index]
+        values = values[np.isfinite(values)]
+        if values.size:
+            means[channel_index] = np.mean(values)
+            stds[channel_index] = np.std(values, ddof=0)
+
+    return means, stds
+
+
+def draw_mean_std_band(
+    ax: plt.Axes,
+    selected_scores: np.ndarray,
+    channel_ids: np.ndarray,
+    color: str,
+) -> None:
+    """Draw a per-channel mean line and shaded +/- sigma band."""
+    means, stds = calculate_mean_std(selected_scores, channel_ids)
+    valid = np.isfinite(means) & np.isfinite(stds)
+    if not np.any(valid):
+        return
+
+    channels = channel_ids[valid].astype(np.float64)
+    valid_means = means[valid]
+    spread = STD_BAND_SIGMAS * stds[valid]
+
+    ax.fill_between(
+        channels,
+        valid_means - spread,
+        valid_means + spread,
+        color=color,
+        alpha=0.20,
+        linewidth=0,
+        zorder=1,
+    )
+    ax.plot(
+        channels,
+        valid_means,
+        color=color,
+        linewidth=1.1,
+        zorder=2,
+    )
+
+
 def main(
     inference_result_dir: Optional[Union[Path, str]] = None,
     *,
@@ -587,8 +655,9 @@ def main(
     datasets: Optional[str] = None,
     channel_map: Optional[Union[Path, str]] = None,
     output: Optional[Union[Path, str]] = None,
+    plot_style: Optional[str] = None,
 ) -> list[Path]:
-    """Create and return six selected-window per-channel boxplot paths."""
+    """Create and return six selected-window per-channel distribution plots."""
     if inference_result_dir is None:
         args = build_arg_parser().parse_args()
         inference_result_dir = args.inference_result_dir
@@ -596,6 +665,7 @@ def main(
         datasets = args.datasets
         channel_map = args.channel_map
         output = args.output
+        plot_style = args.plot_style
 
     inference_dir = Path(inference_result_dir).expanduser().resolve()
     if not inference_dir.is_dir():
@@ -607,8 +677,11 @@ def main(
     datasets = DEFAULT_DATASETS if datasets is None else datasets
     channel_map = CHANNEL_MAP_PATH if channel_map is None else channel_map
     output = OUTPUT_FILENAME if output is None else output
+    plot_style = PLOT_STYLE if plot_style is None else str(plot_style)
     if datasets not in {"good", "bad", "both"}:
         raise ValueError("datasets must be 'good', 'bad', or 'both'.")
+    if plot_style not in {"mean_std", "box"}:
+        raise ValueError("plot_style must be 'mean_std' or 'box'.")
 
     requested = []
     if datasets in {"good", "both"}:
@@ -642,25 +715,38 @@ def main(
         channels = channel_ids.astype(np.float64)
         fig, ax = plt.subplots(figsize=FIGSIZE)
 
-        if len(loaded) == 2:
-            offsets = (-0.20, 0.20)
-            width = 0.34
-        else:
-            offsets = (0.0,)
-            width = 0.68
+        if plot_style == "box":
+            if len(loaded) == 2:
+                offsets = (-0.20, 0.20)
+                width = 0.34
+            else:
+                offsets = (0.0,)
+                width = 0.68
 
         legend_handles = []
-        for (label, color, scores, _indices), offset in zip(loaded, offsets):
-            draw_boxplots(
-                ax,
-                scores,
-                channel_ids,
-                channels + offset,
-                color,
-                width,
-            )
+        for dataset_index, (label, color, scores, _indices) in enumerate(loaded):
+            if plot_style == "mean_std":
+                draw_mean_std_band(ax, scores, channel_ids, color)
+                legend_label = (
+                    f"{label} mean +/- {STD_BAND_SIGMAS:g} sigma"
+                )
+            else:
+                draw_boxplots(
+                    ax,
+                    scores,
+                    channel_ids,
+                    channels + offsets[dataset_index],
+                    color,
+                    width,
+                )
+                legend_label = label
             legend_handles.append(
-                Patch(facecolor=color, edgecolor=color, alpha=0.35, label=label)
+                Patch(
+                    facecolor=color,
+                    edgecolor=color,
+                    alpha=0.30,
+                    label=legend_label,
+                )
             )
 
         selected_indices = loaded[0][3]
@@ -678,8 +764,13 @@ def main(
                 f"{channel_ids.size:,} mapped channels, "
                 f"IDs {channel_ids.min()}-{channel_ids.max()}"
             )
+        display_name = (
+            f"Mean and +/- {STD_BAND_SIGMAS:g} Standard Deviation"
+            if plot_style == "mean_std"
+            else "Box-and-Whisker Distribution"
+        )
         ax.set_title(
-            f"{plane_label}: Per-Channel Score Distribution Across {selection_text} "
+            f"{plane_label}: Per-Channel {display_name} Across {selection_text} "
             f"({channel_summary})",
             fontsize=15,
         )
