@@ -1191,6 +1191,37 @@ def get_per_channel_plot_path(
     return (inference_dir / DEFAULT_PER_CHANNEL_PLOT_NAME).resolve()
 
 
+def get_per_channel_per_window_plot_paths(
+    *,
+    plot_script_path: Path,
+    inference_dir: Path,
+    output_name: str,
+) -> list[Path]:
+    """Discover all plane PNGs made by the selected-window plotter."""
+    inference_dir = Path(inference_dir).expanduser().resolve()
+    namespace = load_per_channel_plot_namespace(
+        plot_script_path=plot_script_path,
+        inference_dir=inference_dir,
+    )
+
+    get_output_paths = namespace.get("get_output_paths")
+    if not callable(get_output_paths):
+        raise RuntimeError(
+            "Selected-window plotting script does not define callable "
+            f"get_output_paths(): {plot_script_path}"
+        )
+
+    paths = [
+        Path(path).expanduser().resolve()
+        for path in get_output_paths(inference_dir, output_name)
+    ]
+    if not paths:
+        raise RuntimeError(
+            f"Selected-window plotting script returned no output paths: {plot_script_path}"
+        )
+    return paths
+
+
 def run_per_channel_score_plot(
     *,
     plot_script_path: Path,
@@ -1302,13 +1333,18 @@ def run_per_channel_per_window_score_plot(
             f"Plotting script does not define a callable main(): {plot_script_path}"
         )
 
-    output_path = plot_main(
+    output_paths = plot_main(
         inference_dir,
         window_spec=window_spec,
         datasets=datasets,
         output=output_name,
     )
-    print(f"Selected-window per-channel plot finished: {output_path}")
+    print("Selected-window per-channel plots finished:")
+    if isinstance(output_paths, (list, tuple)):
+        for output_path in output_paths:
+            print(f"  - {output_path}")
+    else:
+        print(f"  - {output_paths}")
 
 
 # ============================================================
@@ -1823,9 +1859,6 @@ def run_sweep(args: argparse.Namespace) -> int:
         good_score_npz_path = inference_dir / "scores_good.npz"
         bad_score_npz_path = inference_dir / "scores_bad.npz"
         eval_plot_path = inference_dir / args.eval_plot_name
-        per_channel_per_window_plot_path = (
-            inference_dir / args.per_channel_per_window_plot_name
-        )
         eval_log_path = inference_dir / args.eval_log_name
         eval_json_path = inference_dir / args.eval_json_name
 
@@ -1856,13 +1889,25 @@ def run_sweep(args: argparse.Namespace) -> int:
                 plot_script_path=PER_CHANNEL_PLOT_SCRIPT,
                 inference_dir=inference_dir,
             )
+            per_channel_per_window_plot_paths = (
+                get_per_channel_per_window_plot_paths(
+                    plot_script_path=PER_CHANNEL_PER_WINDOW_PLOT_SCRIPT,
+                    inference_dir=inference_dir,
+                    output_name=args.per_channel_per_window_plot_name,
+                )
+            )
+            missing_per_channel_per_window_plot_paths = [
+                path
+                for path in per_channel_per_window_plot_paths
+                if not path.exists()
+            ]
 
             need_per_channel_plot = (
                 args.force_replot or not per_channel_plot_path.exists()
             )
             need_per_channel_per_window_plot = (
                 args.force_replot
-                or not per_channel_per_window_plot_path.exists()
+                or bool(missing_per_channel_per_window_plot_paths)
             )
             need_goodvsbad_plot = (
                 args.force_replot or not eval_plot_path.exists()
@@ -1897,21 +1942,21 @@ def run_sweep(args: argparse.Namespace) -> int:
             if need_per_channel_per_window_plot:
                 if (
                     args.force_replot
-                    and per_channel_per_window_plot_path.exists()
+                    and not missing_per_channel_per_window_plot_paths
                 ):
                     print(
-                        "Existing selected-window per-channel plot found; "
+                        "Existing selected-window per-channel plane plots found; "
                         "rerunning because --force-replot was set."
                     )
                 else:
                     print(
-                        "Selected-window per-channel plot is missing; "
-                        "generating it now."
+                        "One or more selected-window per-channel plane plots "
+                        "are missing; generating all six now."
                     )
-                print(
-                    "Expected selected-window per-channel plot: "
-                    f"{per_channel_per_window_plot_path}"
-                )
+                print("Expected selected-window per-channel plane plots:")
+                for path in per_channel_per_window_plot_paths:
+                    marker = "missing" if not path.exists() else "exists"
+                    print(f"  - {path} [{marker}]")
 
                 run_per_channel_per_window_score_plot(
                     plot_script_path=PER_CHANNEL_PER_WINDOW_PLOT_SCRIPT,
@@ -1921,26 +1966,27 @@ def run_sweep(args: argparse.Namespace) -> int:
                     output_name=args.per_channel_per_window_plot_name,
                 )
 
-                if per_channel_per_window_plot_path.exists():
-                    print(
-                        "Created selected-window per-channel plot: "
-                        f"{per_channel_per_window_plot_path}"
-                    )
+                remaining_missing_paths = [
+                    path
+                    for path in per_channel_per_window_plot_paths
+                    if not path.exists()
+                ]
+                if not remaining_missing_paths:
+                    print("Created all selected-window per-channel plane plots.")
                 else:
                     print(
-                        "WARNING: plotting finished, but the expected "
-                        "selected-window per-channel plot was not found: "
-                        f"{per_channel_per_window_plot_path}"
+                        "WARNING: plotting finished, but these expected plane "
+                        "plots were not found:"
                     )
+                    for path in remaining_missing_paths:
+                        print(f"  - {path}")
             else:
                 print(
-                    "Selected-window per-channel plot already exists; "
+                    "All selected-window per-channel plane plots already exist; "
                     "no replot needed."
                 )
-                print(
-                    "Existing selected-window per-channel plot: "
-                    f"{per_channel_per_window_plot_path}"
-                )
+                for path in per_channel_per_window_plot_paths:
+                    print(f"  - {path}")
 
             if need_goodvsbad_plot:
                 if args.force_replot and eval_plot_path.exists():
@@ -2791,9 +2837,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Plot-only repair mode. For each model directory under --runs-root, "
             "independently check whether the all-window per-channel plot, the "
-            "selected-window per-channel plot, and goodvsbad.png exist. Recreate "
-            "any missing plot from scores_good.npz and scores_bad.npz. No training "
-            "or inference is run."
+            "six selected-window per-plane boxplots, and goodvsbad.png exist. "
+            "Recreate any missing plot set from scores_good.npz and "
+            "scores_bad.npz. No training or inference is run."
         ),
     )
     parser.add_argument(
@@ -2803,8 +2849,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Standalone plot-only mode. For each model directory under --runs-root, "
-            "rerun the all-window per-channel plot, selected-window per-channel "
-            "plot, and good-vs-bad plot whenever scores_good.npz and "
+            "rerun the all-window per-channel plot, all six selected-window "
+            "per-plane boxplots, and good-vs-bad plot whenever scores_good.npz and "
             "scores_bad.npz exist, even if the plots already exist. No training or "
             "inference is run."
         ),
