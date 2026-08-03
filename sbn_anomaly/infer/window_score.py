@@ -198,6 +198,29 @@ def separation_auc(good: np.ndarray, bad: np.ndarray) -> float:
     return float(u / (g.size * b.size))
 
 
+def _load_provenance(arch) -> Optional[np.ndarray]:
+    """Return an (N, >=2) int array of (run, subrun, ...) per window, or None.
+
+    Two provenance layouts exist in the wild: an older combined ``provenance`` (N, 3)
+    array (run, subrun, event), and the current per-window-metadata layout written by
+    ``infer/cli.py`` (separate ``first_run``/``first_subrun``/``first_event_num``
+    arrays -- no combined ``provenance`` key). This reads either, so ``--per-run`` and
+    ``--stream`` work on scores npz produced by the current inference path.
+    """
+    files = getattr(arch, "files", [])
+    if "provenance" in files:
+        return arch["provenance"]
+    if "first_run" in files and "first_subrun" in files:
+        run = np.asarray(arch["first_run"]).astype(np.int64)
+        subrun = np.asarray(arch["first_subrun"]).astype(np.int64)
+        if "first_event_num" in files:
+            evt = np.asarray(arch["first_event_num"]).astype(np.int64)
+        else:
+            evt = np.zeros_like(run)
+        return np.stack([run, subrun, evt], axis=1)
+    return None
+
+
 def _aggregate_file(path: str, aggregator: str, group_args, baseline=None):
     """Return (per-window scores, provenance-or-None) for a scores npz.
 
@@ -216,7 +239,7 @@ def _aggregate_file(path: str, aggregator: str, group_args, baseline=None):
         node_scores, aggregator, groups=groups,
         baseline_mu=baseline_mu, baseline_sigma=baseline_sigma,
     )
-    prov = arch["provenance"] if "provenance" in getattr(arch, "files", []) else None
+    prov = _load_provenance(arch)
     return win, prov
 
 
@@ -385,7 +408,7 @@ def main(argv=None) -> int:
 
     arch = np.load(args.scores, allow_pickle=False)
     node_scores = arch["node_scores"] if "node_scores" in arch else arch["scores"]
-    prov_good = arch["provenance"] if "provenance" in getattr(arch, "files", []) else None
+    prov_good = _load_provenance(arch)
     if args.aggregator == "group_max_mean" and not args.channel_map:
         p.error("group_max_mean needs --channel-map")
     if args.aggregator == "zscore_mean" and not args.baseline:
