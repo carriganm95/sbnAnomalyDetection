@@ -39,6 +39,7 @@ CHANNEL_MAP_PATH = Path(
 
 GOOD_FILENAME = "scores_good.npz"
 BAD_FILENAME = "scores_bad.npz"
+TRAIN_FILENAME = "scores_train.npz"
 
 # Used when no window selection is supplied by the caller.
 # Examples: "1200", "1200,1205", "1200-1210", or "all".
@@ -69,6 +70,7 @@ DPI = 180
 
 GOOD_COLOR = "#2563eb"
 BAD_COLOR = "#dc2626"
+TRAIN_COLOR = "#22c55e"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -120,6 +122,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Distribution display: a mean line with a shaded standard-deviation "
             "band, or the original boxplot. Default: %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--good-bad-only",
+        action="store_true",
+        help=(
+            "Plot only the requested good/bad scores, even when "
+            "scores_train.npz exists. By default, the training mean and "
+            "standard-deviation band are also plotted when available."
         ),
     )
     return parser
@@ -635,7 +646,7 @@ def draw_mean_std_band(
         valid_means - spread,
         valid_means + spread,
         color=color,
-        alpha=0.20,
+        alpha=0.10,
         linewidth=0,
         zorder=1,
     )
@@ -656,6 +667,7 @@ def main(
     channel_map: Optional[Union[Path, str]] = None,
     output: Optional[Union[Path, str]] = None,
     plot_style: Optional[str] = None,
+    good_bad_only: bool = False,
 ) -> list[Path]:
     """Create and return six selected-window per-channel distribution plots."""
     if inference_result_dir is None:
@@ -666,6 +678,7 @@ def main(
         channel_map = args.channel_map
         output = args.output
         plot_style = args.plot_style
+        good_bad_only = args.good_bad_only
 
     inference_dir = Path(inference_result_dir).expanduser().resolve()
     if not inference_dir.is_dir():
@@ -703,6 +716,25 @@ def main(
             )
         num_channels = current_num_channels
         loaded.append((label, color, scores, indices))
+
+    train_loaded = None
+    train_path = inference_dir / TRAIN_FILENAME
+    if not good_bad_only and train_path.is_file():
+        train_scores, train_num_channels, train_indices = load_selected_node_scores(
+            train_path,
+            window_spec,
+        )
+        if num_channels is not None and train_num_channels != num_channels:
+            raise ValueError(
+                "Training and selected good/bad score files have different "
+                f"channel counts: {train_num_channels} and {num_channels}."
+            )
+        train_loaded = ("Train", TRAIN_COLOR, train_scores, train_indices)
+        print("Training scores found; adding their mean and standard-deviation band.")
+    elif good_bad_only:
+        print("--good-bad-only set; training scores will not be plotted.")
+    else:
+        print(f"Training score file not found; continuing without it: {train_path}")
 
     assert num_channels is not None
     plane_groups = load_plane_channel_groups(channel_map, num_channels)
@@ -746,6 +778,20 @@ def main(
                     edgecolor=color,
                     alpha=0.30,
                     label=legend_label,
+                )
+            )
+
+        if train_loaded is not None:
+            train_label, train_color, train_scores, _train_indices = train_loaded
+            draw_mean_std_band(ax, train_scores, channel_ids, train_color)
+            legend_handles.append(
+                Patch(
+                    facecolor=train_color,
+                    edgecolor=train_color,
+                    alpha=0.30,
+                    label=(
+                        f"{train_label} mean +/- {STD_BAND_SIGMAS:g} sigma"
+                    ),
                 )
             )
 
