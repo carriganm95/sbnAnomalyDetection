@@ -43,6 +43,16 @@ DEFAULT_DB_PATH = PROJECT_DIR / "graph_vae_sweep.sqlite3"
 # --input in sbn-infer overrides inference.input_path in the YAML.
 DEFAULT_GOOD_INPUT = PROJECT_DIR / "data" / "good_events_test.npz"
 DEFAULT_BAD_INPUT = PROJECT_DIR / "data" / "bad_events_test.npz"
+DEFAULT_TRAIN_INPUT = PROJECT_DIR / "data" / "events_train.npz"
+
+# Training-split outputs used to fit the per-channel z-score baseline.
+DEFAULT_BASELINE_SCORES_NAME = "scores_train.npz"
+DEFAULT_CHANNEL_BASELINE_NAME = "channel_baseline.npz"
+DEFAULT_BASELINE_CMD = "python -m sbn_anomaly.infer.channel_baseline"
+DEFAULT_BASELINE_EVAL_PLOT_NAME = "goodvsbad_zscore.png"
+DEFAULT_BASELINE_EVAL_LOG_NAME = "goodvsbad_zscore_eval.txt"
+DEFAULT_BASELINE_EVAL_JSON_NAME = "goodvsbad_zscore_eval.json"
+DEFAULT_BASELINE_EVAL_PERCENTILE = 90.0
 
 # Default good-vs-bad evaluation settings.
 DEFAULT_CHANNEL_MAP = PROJECT_DIR / "configs" / "SBNDTPCChannelMap_v2_with_positions.csv"
@@ -83,6 +93,18 @@ DEFAULT_PER_CHANNEL_PLOT_NAME = "per_channel_scores.png"
 # sweep activity, including training, inference, evaluation, plotting, and
 # rewrite/repair modes. Add full model directory paths here.
 IGNORED: list[Path] = [
+    Path(DEFAULT_MODEL_ROOT/"0001_time2000s_tstride400s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0002_time2000s_tstride1000s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0003_time20000s_tstride200s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0004_time20000s_tstride400s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0005_time20000s_tstride1000s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0006_time40000s_tstride200s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0007_time40000s_tstride400s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0008_time40000s_tstride1000s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0009_time80000s_tstride200s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0010_time80000s_tstride400s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"0011_time80000s_tstride1000s_rad4_bs64_lr0p001_beta0p5"),
+    Path(DEFAULT_MODEL_ROOT/"All_data_timed"),
 ]
 
 
@@ -1680,6 +1702,7 @@ def run_sweep(args: argparse.Namespace) -> int:
     db_path = Path(args.db_path)
     good_input = Path(args.good_input)
     bad_input = Path(args.bad_input)
+    train_input = Path(args.train_input)
     channel_map = Path(args.channel_map)
 
     if not config_dir.exists():
@@ -1688,6 +1711,24 @@ def run_sweep(args: argparse.Namespace) -> int:
     if args.missing_evaluate_only:
         args.evaluate_only = True
 
+    if args.baseline_infer:
+        if not 0.0 <= float(args.baseline_eval_percentile) <= 100.0:
+            raise ValueError("--baseline-eval-percentile must be between 0 and 100.")
+        if args.evaluate_only or args.missing_evaluate_only:
+            raise ValueError(
+                "--baseline-infer cannot be combined with evaluation-only modes."
+            )
+        if args.skip_infer:
+            raise ValueError("--baseline-infer and --skip-infer cannot be used together.")
+        if args.restore_missing_db:
+            raise ValueError(
+                "--baseline-infer cannot be combined with --restore-missing-db."
+            )
+        if args.per_channel_plot or args.per_channel_per_window_plot:
+            raise ValueError(
+                "--baseline-infer cannot create good/bad score plots; remove the "
+                "per-channel plotting flags."
+            )
     # --missing-plot and --force-replot are standalone plot-only modes.
     # --missing-plot plots only when the expected plot is absent.
     # --force-replot always reruns plotting, even when the plot already exists.
@@ -1705,6 +1746,7 @@ def run_sweep(args: argparse.Namespace) -> int:
         or args.missing_evaluate_only
         or args.infer_only
         or args.missing_infer_only
+        or args.baseline_infer
         or args.skip_infer
         or args.force_rewrite
         or args.missing_rewrite
@@ -1726,12 +1768,18 @@ def run_sweep(args: argparse.Namespace) -> int:
         )
 
     if not args.evaluate_only and not args.skip_infer:
-        if not good_input.exists():
-            raise FileNotFoundError(f"Good inference input does not exist: {good_input}")
-        if not bad_input.exists():
-            raise FileNotFoundError(f"Bad inference input does not exist: {bad_input}")
+        if args.baseline_infer:
+            if not train_input.exists():
+                raise FileNotFoundError(
+                    f"Training inference input does not exist: {train_input}"
+                )
+        else:
+            if not good_input.exists():
+                raise FileNotFoundError(f"Good inference input does not exist: {good_input}")
+            if not bad_input.exists():
+                raise FileNotFoundError(f"Bad inference input does not exist: {bad_input}")
 
-    if not args.skip_eval and not channel_map.exists():
+    if not args.skip_eval and not args.baseline_infer and not channel_map.exists():
         raise FileNotFoundError(f"Channel map for evaluation does not exist: {channel_map}")
 
     config_paths = sorted(config_dir.glob(args.pattern))
@@ -1743,6 +1791,7 @@ def run_sweep(args: argparse.Namespace) -> int:
     train_base_cmd = shlex.split(args.train_cmd)
     infer_base_cmd = shlex.split(args.infer_cmd)
     eval_base_cmd = shlex.split(args.eval_cmd)
+    baseline_base_cmd = shlex.split(args.baseline_cmd)
 
     if args.missing_infer_only:
         args.infer_only = True
@@ -1807,6 +1856,9 @@ def run_sweep(args: argparse.Namespace) -> int:
     print(f"Database: {db_path}")
     print(f"Good inference input: {good_input}")
     print(f"Bad inference input:  {bad_input}")
+    print(f"Baseline inference mode: {args.baseline_infer}")
+    if args.baseline_infer:
+        print(f"Training inference input: {train_input}")
     print(f"Batch mode: {args.batch}")
     print(f"Evaluate-only mode: {args.evaluate_only}")
     print(f"Missing-evaluate-only mode: {args.missing_evaluate_only}")
@@ -1828,10 +1880,17 @@ def run_sweep(args: argparse.Namespace) -> int:
     print(f"Skip evaluation: {args.skip_eval}")
     if not args.skip_eval:
         print(f"Evaluation command: {args.eval_cmd}")
-        print(f"Evaluation aggregator: {args.eval_aggregator}")
-        print(f"Evaluation channel map: {channel_map}")
+        if args.baseline_infer:
+            print("Evaluation aggregator: zscore_mean")
+            print("Evaluation baseline: inference_result/channel_baseline.npz")
+            print(f"Evaluation plot: {args.baseline_eval_plot_name}")
+        else:
+            print(f"Evaluation aggregator: {args.eval_aggregator}")
+            print(f"Evaluation channel map: {channel_map}")
         if args.eval_threshold is not None:
             print(f"Evaluation threshold: {args.eval_threshold} (explicit; percentile ignored by window_score)")
+        elif args.baseline_infer:
+            print(f"Evaluation percentile: {args.baseline_eval_percentile}")
         else:
             print(f"Evaluation percentile: {args.eval_percentile}")
     if args.batch:
@@ -1858,6 +1917,11 @@ def run_sweep(args: argparse.Namespace) -> int:
         inference_dir = run_dir / "inference_result"
         good_score_npz_path = inference_dir / "scores_good.npz"
         bad_score_npz_path = inference_dir / "scores_bad.npz"
+        baseline_score_npz_path = inference_dir / DEFAULT_BASELINE_SCORES_NAME
+        channel_baseline_npz_path = inference_dir / DEFAULT_CHANNEL_BASELINE_NAME
+        baseline_eval_plot_path = inference_dir / args.baseline_eval_plot_name
+        baseline_eval_log_path = inference_dir / args.baseline_eval_log_name
+        baseline_eval_json_path = inference_dir / args.baseline_eval_json_name
         eval_plot_path = inference_dir / args.eval_plot_name
         eval_log_path = inference_dir / args.eval_log_name
         eval_json_path = inference_dir / args.eval_json_name
@@ -2054,20 +2118,50 @@ def run_sweep(args: argparse.Namespace) -> int:
 
         if (
             args.missing_infer_only
-            and good_score_npz_path.exists()
-            and bad_score_npz_path.exists()
-            and (args.skip_eval or eval_json_path.exists())
+            and (
+                (
+                    args.baseline_infer
+                    and baseline_score_npz_path.exists()
+                    and channel_baseline_npz_path.exists()
+                    and (
+                        args.skip_eval
+                        or (
+                            baseline_eval_plot_path.exists()
+                            and baseline_eval_log_path.exists()
+                            and baseline_eval_json_path.exists()
+                        )
+                    )
+                )
+                or (
+                    not args.baseline_infer
+                    and good_score_npz_path.exists()
+                    and bad_score_npz_path.exists()
+                    and (args.skip_eval or eval_json_path.exists())
+                )
+            )
         ):
             print("\n" + "=" * 80)
             print(f"[{idx}/{len(config_paths)}] {config_path}")
-            print(
-                "Skipping because --missing-infer-only was set, both inference outputs "
-                "already exist, and evaluation is not requested or already exists."
-            )
-            print(f"Existing good inference output: {good_score_npz_path}")
-            print(f"Existing bad inference output:  {bad_score_npz_path}")
-            if not args.skip_eval:
-                print(f"Existing evaluation summary: {eval_json_path}")
+            if args.baseline_infer:
+                print(
+                    "Skipping because --missing-infer was set and both baseline "
+                    "inference outputs already exist."
+                )
+                print(f"Existing training scores: {baseline_score_npz_path}")
+                print(f"Existing channel baseline: {channel_baseline_npz_path}")
+                if not args.skip_eval:
+                    print(f"Existing z-score plot: {baseline_eval_plot_path}")
+                    print(f"Existing z-score evaluation log: {baseline_eval_log_path}")
+                    print(f"Existing z-score evaluation JSON: {baseline_eval_json_path}")
+            else:
+                print(
+                    "Skipping because --missing-infer-only was set, both inference "
+                    "outputs already exist, and evaluation is not requested or already exists."
+                )
+                print(f"Existing good inference output: {good_score_npz_path}")
+                print(f"Existing bad inference output:  {bad_score_npz_path}")
+                if not args.skip_eval:
+                    print(f"Existing evaluation summary: {eval_json_path}")
             print("=" * 80)
             continue
 
@@ -2145,10 +2239,17 @@ def run_sweep(args: argparse.Namespace) -> int:
                 print("\n" + "=" * 80)
                 print(f"[{idx}/{len(config_paths)}] {config_path}")
                 print(f"Run name conflict: {run_name!r}")
-                print(
-                    "infer_only=True, so the old database record will be replaced "
-                    "and both good/bad inference jobs will be rerun using the existing checkpoint."
-                )
+                if args.baseline_infer:
+                    print(
+                        "infer_only=True with baseline_infer=True, so the old database "
+                        "record will be replaced and baseline inference will be rerun "
+                        "using the existing checkpoint."
+                    )
+                else:
+                    print(
+                        "infer_only=True, so the old database record will be replaced "
+                        "and both good/bad inference jobs will be rerun using the existing checkpoint."
+                    )
                 print(f"Existing status: {existing_experiment.get('status')}")
                 print(f"Existing final model: {existing_experiment.get('final_model_path')}")
                 print("=" * 80)
@@ -2224,6 +2325,16 @@ def run_sweep(args: argparse.Namespace) -> int:
                 bad_score_npz_path,
             ) = prepare_run_config(original_cfg, run_dir)
 
+            baseline_score_npz_path = inference_dir / DEFAULT_BASELINE_SCORES_NAME
+            channel_baseline_npz_path = inference_dir / DEFAULT_CHANNEL_BASELINE_NAME
+            baseline_eval_plot_path = inference_dir / args.baseline_eval_plot_name
+            baseline_eval_log_path = inference_dir / args.baseline_eval_log_name
+            baseline_eval_json_path = inference_dir / args.baseline_eval_json_name
+            if args.baseline_infer:
+                patched_cfg.setdefault("inference", {})["output_path"] = str(
+                    baseline_score_npz_path
+                )
+
             save_yaml(run_config_path, patched_cfg)
 
             train_cmd = train_base_cmd + ["--config", str(run_config_path)]
@@ -2242,6 +2353,20 @@ def run_sweep(args: argparse.Namespace) -> int:
                 str(bad_input),
                 "--output",
                 str(bad_score_npz_path),
+            ]
+            baseline_infer_cmd = infer_base_cmd + [
+                "--config",
+                str(run_config_path),
+                "--input",
+                str(train_input),
+                "--output",
+                str(baseline_score_npz_path),
+            ]
+            baseline_build_cmd = baseline_base_cmd + [
+                "--scores",
+                str(baseline_score_npz_path),
+                "--output",
+                str(channel_baseline_npz_path),
             ]
             eval_cmd = eval_base_cmd + [
                 "--scores",
@@ -2265,6 +2390,52 @@ def run_sweep(args: argparse.Namespace) -> int:
             if args.eval_per_run:
                 eval_cmd += ["--per-run"]
 
+            baseline_eval_cmd = eval_base_cmd + [
+                "--scores",
+                str(good_score_npz_path),
+                "--compare",
+                str(bad_score_npz_path),
+                "--labels",
+                args.good_label,
+                args.bad_label,
+                "--aggregator",
+                "zscore_mean",
+                "--baseline",
+                str(channel_baseline_npz_path),
+                "--plot",
+                str(baseline_eval_plot_path),
+            ]
+            if args.eval_threshold is not None:
+                baseline_eval_cmd += ["--threshold", str(args.eval_threshold)]
+            else:
+                baseline_eval_cmd += [
+                    "--percentile",
+                    str(args.baseline_eval_percentile),
+                ]
+            if args.eval_per_run:
+                baseline_eval_cmd += ["--per-run"]
+
+            if args.baseline_infer:
+                recorded_score_path_1 = baseline_score_npz_path
+                recorded_score_path_2 = channel_baseline_npz_path
+                recorded_infer_cmd_1 = baseline_infer_cmd
+                recorded_infer_cmd_2 = baseline_build_cmd
+                recorded_eval_cmd = baseline_eval_cmd
+                active_eval_cmd = baseline_eval_cmd
+                active_eval_plot_path = baseline_eval_plot_path
+                active_eval_log_path = baseline_eval_log_path
+                active_eval_json_path = baseline_eval_json_path
+            else:
+                recorded_score_path_1 = good_score_npz_path
+                recorded_score_path_2 = bad_score_npz_path
+                recorded_infer_cmd_1 = infer_good_cmd
+                recorded_infer_cmd_2 = infer_bad_cmd
+                recorded_eval_cmd = eval_cmd
+                active_eval_cmd = eval_cmd
+                active_eval_plot_path = eval_plot_path
+                active_eval_log_path = eval_log_path
+                active_eval_json_path = eval_json_path
+
             experiment_id = insert_experiment(
                 conn,
                 run_name=run_name,
@@ -2275,15 +2446,15 @@ def run_sweep(args: argparse.Namespace) -> int:
                 checkpoint_dir=checkpoint_dir,
                 inference_dir=inference_dir,
                 final_model_path=final_model_path,
-                good_score_npz_path=good_score_npz_path,
-                bad_score_npz_path=bad_score_npz_path,
+                good_score_npz_path=recorded_score_path_1,
+                bad_score_npz_path=recorded_score_path_2,
                 train_cmd=train_cmd,
-                infer_good_cmd=infer_good_cmd,
-                infer_bad_cmd=infer_bad_cmd,
-                eval_cmd=eval_cmd,
-                eval_plot_path=eval_plot_path,
-                eval_log_path=eval_log_path,
-                eval_json_path=eval_json_path,
+                infer_good_cmd=recorded_infer_cmd_1,
+                infer_bad_cmd=recorded_infer_cmd_2,
+                eval_cmd=recorded_eval_cmd,
+                eval_plot_path=active_eval_plot_path,
+                eval_log_path=active_eval_log_path,
+                eval_json_path=active_eval_json_path,
                 patched_cfg=patched_cfg,
             )
             insert_params(conn, experiment_id, patched_cfg)
@@ -2356,27 +2527,56 @@ def run_sweep(args: argparse.Namespace) -> int:
                         print("Skipping training because --infer-only was set.")
                     print(f"Using existing checkpoint: {final_model_path}")
 
-                    print("Good inference/scoring...")
-                    infer_good_returncode = run_command(
-                        infer_good_cmd,
-                        cwd=PROJECT_DIR,
-                        timeout=args.timeout,
-                        monitor_interval=args.monitor_interval,
-                        batch=args.batch,
-                    )
-                    if infer_good_returncode != 0:
-                        raise RuntimeError(f"Good inference failed with return code {infer_good_returncode}")
+                    if args.baseline_infer:
+                        print("Training-set inference for channel baseline...")
+                        infer_good_returncode = run_command(
+                            baseline_infer_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                        )
+                        if infer_good_returncode != 0:
+                            raise RuntimeError(
+                                "Baseline training-set inference failed with return "
+                                f"code {infer_good_returncode}"
+                            )
 
-                    print("Bad inference/scoring...")
-                    infer_bad_returncode = run_command(
-                        infer_bad_cmd,
-                        cwd=PROJECT_DIR,
-                        timeout=args.timeout,
-                        monitor_interval=args.monitor_interval,
-                        batch=args.batch,
-                    )
-                    if infer_bad_returncode != 0:
-                        raise RuntimeError(f"Bad inference failed with return code {infer_bad_returncode}")
+                        print("Building per-channel baseline...")
+                        infer_bad_returncode = run_command(
+                            baseline_build_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                        )
+                        if infer_bad_returncode != 0:
+                            raise RuntimeError(
+                                "Channel-baseline construction failed with return "
+                                f"code {infer_bad_returncode}"
+                            )
+                    else:
+                        print("Good inference/scoring...")
+                        infer_good_returncode = run_command(
+                            infer_good_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                        )
+                        if infer_good_returncode != 0:
+                            raise RuntimeError(f"Good inference failed with return code {infer_good_returncode}")
+
+                        print("Bad inference/scoring...")
+                        infer_bad_returncode = run_command(
+                            infer_bad_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                        )
+                        if infer_bad_returncode != 0:
+                            raise RuntimeError(f"Bad inference failed with return code {infer_bad_returncode}")
 
                     if args.per_channel_plot:
                         run_per_channel_score_plot(
@@ -2396,14 +2596,28 @@ def run_sweep(args: argparse.Namespace) -> int:
                     if args.skip_eval:
                         print("Skipping good-vs-bad evaluation because --skip-eval was set.")
                     else:
-                        print("Good-vs-bad evaluation...")
+                        if args.baseline_infer:
+                            missing_test_scores = [
+                                path
+                                for path in (good_score_npz_path, bad_score_npz_path)
+                                if not path.exists()
+                            ]
+                            if missing_test_scores:
+                                raise FileNotFoundError(
+                                    "Baseline z-score evaluation requires existing "
+                                    "scores_good.npz and scores_bad.npz; missing: "
+                                    + ", ".join(str(path) for path in missing_test_scores)
+                                )
+                            print("Good-vs-bad zscore_mean evaluation...")
+                        else:
+                            print("Good-vs-bad evaluation...")
                         eval_returncode = run_command(
-                            eval_cmd,
+                            active_eval_cmd,
                             cwd=PROJECT_DIR,
                             timeout=args.timeout,
                             monitor_interval=args.monitor_interval,
                             batch=args.batch,
-                            log_path=eval_log_path,
+                            log_path=active_eval_log_path,
                         )
                         if eval_returncode != 0:
                             raise RuntimeError(f"Evaluation failed with return code {eval_returncode}")
@@ -2426,27 +2640,56 @@ def run_sweep(args: argparse.Namespace) -> int:
                     print("Skipping both good/bad inference jobs because --skip-infer was set.")
                     status = "trained_no_infer"
                 else:
-                    print("Good inference/scoring...")
-                    infer_good_returncode = run_command(
-                        infer_good_cmd,
-                        cwd=PROJECT_DIR,
-                        timeout=args.timeout,
-                        monitor_interval=args.monitor_interval,
-                        batch=args.batch,
-                    )
-                    if infer_good_returncode != 0:
-                        raise RuntimeError(f"Good inference failed with return code {infer_good_returncode}")
+                    if args.baseline_infer:
+                        print("Training-set inference for channel baseline...")
+                        infer_good_returncode = run_command(
+                            baseline_infer_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                        )
+                        if infer_good_returncode != 0:
+                            raise RuntimeError(
+                                "Baseline training-set inference failed with return "
+                                f"code {infer_good_returncode}"
+                            )
 
-                    print("Bad inference/scoring...")
-                    infer_bad_returncode = run_command(
-                        infer_bad_cmd,
-                        cwd=PROJECT_DIR,
-                        timeout=args.timeout,
-                        monitor_interval=args.monitor_interval,
-                        batch=args.batch,
-                    )
-                    if infer_bad_returncode != 0:
-                        raise RuntimeError(f"Bad inference failed with return code {infer_bad_returncode}")
+                        print("Building per-channel baseline...")
+                        infer_bad_returncode = run_command(
+                            baseline_build_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                        )
+                        if infer_bad_returncode != 0:
+                            raise RuntimeError(
+                                "Channel-baseline construction failed with return "
+                                f"code {infer_bad_returncode}"
+                            )
+                    else:
+                        print("Good inference/scoring...")
+                        infer_good_returncode = run_command(
+                            infer_good_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                        )
+                        if infer_good_returncode != 0:
+                            raise RuntimeError(f"Good inference failed with return code {infer_good_returncode}")
+
+                        print("Bad inference/scoring...")
+                        infer_bad_returncode = run_command(
+                            infer_bad_cmd,
+                            cwd=PROJECT_DIR,
+                            timeout=args.timeout,
+                            monitor_interval=args.monitor_interval,
+                            batch=args.batch,
+                        )
+                        if infer_bad_returncode != 0:
+                            raise RuntimeError(f"Bad inference failed with return code {infer_bad_returncode}")
 
                     if args.per_channel_plot:
                         run_per_channel_score_plot(
@@ -2466,14 +2709,28 @@ def run_sweep(args: argparse.Namespace) -> int:
                     if args.skip_eval:
                         print("Skipping good-vs-bad evaluation because --skip-eval was set.")
                     else:
-                        print("Good-vs-bad evaluation...")
+                        if args.baseline_infer:
+                            missing_test_scores = [
+                                path
+                                for path in (good_score_npz_path, bad_score_npz_path)
+                                if not path.exists()
+                            ]
+                            if missing_test_scores:
+                                raise FileNotFoundError(
+                                    "Baseline z-score evaluation requires existing "
+                                    "scores_good.npz and scores_bad.npz; missing: "
+                                    + ", ".join(str(path) for path in missing_test_scores)
+                                )
+                            print("Good-vs-bad zscore_mean evaluation...")
+                        else:
+                            print("Good-vs-bad evaluation...")
                         eval_returncode = run_command(
-                            eval_cmd,
+                            active_eval_cmd,
                             cwd=PROJECT_DIR,
                             timeout=args.timeout,
                             monitor_interval=args.monitor_interval,
                             batch=args.batch,
-                            log_path=eval_log_path,
+                            log_path=active_eval_log_path,
                         )
                         if eval_returncode != 0:
                             raise RuntimeError(f"Evaluation failed with return code {eval_returncode}")
@@ -2484,34 +2741,87 @@ def run_sweep(args: argparse.Namespace) -> int:
                 metrics = {
                     "checkpoint.exists": 0,
                     "checkpoint.expected_path": str(final_model_path),
-                    "good.score_npz.exists": 0,
-                    "bad.score_npz.exists": 0,
                 }
+                if args.baseline_infer:
+                    metrics.update(
+                        {
+                            "baseline.scores.exists": int(baseline_score_npz_path.exists()),
+                            "baseline.scores.path": str(baseline_score_npz_path),
+                            "baseline.channel.exists": int(channel_baseline_npz_path.exists()),
+                            "baseline.channel.path": str(channel_baseline_npz_path),
+                        }
+                    )
+                else:
+                    metrics.update(
+                        {
+                            "good.score_npz.exists": 0,
+                            "bad.score_npz.exists": 0,
+                        }
+                    )
             elif status == "missing_scores":
                 pass
+            elif args.baseline_infer:
+                metrics = {
+                    "checkpoint.exists": int(final_model_path.exists()),
+                    "checkpoint.expected_path": str(final_model_path),
+                    "baseline.infer_mode": 1,
+                    "baseline.scores.exists": int(baseline_score_npz_path.exists()),
+                    "baseline.scores.path": str(baseline_score_npz_path),
+                    "baseline.channel.exists": int(channel_baseline_npz_path.exists()),
+                    "baseline.channel.path": str(channel_baseline_npz_path),
+                    "baseline.infer_returncode": (
+                        infer_good_returncode if infer_good_returncode is not None else -1
+                    ),
+                    "baseline.build_returncode": (
+                        infer_bad_returncode if infer_bad_returncode is not None else -1
+                    ),
+                    "eval.skipped": int(args.skip_eval),
+                }
+                if not args.skip_eval:
+                    metrics["eval.returncode"] = (
+                        eval_returncode if eval_returncode is not None else -1
+                    )
+                    metrics["eval.aggregator"] = "zscore_mean"
+                    metrics["eval.baseline_path"] = str(channel_baseline_npz_path)
+                    metrics["eval.plot_path"] = str(active_eval_plot_path)
+                    metrics["eval.log_path"] = str(active_eval_log_path)
+                    metrics["eval.json_path"] = str(active_eval_json_path)
+                    metrics["eval.plot.exists"] = int(active_eval_plot_path.exists())
+                    metrics["eval.log.exists"] = int(active_eval_log_path.exists())
+                    metrics.update(parse_window_score_eval_log(active_eval_log_path))
+                    save_eval_summary_json(
+                        active_eval_json_path,
+                        eval_cmd=active_eval_cmd,
+                        eval_returncode=eval_returncode,
+                        eval_plot_path=active_eval_plot_path,
+                        eval_log_path=active_eval_log_path,
+                        good_score_npz_path=good_score_npz_path,
+                        bad_score_npz_path=bad_score_npz_path,
+                        metrics=metrics,
+                    )
             else:
                 metrics = collect_run_metrics(
                     checkpoint_dir=checkpoint_dir,
-                    good_score_npz_path=good_score_npz_path,
-                    bad_score_npz_path=bad_score_npz_path,
+                    good_score_npz_path=recorded_score_path_1,
+                    bad_score_npz_path=recorded_score_path_2,
                 )
                 metrics["eval.skipped"] = int(args.skip_eval)
                 metrics["eval.evaluate_only"] = int(args.evaluate_only)
                 metrics["eval.missing_evaluate_only"] = int(args.missing_evaluate_only)
                 if not args.skip_eval:
                     metrics["eval.returncode"] = eval_returncode if eval_returncode is not None else -1
-                    metrics["eval.plot_path"] = str(eval_plot_path)
-                    metrics["eval.log_path"] = str(eval_log_path)
-                    metrics["eval.json_path"] = str(eval_json_path)
-                    metrics["eval.plot.exists"] = int(eval_plot_path.exists())
-                    metrics["eval.log.exists"] = int(eval_log_path.exists())
-                    metrics.update(parse_window_score_eval_log(eval_log_path))
+                    metrics["eval.plot_path"] = str(active_eval_plot_path)
+                    metrics["eval.log_path"] = str(active_eval_log_path)
+                    metrics["eval.json_path"] = str(active_eval_json_path)
+                    metrics["eval.plot.exists"] = int(active_eval_plot_path.exists())
+                    metrics["eval.log.exists"] = int(active_eval_log_path.exists())
+                    metrics.update(parse_window_score_eval_log(active_eval_log_path))
                     save_eval_summary_json(
-                        eval_json_path,
-                        eval_cmd=eval_cmd,
+                        active_eval_json_path,
+                        eval_cmd=active_eval_cmd,
                         eval_returncode=eval_returncode,
-                        eval_plot_path=eval_plot_path,
-                        eval_log_path=eval_log_path,
+                        eval_plot_path=active_eval_plot_path,
+                        eval_log_path=active_eval_log_path,
                         good_score_npz_path=good_score_npz_path,
                         bad_score_npz_path=bad_score_npz_path,
                         metrics=metrics,
@@ -2536,8 +2846,8 @@ def run_sweep(args: argparse.Namespace) -> int:
                     infer_good_returncode=infer_good_returncode,
                     infer_bad_returncode=infer_bad_returncode,
                     eval_returncode=eval_returncode,
-                    good_score_npz_path=good_score_npz_path,
-                    bad_score_npz_path=bad_score_npz_path,
+                    good_score_npz_path=recorded_score_path_1,
+                    bad_score_npz_path=recorded_score_path_2,
                     error=error,
                     metrics=metrics,
                 )
@@ -2601,6 +2911,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Bad-test sparse events npz passed to sbn-infer --input.",
     )
     parser.add_argument(
+        "--train-input",
+        "--train_input",
+        dest="train_input",
+        default=str(DEFAULT_TRAIN_INPUT),
+        help=(
+            "Training sparse-events NPZ used by --baseline-infer. The trained "
+            "model infers this file to create scores_train.npz."
+        ),
+    )
+    parser.add_argument(
         "--pattern",
         default="*.yaml",
         help="Glob pattern for config files.",
@@ -2614,6 +2934,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--infer-cmd",
         default="sbn-infer",
         help='Inference command, e.g. "sbn-infer" or "python -m sbn_anomaly.infer.cli".',
+    )
+    parser.add_argument(
+        "--baseline-cmd",
+        "--baseline_cmd",
+        dest="baseline_cmd",
+        default=DEFAULT_BASELINE_CMD,
+        help=(
+            "Command that converts scores_train.npz into channel_baseline.npz "
+            "when --baseline-infer is active."
+        ),
     )
     parser.add_argument(
         "--eval-cmd",
@@ -2730,6 +3060,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Evaluation JSON summary filename inside each inference_result directory.",
     )
     parser.add_argument(
+        "--baseline-eval-percentile",
+        "--baseline_eval_percentile",
+        dest="baseline_eval_percentile",
+        type=float,
+        default=DEFAULT_BASELINE_EVAL_PERCENTILE,
+        help=(
+            "Good-score percentile used by the zscore_mean evaluation after "
+            "--baseline-infer. Default: %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-eval-plot-name",
+        "--baseline_eval_plot_name",
+        dest="baseline_eval_plot_name",
+        default=DEFAULT_BASELINE_EVAL_PLOT_NAME,
+        help="Z-score evaluation plot filename inside inference_result.",
+    )
+    parser.add_argument(
+        "--baseline-eval-log-name",
+        "--baseline_eval_log_name",
+        dest="baseline_eval_log_name",
+        default=DEFAULT_BASELINE_EVAL_LOG_NAME,
+        help="Z-score evaluation log filename inside inference_result.",
+    )
+    parser.add_argument(
+        "--baseline-eval-json-name",
+        "--baseline_eval_json_name",
+        dest="baseline_eval_json_name",
+        default=DEFAULT_BASELINE_EVAL_JSON_NAME,
+        help="Z-score evaluation JSON filename inside inference_result.",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=None,
@@ -2754,15 +3116,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--baseline-infer",
+        "--baseline_infer",
+        dest="baseline_infer",
+        action="store_true",
+        help=(
+            "Switch every inference stage to channel-baseline mode. Instead of "
+            "inferring good/bad test inputs, infer --train-input to "
+            "inference_result/scores_train.npz, then build "
+            "inference_result/channel_baseline.npz. Existing scores_good.npz and "
+            "scores_bad.npz are then evaluated with zscore_mean and plotted. "
+            "Compatible with --infer-only and --missing-infer."
+        ),
+    )
+    parser.add_argument(
         "--missing-infer-only",
+        "--missing-infer",
         "--missing_infer_only",
+        "--missing_infer",
         "--missing-infer_only",
         "--missing_infer-only",
         dest="missing_infer_only",
         action="store_true",
         help=(
-            "Only rerun inference for models whose run directory does not contain both "
-            "inference_result/scores_good.npz and inference_result/scores_bad.npz. "
+            "Only rerun inference for models missing required inference outputs. "
+            "Normally these are scores_good.npz and scores_bad.npz; with "
+            "--baseline-infer they are scores_train.npz, channel_baseline.npz, "
+            "and (unless --skip-eval is set) the z-score plot/log/JSON outputs. "
             "This implies --infer-only."
         ),
     )
