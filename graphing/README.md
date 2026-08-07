@@ -38,7 +38,7 @@ Note: If model training and inference complete successfully, the correctly forma
 | --- | --- | --- | --- |
 | `plot_per_channel_scores.py` | Good/bad mean node score versus channel | One optional positional argument to the path that contains the good and bad channel scores.npz files | Yes |
 | `plot_per_channel_per_window_scores.py` | Six per-plane channel-distribution plots (one plot per plane) for selected windows | Positional argument to the path that contains the good and bad channel scores.npz files plus six optional flags | Yes |
-| `plot_debug.py` | Target-good-run versus other-good-run versus bad-run integral distributions | No flags; edit constants | No |
+| `plot_debug.py` | Target-good-run versus other-good-run versus bad-run integral distributions. Used for checking dataset shape and distribution | No flags; edit constants | No |
 | `plot_event_hist.py` | Between-event-time histogram and printed window-duration diagnostics | No flags; edit constants | No |
 | `plot_mean_median_hist.py` | Histograms of per-window/per-channel integral mean and standard deviation | No flags; edit constants | No |
 | `plot_pulse.py` | Overlay of four ROOT waveform histograms | No flags; edit constants | No |

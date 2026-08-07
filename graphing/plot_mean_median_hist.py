@@ -11,7 +11,7 @@ import numpy as np
 # ============================================================
 
 NPZ_PATH = Path(
-    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/scratch/11076_to_11276_200_channels/good_events_test.npz"
+    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/dataset_preparation/8800_to_9000_channels/good_events_test.npz"
 )
 
 WINDOW_SIZE = 100

@@ -14,7 +14,7 @@ import numpy as np
 #   1. One .npz file
 #   2. A directory containing .npz files
 INPUT_PATH = Path(
-    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/scratch/good_events_test.npz"
+    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/data_preparation/good_events_test.npz"
 )
 
 OUTPUT_DIR = Path(
