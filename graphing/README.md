@@ -452,7 +452,7 @@ line is drawn when `EVENT_NUM_TARGET` is not `None`.
   `DPI`.
 - `POINT_SIZE`, `POINT_ALPHA`, `USE_HORIZONTAL_JITTER`, `JITTER_WIDTH`, and
   `RANDOM_SEED` are defined but are not currently used by the plotting function.
-
+ 
 ```bash
 python graphing/plot_time_window_box_whisker.py
 ```
