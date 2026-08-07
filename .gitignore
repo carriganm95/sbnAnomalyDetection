@@ -73,7 +73,15 @@ runs/
 .pixi/*
 !.pixi/config.toml
 
-# scratch
-inspect_run.py
+# dataset_preparation
 leaf_names.txt
-scratch/
+dataset_preparation/8800_to_9000_channels/
+dataset_preparation/8800_to_9000_high_evt/
+dataset_preparation/8800_to_9000_low_evt/
+dataset_preparation/filtered_full/
+dataset_preparation/filtered_full_high_evt/
+dataset_preparation/filtered_full_low_evt/
+dataset_preparation/bad_events_test.npz
+dataset_preparation/good_events_test.npz
+dataset_preparation/events_train.npz
+nohup.out

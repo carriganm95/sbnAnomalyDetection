@@ -15,12 +15,19 @@ Aggregators
 - ``group_max_mean`` : pool channel errors within electronics groups (ASIC/FEMB),
   take the worst group's mean. Best for coherent board/ASIC failures and tells
   you which group -- the recommended default.
+- ``zscore_mean``     : z-score each channel against a precomputed per-channel
+  baseline (mu, sigma from ``channel_baseline.py``, fit on a training-set-only
+  good sample), then mean the z-scores across channels. Targets a small,
+  consistent shift spread across most/all channels -- the kind of signal that
+  ``mean``/``topk_mean`` dilute (raw magnitude swamped by naturally noisy
+  channels) and ``group_max_mean`` misses (not localized to one group).
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -62,12 +69,49 @@ def group_max_mean_score(node_scores: np.ndarray, groups: np.ndarray) -> np.ndar
     if gids.size == 0:
         return mean_score(node_scores)
     gmeans = np.full((W, gids.size), np.nan, dtype=np.float64)
-    with np.errstate(invalid="ignore"):
+    # All-NaN groups/windows are expected (inactive channels) -> NaN result;
+    # silence the benign "Mean of empty slice" / "All-NaN slice" warnings.
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
         for j, g in enumerate(gids):
             cols = np.where(groups == g)[0]
             if cols.size:
                 gmeans[:, j] = np.nanmean(node_scores[:, cols], axis=1)
         return np.nanmax(gmeans, axis=1)
+
+
+def zscore_mean_score(
+    node_scores: np.ndarray, mu: np.ndarray, sigma: np.ndarray
+) -> np.ndarray:
+    """Per window: z-score each channel against a fixed baseline, then nanmean over channels.
+
+    ``mu``/``sigma`` are ``(N_channels,)`` per-channel baseline stats, typically fit on a
+    training-set-only good sample by ``channel_baseline.py`` (must NOT be fit on the same
+    windows you're evaluating separation on, or the comparison is optimistic). Channels
+    with an invalid baseline (NaN or non-positive sigma -- e.g. too few calibration
+    windows) are excluded from the mean rather than blowing up as +/-inf.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    if mu.shape[0] != node_scores.shape[1] or sigma.shape[0] != node_scores.shape[1]:
+        raise ValueError(
+            f"baseline has {mu.shape[0]} channels but node_scores has {node_scores.shape[1]}"
+        )
+    bad_channel = ~np.isfinite(sigma) | (sigma <= 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = (node_scores - mu[None, :]) / sigma[None, :]
+    if np.any(bad_channel):
+        z = z.copy()
+        z[:, bad_channel] = np.nan
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanmean(z, axis=1)
+
+
+def load_channel_baseline(path) -> tuple[np.ndarray, np.ndarray]:
+    """Load the (mu, sigma) per-channel baseline saved by ``channel_baseline.py``."""
+    arch = np.load(path, allow_pickle=False)
+    return arch["mu"], arch["sigma"]
 
 
 def aggregate_windows(
@@ -76,6 +120,8 @@ def aggregate_windows(
     *,
     groups: Optional[np.ndarray] = None,
     k: int = 64,
+    baseline_mu: Optional[np.ndarray] = None,
+    baseline_sigma: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Dispatch to the named aggregator."""
     node_scores = np.asarray(node_scores, dtype=np.float64)
@@ -89,6 +135,13 @@ def aggregate_windows(
         if groups is None:
             raise ValueError("group_max_mean requires a `groups` array (use --channel-map)")
         return group_max_mean_score(node_scores, groups)
+    if aggregator == "zscore_mean":
+        if baseline_mu is None or baseline_sigma is None:
+            raise ValueError(
+                "zscore_mean requires a baseline (use --baseline, built with "
+                "`python -m sbn_anomaly.infer.channel_baseline`)"
+            )
+        return zscore_mean_score(node_scores, baseline_mu, baseline_sigma)
     raise ValueError(f"unknown aggregator {aggregator!r}")
 
 
@@ -145,16 +198,48 @@ def separation_auc(good: np.ndarray, bad: np.ndarray) -> float:
     return float(u / (g.size * b.size))
 
 
-def _aggregate_file(path: str, aggregator: str, group_args):
-    """Return (per-window scores, provenance-or-None) for a scores npz."""
+def _load_provenance(arch) -> Optional[np.ndarray]:
+    """Return an (N, >=2) int array of (run, subrun, ...) per window, or None.
+
+    Two provenance layouts exist in the wild: an older combined ``provenance`` (N, 3)
+    array (run, subrun, event), and the current per-window-metadata layout written by
+    ``infer/cli.py`` (separate ``first_run``/``first_subrun``/``first_event_num``
+    arrays -- no combined ``provenance`` key). This reads either, so ``--per-run`` and
+    ``--stream`` work on scores npz produced by the current inference path.
+    """
+    files = getattr(arch, "files", [])
+    if "provenance" in files:
+        return arch["provenance"]
+    if "first_run" in files and "first_subrun" in files:
+        run = np.asarray(arch["first_run"]).astype(np.int64)
+        subrun = np.asarray(arch["first_subrun"]).astype(np.int64)
+        if "first_event_num" in files:
+            evt = np.asarray(arch["first_event_num"]).astype(np.int64)
+        else:
+            evt = np.zeros_like(run)
+        return np.stack([run, subrun, evt], axis=1)
+    return None
+
+
+def _aggregate_file(path: str, aggregator: str, group_args, baseline=None):
+    """Return (per-window scores, provenance-or-None) for a scores npz.
+
+    ``baseline``, when the aggregator is ``zscore_mean``, is a ``(mu, sigma)`` tuple.
+    """
     arch = np.load(path, allow_pickle=False)
     node_scores = arch["node_scores"] if "node_scores" in arch else arch["scores"]
     groups = None
     if aggregator == "group_max_mean":
         csv, level = group_args
         groups = channel_to_group(csv, level=level, num_channels=node_scores.shape[1])
-    win = aggregate_windows(node_scores, aggregator, groups=groups)
-    prov = arch["provenance"] if "provenance" in getattr(arch, "files", []) else None
+    baseline_mu = baseline_sigma = None
+    if aggregator == "zscore_mean" and baseline is not None:
+        baseline_mu, baseline_sigma = baseline
+    win = aggregate_windows(
+        node_scores, aggregator, groups=groups,
+        baseline_mu=baseline_mu, baseline_sigma=baseline_sigma,
+    )
+    prov = _load_provenance(arch)
     return win, prov
 
 
@@ -272,6 +357,30 @@ def _plot_overlay(score_lists, labels, path, aggregator, threshold=None, nbins=6
                    label=f"threshold = {threshold:.4g}")
         ax.text(threshold, ax.get_ylim()[1], f" thr={threshold:.4g}",
                 rotation=90, va="top", ha="left", fontsize=8, color="k")
+
+        # For a good-vs-bad overlay, show the window-level classification
+        # metrics at the same operating threshold used by _confusion().
+        # The first distribution is the negative (good) class and the second
+        # distribution is the positive (bad) class.
+        if len(finite) >= 2:
+            good_scores, bad_scores = finite[0], finite[1]
+            tp = int(np.sum(bad_scores > threshold))
+            fn = int(bad_scores.size - tp)
+            fp = int(np.sum(good_scores > threshold))
+
+            precision = tp / (tp + fp) if (tp + fp) else float("nan")
+            recall = tp / (tp + fn) if (tp + fn) else float("nan")
+
+            ax.text(
+                0.98,
+                0.95,
+                f"Precision: {precision:.3f}\nRecall: {recall:.3f}",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=10,
+                bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.85},
+            )
     ax.set_xlabel(f"window score ({aggregator})")
     ax.set_ylabel("density")
     ax.set_yscale("log")
@@ -280,15 +389,93 @@ def _plot_overlay(score_lists, labels, path, aggregator, threshold=None, nbins=6
     fig.savefig(path, dpi=120)
     plt.close(fig)
 
+"""
+def _plot_overlay(
+    score_lists,
+    labels,
+    path,
+    aggregator,
+    threshold=None,
+    nbins=60,
+):
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    finite = [
+        np.asarray(scores)[np.isfinite(scores)]
+        for scores in score_lists
+    ]
+
+    nonempty = [values for values in finite if values.size]
+    all_values = (
+        np.concatenate(nonempty)
+        if nonempty
+        else np.array([0.0, 1.0])
+    )
+
+    lo = float(np.min(all_values))
+    hi = float(np.max(all_values))
+
+    if hi <= lo:
+        hi = lo + 1.0
+
+    # Use the same bin edges for all distributions.
+    edges = np.linspace(lo, hi, nbins + 1)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    for values, label in zip(finite, labels):
+        ax.hist(
+            values,
+            bins=edges,
+            alpha=0.5,
+            density=True,
+            label=f"{label} (n={values.size})",
+        )
+
+    if threshold is not None:
+        ax.axvline(
+            threshold,
+            color="k",
+            linestyle="--",
+            linewidth=1.3,
+            label=f"Anomaly threshold = {threshold:.4g}",
+        )
+
+        ax.text(
+            threshold,
+            ax.get_ylim()[1],
+            f" threshold = {threshold:.4g}",
+            rotation=90,
+            verticalalignment="top",
+            horizontalalignment="left",
+            fontsize=8,
+            color="k",
+        )
+
+    ax.set_xlabel("Anomaly score")
+    ax.set_ylabel("Window density")
+    ax.set_yscale("log")
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+"""
+
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Aggregate per-channel errors -> per-window scores")
     p.add_argument("--scores", required=True, help="inference npz with 'node_scores' (W, C)")
     p.add_argument("--aggregator", default="group_max_mean",
-                   choices=["mean", "max", "topk_mean", "group_max_mean"])
+                   choices=["mean", "max", "topk_mean", "group_max_mean", "zscore_mean"])
     p.add_argument("--channel-map", default=None, help="channel map CSV (for group_max_mean)")
     p.add_argument("--group-level", default="femb", choices=["femb", "asic"])
     p.add_argument("--k", type=int, default=64, help="k for topk_mean")
+    p.add_argument("--baseline", default=None,
+                   help="channel baseline .npz (mu/sigma) from channel_baseline.py, "
+                        "required for zscore_mean -- fit it on train-set-only good windows")
     p.add_argument("--output", default=None, help="optional .npy to save the per-window scores")
     p.add_argument("--plot", default=None, help="save a score-distribution PNG to this path")
     p.add_argument("--compare", default=None,
@@ -320,16 +507,23 @@ def main(argv=None) -> int:
 
     arch = np.load(args.scores, allow_pickle=False)
     node_scores = arch["node_scores"] if "node_scores" in arch else arch["scores"]
-    prov_good = arch["provenance"] if "provenance" in getattr(arch, "files", []) else None
+    prov_good = _load_provenance(arch)
     if args.aggregator == "group_max_mean" and not args.channel_map:
         p.error("group_max_mean needs --channel-map")
+    if args.aggregator == "zscore_mean" and not args.baseline:
+        p.error("zscore_mean needs --baseline (build one with "
+                "`python -m sbn_anomaly.infer.channel_baseline`)")
     group_args = (args.channel_map, args.group_level)
 
     groups = None
     if args.aggregator == "group_max_mean":
         groups = channel_to_group(args.channel_map, level=args.group_level,
                                   num_channels=node_scores.shape[1])
-    win = aggregate_windows(node_scores, args.aggregator, groups=groups, k=args.k)
+    baseline_mu = baseline_sigma = None
+    if args.aggregator == "zscore_mean":
+        baseline_mu, baseline_sigma = load_channel_baseline(args.baseline)
+    win = aggregate_windows(node_scores, args.aggregator, groups=groups, k=args.k,
+                             baseline_mu=baseline_mu, baseline_sigma=baseline_sigma)
     finite = win[np.isfinite(win)]
     print(f"# {args.labels[0]}: aggregator={args.aggregator} windows={win.size} "
           f"mean={np.nanmean(win):.4g} p95={np.nanpercentile(finite,95):.4g} "
@@ -344,7 +538,8 @@ def main(argv=None) -> int:
 
     win_cmp = prov_bad = None
     if args.compare:
-        win_cmp, prov_bad = _aggregate_file(args.compare, args.aggregator, group_args)
+        win_cmp, prov_bad = _aggregate_file(args.compare, args.aggregator, group_args,
+                                            baseline=(baseline_mu, baseline_sigma))
         fc = win_cmp[np.isfinite(win_cmp)]
         print(f"# {args.labels[1]}: windows={win_cmp.size} mean={np.nanmean(win_cmp):.4g} "
               f"p95={np.nanpercentile(fc,95):.4g} max={np.nanmax(win_cmp):.4g}")

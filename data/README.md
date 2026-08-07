@@ -63,9 +63,26 @@ smaller than a dense events × channels array):
 | `channels_flat` | int64 | channel ids of all hits, concatenated across events |
 | `integrals_flat` | float32 | corresponding hit integrals |
 | `times_flat` | float32 | hit times (enables `time_mean` / `time_spread` features) |
+| `widths_flat` | float32 | hit widths (enables `width_*` features; only meaningfully populated on the collection plane in SBND ntuples) |
+| `sumadcs_flat` | float32 | raw ADC sum under the hit (enables `sumadc_*` features) |
+| `mults_flat` | float32 | hit multiplicity — overlapping/split-fit hits (enables `mult_*` features) |
+| `hassps_flat` | float32 | whether the hit has a matched 3-D space point, 0/1 (enables `sp_fraction`) |
+| `planes_flat` / `wires_flat` / `tpcs_flat` | int32 | hit geometry — used for per-plane grouping and diagnostics, not as node features directly |
 | `offsets` | int64 | event `i` has hits `channels_flat[offsets[i]:offsets[i+1]]` |
 | `n_channels` | int64 | total detector channel count |
 | `evt_run` / `evt_subrun` / `evt_num` | int32 | per-event provenance |
+
+`widths_flat`/`sumadcs_flat`/`mults_flat`/`hassps_flat`/`planes_flat`/`wires_flat`/
+`tpcs_flat` are all optional — `SparseWindowDatasetPyG.from_root()` pulls them when
+present in the source tree (checked per file; zero-filled and logged if a
+production is missing one) and `save_events()`/`from_npz()` round-trip whichever
+are present. Requesting a `node_features` entry that needs one of these without
+having materialized it raises a clear `ValueError` telling you which array is
+missing.
+
+See [`scripts/README.md`](../scripts/README.md#compare_events_distributionspy)
+for a tool that compares these values (raw and windowed) between two events
+npz files before you trust one as a `node_features` entry.
 
 Per-channel window features are computed from this on the fly when the dataset is
 loaded, so a single events npz supports any `node_features` / `window_size`

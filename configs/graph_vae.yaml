@@ -27,19 +27,57 @@ data:
   # windows_path: data/windows_train.npz   # alternative: dense (num_windows, num_nodes, F)
 
   # Window definition (how events are grouped into one reconstruction frame).
+  #
+  # window_mode: event (default) | time
+  #   event: a fixed number of events per window (window_size), split into
+  #     n_temporal_bins equal-sized groups by event index. stride advances by
+  #     that many events between windows.
+  #   time: a fixed elapsed-time span per window (window_duration, same units
+  #     as the "time" tpc_branch below -- meta.time here), holding however
+  #     many events actually occurred in that span. Makes a changing trigger
+  #     rate a directly visible signal (event count/occupancy/hit_rate per
+  #     bin) instead of always packing the same event count regardless of how
+  #     long that took to collect. Requires a time-like tpc_branches entry
+  #     (already set below) and reconstruction=True (this config). n_bins
+  #     split window_duration into equal time slices; stride_duration (default
+  #     = window_duration, i.e. non-overlapping) advances the window start.
+  #   window_size/stride below are ignored in time mode; window_duration/
+  #   stride_duration are ignored in event mode -- flip window_mode to switch,
+  #   no other config changes needed.
+  window_mode: event
   window_size: 100
   n_temporal_bins: 4
   stride: 100
+  # window_duration: 5.0      # only used when window_mode: time
+  # stride_duration: 5.0      # only used when window_mode: time (default: window_duration)
 
   adjacency_radius: 4
   prune_inactive: true
   standardize: true                       # z-score features on good-run stats
+  # global (default): one mean/std per feature, pooled across every channel
+  #   on every plane. Simple, but can hide a systematic per-plane offset/scale
+  #   mismatch (e.g. collection vs induction) -- see
+  #   scripts/check_standardization_per_plane.py to check whether this is
+  #   actually biasing your data before flipping this.
+  # plane: fit a separate mean/std per plane (requires planes_flat in the
+  #   events npz, or set channel_map below so plane can be derived from
+  #   channel id). Planes with fewer than min_plane_samples active-channel
+  #   samples fall back to the pooled fit rather than a noisy estimate.
+  standardize_by: global
+  # min_plane_samples: 20
 
   # ROOT streaming fields (used with --root-files). Match configs/gnn.yaml.
+  # hit_branches just needs one branch per plane prefix (e.g. hits0.h.integral)
+  # to discover the "hits0.h" / "hits1.h" / "hits2.h" prefixes -- from_root()
+  # then pulls integral/channel/time/wire/plane/tpc plus width/sumadc/mult/
+  # hasSP automatically from each prefix when those branches exist in the
+  # tree (checked per file; missing ones are zero-filled, see
+  # sparse_window_dataset.py:from_root). NOTE: this must be set for ROOT
+  # loading to work at all -- if left unset/empty, no hits are read.
   tree_name: caloskim/TrackCaloSkim
-  # hit_branches: [hits0.h.integral, hits0.h.channel, ...]
-  # tpc_branches: [meta.run, meta.subrun, meta.evt]
-  n_channels: 200
+  hit_branches: [hits0.h.integral, hits0.h.channel, hits1.h.integral, hits1.h.channel, hits2.h.integral, hits2.h.channel]
+  tpc_branches: [meta.run, meta.subrun, meta.evt, meta.time]
+  n_channels: 11276
 
   # Geometry-aware graph (see configs/gnn.yaml). electronics recommended.
   channel_map: configs/SBNDTPCChannelMap_v2_with_positions.csv
@@ -49,16 +87,50 @@ data:
   # Integral moments: sum, mean, stdev, min, max, count
   # Rate/occupancy:   occupancy (fraction of events with a hit), hit_rate (hits/event)
   # Timing:           time_mean, time_spread  (require a per-hit time branch)
+  # Width:            width_sum, width_mean, width_min, width_max, width_stdev
+  #                   (hit pulse width; only meaningfully populated on the
+  #                   collection plane in SBND ntuples -- the feature most
+  #                   likely to separate collection-plane anomalies)
+  # SumADC:           sumadc_sum, sumadc_mean, sumadc_min, sumadc_max, sumadc_stdev
+  #                   (raw ADC under the hit; differs from fitted integral
+  #                   when the pulse shape is distorted, e.g. by noise)
+  # Multiplicity:      mult_sum, mult_mean, mult_min, mult_max, mult_stdev
+  #                   (overlapping/split-fit hits -- a common noise signature)
+  # Space-point match: sp_fraction (fraction of a channel's hits with a
+  #                   matched 3-D space point; coherent-noise hits usually
+  #                   don't triangulate across planes, so this drops)
+  # All of the above (except the base integral moments) require the matching
+  # ROOT branch to exist and be readable -- from_root() zero-fills and warns
+  # per file when one is missing rather than failing the whole load.
   # A stronger, less redundant mix than six integral moments:
-  node_features: [sum, min, max, mean, stdev, count, occupancy, time_mean, time_spread]   # integral set (best so far)
-  # node_features: [sum, mean, stdev, occupancy, time_mean, time_spread]  # rate/timing mix
+  # node_features: [sum, min, max, mean, stdev, count, occupancy, time_mean, time_spread]   # integral set (best so far)
+  # node_features: [sum, min, max, mean, stdev, occupancy, time_mean, time_spread]  # rate/timing mix
+  node_features: [sum, min, max, mean, stdev, occupancy, time_mean, time_spread, width_mean, width_stdev, sumadc_mean, mult_mean, sp_fraction]  # + collection-plane-targeted features
 
   # Sign-preserving log1p applied to these features BEFORE standardization.
   # Integral magnitude (sum/min/max/mean) is heavy-tailed even after z-scoring,
   # which makes the VAE reconstruct them as a flat mean; log-compressing the tail
   # lets the model actually track them. occupancy/timing are already well-behaved.
+  # sumadc_sum/sumadc_max and mult_sum are similarly heavy-tailed if you add
+  # them; width_mean/sp_fraction are bounded/well-behaved and don't need it.
   # Must be a subset of node_features. Use the SAME list for train and inference.
   log_features: [sum, min, max, mean]
+
+  # Per-graph (per-window) conditioning features -- distinct from node_features
+  # (per-channel-per-bin): these describe the WHOLE window and are fed into the
+  # model as an extra conditioning input (model.graph_dim is set automatically
+  # from len(graph_features), no need to set it separately), so the model can
+  # learn "what a channel should look like given how busy this window was"
+  # instead of a rate change only ever showing up as reconstruction error.
+  #   event_count:       raw number of events aggregated into the window.
+  #   log1p_event_count: log1p(event_count) -- use this instead of/alongside
+  #     event_count when window_mode: time, since event count can range from
+  #     0 (quiet gap) to many in a burst; log-compresses that tail the same
+  #     way log_features does for heavy-tailed node features.
+  # Standardized the same way as node_features (fit from good-run windows,
+  # persisted in standardization.npz). Empty/unset = no conditioning (default,
+  # fully backward compatible -- graph_dim=0).
+  graph_features: [log1p_event_count]
 
 model:
   latent_dim: 12          # per-node bottleneck
@@ -87,7 +159,7 @@ training:
   validation_split: 0.1
   use_amp: true
   save_best_only: true
-  beta: 0.8               # KL weight
+  beta: 0.5               # KL weight
   beta_warmup_epochs: 10
   checkpoint_dir: checkpoints/graph_vae/v7
   output_path: checkpoints/graph_vae/v7/graph_vae_final.pt

@@ -322,8 +322,11 @@ for `sequential` graph construction and any graph builder mode that uses radius.
 |---|---|
 | `events_path` | Training sparse-events NPZ. |
 | `windows_path` | Optional dense-window input; sparse events are preferred. |
-| `window_size` | Number of events per window. |
-| `stride` | Number of events between consecutive windows. |
+| `window_mode` | `event` (default) or `time`. `event`: fixed event count per window (`window_size`), split into `n_temporal_bins` by event index. `time`: fixed elapsed-time span per window (`window_duration`), holding however many events occurred in that span — makes trigger-rate changes a direct signal instead of a fixed count regardless of elapsed time. `time` mode requires a time-like `tpc_branches` entry and `reconstruction=True` (graph VAE only, not the GNN forecaster). |
+| `window_size` | Number of events per window. Used when `window_mode: event`. |
+| `stride` | Number of events between consecutive windows. Used when `window_mode: event`. |
+| `window_duration` | Elapsed-time span per window, same units as the time-like `tpc_branches` entry. Used when `window_mode: time`. |
+| `stride_duration` | How far the window start advances between samples. Used when `window_mode: time`; defaults to `window_duration` (non-overlapping windows). |
 | `n_temporal_bins` | Number of time/event bins inside one window. |
 | `n_channels` | Detector channel count. |
 | `channel_map` | Channel-map CSV. |
@@ -332,7 +335,10 @@ for `sequential` graph construction and any graph builder mode that uses radius.
 | `node_features` | Per-channel aggregate feature list. |
 | `log_features` | Features transformed before standardization. |
 | `standardize` | Whether to z-score features using training statistics. |
+| `standardize_by` | `global` (one pooled mean/std, default) or `plane` (separate mean/std per plane — use if `scripts/check_standardization_per_plane.py` shows a plane-biased pooled fit). |
+| `min_plane_samples` | Minimum active-channel samples required to fit a plane its own stats under `standardize_by: plane`; under-sampled planes fall back to the pooled fit. Default 20. |
 | `prune_inactive` | Whether inactive channels are removed from per-window graphs. |
+| `graph_features` | Per-window (graph-level, not per-channel) conditioning features: `event_count`, `log1p_event_count`. Standardized like `node_features` and packed into `Data.graph_attr`; sets `model.graph_dim` automatically (no separate model key). Empty/unset = no conditioning (default). |
 
 ### `model`
 
@@ -344,6 +350,7 @@ for `sequential` graph construction and any graph builder mode that uses radius.
 | `dropout` | Dropout regularization. |
 | `mask_ratio` | Denoising mask fraction. |
 | `use_channel_idx` | Whether to condition on channel identity. |
+| `graph_dim` | Derived automatically from `data.graph_features` (length of that list) — conditions both encoder and decoder on a per-window vector (e.g. event count) via `data.graph_attr`, broadcast to every node in its graph through `data.batch`. Not meant to be set directly in config. |
 | `conv` | Graph convolution type, such as `sage` or `gcn`. |
 
 Example:

@@ -107,6 +107,12 @@ from pathlib import Path
 import numpy as np
 
 
+# Run and event number to search for in the evt_run and evt_num arrays.
+# Set search_run to None to disable this check.
+search_run = None
+search_event = None
+
+
 def print_array_values(arr, full=False, max_items=50, indent="  "):
     """
     Print array contents.
@@ -184,6 +190,41 @@ def count_nan_in_array(arr):
         return int(n_nan)
 
     return 0
+
+
+def count_unique_in_array(arr):
+    """Count the number of unique values in an array."""
+    arr = np.asarray(arr)
+
+    if arr.size == 0:
+        return 0
+
+    try:
+        return int(np.unique(arr).size)
+    except (TypeError, ValueError):
+        # Robust fallback for object arrays containing mixed/unorderable types
+        unique_values = set()
+
+        for value in arr.ravel():
+            try:
+                if isinstance(value, np.ndarray):
+                    value = (
+                        str(value.dtype),
+                        value.shape,
+                        value.tobytes(),
+                    )
+                elif isinstance(value, np.generic):
+                    value = value.item()
+
+                try:
+                    unique_values.add(value)
+                except TypeError:
+                    unique_values.add(repr(value))
+
+            except Exception:
+                unique_values.add(repr(value))
+
+        return len(unique_values)
 
 
 def print_nan_summary(array_items, title="NaN summary"):
@@ -297,6 +338,68 @@ def write_npz_full_csv(npz_path, csv_path=None):
     return csv_path
 
 
+
+def print_search_run_summary(meta, run_number, event_number=None):
+    """Check for a run and, within that run, an optional event number."""
+    if run_number is None:
+        return
+
+    print("\n" + "=" * 80)
+    print(f"Search for run {run_number}")
+    print("=" * 80)
+
+    if "evt_run" not in meta.files:
+        print("  Cannot search: this NPZ file does not contain an evt_run array.")
+        return
+
+    evt_run = np.asarray(meta["evt_run"]).ravel()
+    run_indices = np.flatnonzero(evt_run == run_number)
+
+    if run_indices.size == 0:
+        print(f"  Run {run_number} was not found in evt_run.")
+        return
+
+    print(f"  Run {run_number} was found in evt_run.")
+    print(f"  Number of matching events: {run_indices.size}")
+    print(f"  First matching index:      {run_indices[0]}")
+    print(f"  Last matching index:       {run_indices[-1]}")
+
+    if run_indices.size <= 20:
+        print(f"  Matching indices:          {run_indices}")
+    else:
+        print(f"  First 10 indices:          {run_indices[:10]}")
+        print(f"  Last 10 indices:           {run_indices[-10:]}")
+
+    if event_number is None:
+        return
+
+    print(f"\n  Checking for event {event_number} within run {run_number}...")
+
+    if "evt_num" not in meta.files:
+        print("  Cannot search for the event: this NPZ file does not contain an evt_num array.")
+        return
+
+    evt_num = np.asarray(meta["evt_num"]).ravel()
+    if evt_num.size != evt_run.size:
+        print(
+            "  Cannot safely pair evt_run with evt_num because their sizes differ: "
+            f"evt_run={evt_run.size}, evt_num={evt_num.size}."
+        )
+        return
+
+    event_indices = np.flatnonzero(
+        (evt_run == run_number) & (evt_num == event_number)
+    )
+
+    if event_indices.size == 0:
+        print(f"  Event {event_number} was not found within run {run_number}.")
+        return
+
+    print(f"  Event {event_number} was found within run {run_number}.")
+    print(f"  Number of matching entries: {event_indices.size}")
+    print(f"  Matching indices:           {event_indices}")
+
+
 def print_npz(npz_path, full=False, max_items=50):
     print("=" * 80)
     print(f"Reading NPZ file: {npz_path}")
@@ -313,10 +416,17 @@ def print_npz(npz_path, full=False, max_items=50):
         arr = meta[key]
 
         print(f"\n[{key}]")
-        print(f"  shape: {arr.shape}")
-        print(f"  dtype: {arr.dtype}")
-        print(f"  ndim:  {arr.ndim}")
-        print(f"  size:  {arr.size}")
+
+        # Scalar arrays: print only the value
+        if arr.ndim == 0:
+            print(f"  value: {arr.item()}")
+            continue
+
+        print(f"  shape:  {arr.shape}")
+        print(f"  dtype:  {arr.dtype}")
+        print(f"  ndim:   {arr.ndim}")
+        print(f"  size:   {arr.size}")
+        print(f"  unique: {count_unique_in_array(arr)}")
 
         print_array_values(arr, full=full, max_items=max_items)
 
@@ -324,6 +434,9 @@ def print_npz(npz_path, full=False, max_items=50):
         ((key, meta[key]) for key in meta.files),
         title="NaN summary for NPZ arrays",
     )
+
+    # Check whether the requested run appears in evt_run.
+    print_search_run_summary(meta, search_run, search_event)
 
     # Extra sparse-mode interpretation, if possible
     print_sparse_npz_interpretation(meta, full=full, max_items=max_items)
