@@ -21,7 +21,7 @@ Run commands from the repository root unless an absolute path is shown:
 python graphing/<script_name>.py [arguments]
 ```
 
-All scripts require NumPy and Matplotlib. `plot_pulse.py` additionally requires
+A scripts require NumPy and Matplotlib. `plot_pulse.py` additionally requires
 PyROOT and access to the referenced ROOT files.
 
 The score plotters expect GraphVAE score files with:
@@ -29,6 +29,7 @@ The score plotters expect GraphVAE score files with:
 | Array | Expected shape | Meaning |
 | --- | ---: | --- |
 | `node_scores` | `(W, C)` | Per-window, per-channel reconstruction/anomaly scores. `W` is the number of windows and `C` is the number of channels. Inactive channels may be `NaN`. |
+
 Note: If model training and inference complete successfully, the correctly formatted GraphVAE score files will be generated automatically.
 
 The sparse-event utilities use some or all of these arrays:
@@ -85,7 +86,7 @@ python graphing/plot_per_channel_scores.py \
 | Argument or flag | Default | Description |
 | --- | --- | --- |
 | `inference_result_dir` | `DEFAULT_INFERENCE_RESULT_DIR` | Optional positional directory containing `scores_good.npz` and `scores_bad.npz`. |
-| `-h`, `--help` | 鈥� | Display the generated help message. |
+| `-h`, `--help` | — | Display the generated help message. |
 
 There are no command-line flags for the channel range, spike removal, or figure
 style. Change these constants near the top of the script when running it
@@ -182,7 +183,7 @@ python graphing/plot_per_channel_per_window_scores.py \
 | `--output PATH` | `channel_node_scores_selected_windows.png` | Base output name or path. Relative paths are placed inside `inference_result_dir`; `.png` is added when no suffix is supplied. |
 | `--plot-style {mean_std,box}` | `mean_std` | Select the mean/std-band or box-and-whisker representation. |
 | `--good-bad-only` | off | Do not add `scores_train.npz`, even if it exists. |
-| `-h`, `--help` | 鈥� | Display the generated help message. |
+| `-h`, `--help` | — | Display the generated help message. |
 
 Additional editable constants include `STD_BAND_SIGMAS=1.0`,
 `WHISKER_IQR=1.5`, `SHOW_FLIERS=True`, `FIGSIZE=(18, 7)`, `DPI=180`, and the
