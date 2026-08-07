@@ -18,7 +18,7 @@ INPUT_DIR = Path(
 )
 
 OUTPUT_DIR = Path(
-    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/scratch"
+    "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/dataset_preparation"
 )
 
 WINDOWS_TRAIN_PATH = OUTPUT_DIR / "windows_train.npz"
