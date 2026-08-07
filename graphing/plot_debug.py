@@ -12,12 +12,12 @@ import numpy as np
 
 GOOD_NPZ_PATH = Path(
     "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/"
-    "scratch/8800_to_9000_200_channels/good_events_test.npz"
+    "dataset_preparation/8800_to_9000_channels/good_events_test.npz"
 )
 
 BAD_NPZ_PATH = Path(
     "/exp/sbnd/app/users/jiayufu/sbnAnomalyDetection/"
-    "scratch/8800_to_9000_200_channels/bad_events_test.npz"
+    "dataset_preparation/8800_to_9000_channels/bad_events_test.npz"
 )
 
 TARGET_RUN = 20142
