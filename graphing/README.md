@@ -32,22 +32,11 @@ The score plotters expect GraphVAE score files with:
 
 Note: If model training and inference complete successfully, the correctly formatted GraphVAE score files will be generated automatically.
 
-The sparse-event utilities use some or all of these arrays:
-
-| Array | Meaning |
-| --- | --- |
-| `channels_flat` | Channel ID for every stored hit. |
-| `integrals_flat` | Integral value for every stored hit. |
-| `offsets` | CSR-style event boundaries; event `i` occupies flat entries `offsets[i]:offsets[i+1]`. |
-| `n_channels` | Total number of channel columns represented by the file. |
-| `evt_time` | Event timestamps in nanoseconds. |
-| `evt_run` | Run number for each event. |
-
 ## Script summary
 
 | Script | Main result | Command-line interface | Sweep integration |
 | --- | --- | --- | --- |
-| `plot_per_channel_scores.py` | Good/bad mean node score versus channel | One optional positional argument | Yes |
+| `plot_per_channel_scores.py` | Good/bad mean node score versus channel | One optional positional argument to the path that contains the good and bad channel scores.npz files | Yes |
 | `plot_per_channel_per_window_scores.py` | Six per-plane channel-distribution plots for selected windows | Positional input plus six optional flags | Yes |
 | `plot_debug.py` | Target-good-run versus other-good-run versus bad-run integral distributions | No flags; edit constants | No |
 | `plot_event_hist.py` | Between-event-time histogram and printed window-duration diagnostics | No flags; edit constants | No |
