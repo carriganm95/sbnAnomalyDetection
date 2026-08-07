@@ -29,6 +29,7 @@ The score plotters expect GraphVAE score files with:
 | Array | Expected shape | Meaning |
 | --- | ---: | --- |
 | `node_scores` | `(W, C)` | Per-window, per-channel reconstruction/anomaly scores. `W` is the number of windows and `C` is the number of channels. Inactive channels may be `NaN`. |
+Note: If model training and inference complete successfully, the correctly formatted GraphVAE score files will be generated automatically.
 
 The sparse-event utilities use some or all of these arrays:
 
