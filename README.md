@@ -12,6 +12,8 @@ problems can be flagged from a small amount of data — no waiting for a whole r
 - Base config: [`configs/graph_vae.yaml`](configs/graph_vae.yaml)
 - Sweep config generator: [`config_maker.py`](config_maker.py)
 - Sweep runner / evaluator: [`run_graph_vae_sweep.py`](run_graph_vae_sweep.py)
+- Plotting and score diagnostics: [`graphing/README.md`](graphing/README.md)
+- NPZ splitting, filtering, and validation: [`dataset_preparation/README.md`](dataset_preparation/README.md)
 - Single-model train: `sbn-train --config configs/graph_vae.yaml`
 - Single-model score: `sbn-infer --config configs/graph_vae.yaml --input <events.npz> --output scores.npz`
 - Single-model evaluate: `python -m sbn_anomaly.infer.window_score ...`
@@ -163,6 +165,23 @@ python -m sbn_anomaly.data.merge_events \
   --glob 'data/good_*.npz'
 ```
 
+### Prepare existing NPZ datasets
+
+The scripts in [`dataset_preparation/`](dataset_preparation/README.md) operate on
+already-materialized NPZ files and are separate from the ROOT materialization
+commands above:
+
+| Script | Purpose |
+|---|---|
+| [`train_test_from_npz.py`](dataset_preparation/train_test_from_npz.py) | Combine `tpc_data_v3_*.npz` sources and create a run-preserving `good_runs.npz` / `windows_train.npz` split; `--with-bad` also creates `bad_runs.npz`. |
+| [`filter.py`](dataset_preparation/filter.py) | Apply the same channel slice to training, good-test, and bad-test NPZ files, reindex channels, and optionally filter runs or retain empty events. |
+| [`inspect_run.py`](dataset_preparation/inspect_run.py) | Inspect timestamp ordering, run segments, event counts in timed windows, padding, and fixed-event-window durations. |
+| [`check_time_sequence.py`](dataset_preparation/check_time_sequence.py) | Report locations where `evt_time` moves backward. |
+
+See the subdirectory README for every flag, editable constant, input constraint,
+and output key. These scripts replace the older ad-hoc repair workflow; there is
+no `repair.py` in the current directory.
+
 ---
 
 ## Single-model training
@@ -211,13 +230,15 @@ Typical output arrays:
 | Array | Shape | Description |
 |---|---:|---|
 | `node_scores` | `(W, C)` | Per-window per-channel reconstruction error; inactive channels may be `NaN`. |
-| `scores` | `(W,)` | Per-window aggregated score. |
-| `scores_max` | `(W,)` | Max-style score when saved by the inferrer. |
+| `scores` | `(W,)` | Per-window score produced with `inference.window_aggregator`. |
+| `window_index` | `(W,)` | Sequential zero-based window index. |
 | `channel_mean_error` | `(C,)` | Mean per-channel error over windows. |
 | `channel_max_error` | `(C,)` | Max per-channel error over windows. |
 | `channel_active_frac` | `(C,)` | Fraction of windows where each channel was active. |
-| `provenance` | `(W, 3)` | Usually `(run, subrun, event)` for each window. |
+| `event_count` | `(W,)` | Events contributing to each sparse-data window, when available. |
+| `provenance` | `(W, 3)` | First `(run, subrun, event)` for each GraphVAE window, when source provenance is available. `window_score` also accepts score files with separate `first_run`, `first_subrun`, and `first_event_num` arrays. |
 | `is_anomaly` | `(W,)` | Present when an inference threshold is set. |
+| `threshold` | scalar | The inference threshold used to create `is_anomaly`, when configured. |
 
 ---
 
@@ -233,7 +254,7 @@ python -m sbn_anomaly.infer.window_score \
   --labels good bad \
   --aggregator group_max_mean \
   --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
-  --percentile 90 \
+  --percentile 95 \
   --plot goodvsbad.png
 ```
 
@@ -249,19 +270,114 @@ python -m sbn_anomaly.infer.window_score \
   --labels good bad \
   --aggregator group_max_mean \
   --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
-  --percentile 90 \
+  --percentile 95 \
   --stream --persist-n 3 --persist-m 2
 ```
 
-Common aggregators:
+### Window-score aggregators
 
-- `mean`
-- `max`
-- `topk_mean`
-- `group_max_mean`
+| Aggregator | What it computes | Additional input |
+|---|---|---|
+| `mean` | NaN-aware mean over active channels. | None. |
+| `max` | NaN-aware maximum channel error. | None. |
+| `topk_mean` | Mean of the largest `k` finite channel errors; useful for localized faults without relying on one noisy channel. | `--k` (default `64`). |
+| `group_max_mean` | Mean within each FEMB or ASIC group, followed by the maximum group mean; the recommended default for coherent electronics faults. | `--channel-map` and optionally `--group-level`. |
+| `zscore_mean` | Per-channel `(score - mu) / sigma`, followed by a NaN-aware channel mean. This targets small, detector-wide shifts that can be hidden by naturally noisy channels. | `--baseline` made from training-only good scores. |
 
-`group_max_mean` is usually the default for coherent electronics groups because
-it pools channel errors by electronics group and takes the worst group.
+### Training-baseline inference and `zscore_mean`
+
+Fit the channel baseline only on inference scores from the **training split of
+good runs**. Do not fit it on the held-out good file used for evaluation, or the
+reported separation will be optimistic.
+
+```bash
+# Score the same good-only NPZ used to train the model.
+sbn-infer \
+  --config configs/graph_vae.yaml \
+  --input data/events_train.npz \
+  --output scores_train.npz
+
+# Pool one or more training-score files into per-channel mu, sigma, and n.
+python -m sbn_anomaly.infer.channel_baseline \
+  --scores scores_train.npz \
+  --min-count 20 \
+  --output channel_baseline.npz
+
+# Apply that fixed baseline to disjoint held-out good and bad scores.
+python -m sbn_anomaly.infer.window_score \
+  --scores scores_good.npz \
+  --compare scores_bad.npz \
+  --labels good bad \
+  --aggregator zscore_mean \
+  --baseline channel_baseline.npz \
+  --percentile 95 \
+  --plot goodvsbad_zscore.png
+```
+
+`channel_baseline` pools all files supplied to `--scores`, saves `mu`, `sigma`,
+and finite sample count `n` per channel, and excludes channels with fewer than
+`--min-count` usable windows or a non-positive/non-finite standard deviation.
+
+| `channel_baseline` flag | Default | Meaning |
+|---|---:|---|
+| `--scores PATH [PATH ...]` | required | One or more training-only good score NPZ files; all windows are pooled and channel counts must match. |
+| `--min-count N` | `20` | Minimum finite windows needed for a valid channel baseline. |
+| `--output PATH` | required | Output NPZ; a `.npz` suffix is added when omitted. |
+| `-h`, `--help` | — | Show command help. |
+
+### `window_score` flag reference
+
+| Flag | Default | Meaning |
+|---|---:|---|
+| `--scores PATH` | required | Primary score NPZ; its `node_scores` (or legacy `scores`) is treated as the good/reference sample. |
+| `--compare PATH` | none | Second score NPZ to overlay and treat as the positive/bad sample for AUC and classification metrics. |
+| `--labels A B` | `good bad` | Labels for the primary and comparison samples. |
+| `--aggregator NAME` | `group_max_mean` | One of `mean`, `max`, `topk_mean`, `group_max_mean`, or `zscore_mean`. |
+| `--channel-map PATH` | none | Channel-map CSV required by `group_max_mean`. |
+| `--group-level {femb,asic}` | `femb` | Electronics grouping used by `group_max_mean`. |
+| `--k N` | `64` | Number of largest channel scores averaged by `topk_mean`. |
+| `--baseline PATH` | none | `channel_baseline.npz` required by `zscore_mean`. |
+| `--output PATH` | none | Save the primary sample's aggregated per-window scores as `.npy`. |
+| `--plot PATH` | none | Save a distribution overlay. The operating threshold is drawn and labeled; with good and bad inputs the plot also displays precision and recall at that threshold. |
+| `--threshold VALUE` | none | Explicit operating threshold; overrides `--percentile`. |
+| `--percentile P` | `99` | Primary/good-score percentile used when `--threshold` is absent. The sweep explicitly passes `95` in its normal evaluation path. |
+| `--per-run` | off | Aggregate windows into one score per run and report run-level AUC/confusion metrics. Requires provenance. |
+| `--run-stat {frac_above,max,p99,mean}` | `frac_above` | Run rollup statistic. `frac_above` is the fraction of that run's windows above the window threshold. |
+| `--run-key {run,runsubrun}` | `run` | Group windows by run or by run/subrun. |
+| `--run-threshold VALUE` | good-run p90 | Explicit run-level decision threshold. This is distinct from the window percentile. |
+| `--stream` | off | Evaluate a real-time persistence detector per run, reporting good-run false alarms and bad-run detection rate/latency. Requires provenance. |
+| `--persist-n N` | `3` | Number of recent windows in the streaming detector. |
+| `--persist-m M` | `2` | Trigger when at least `M` of the last `N` windows exceed the window threshold. |
+| `--instant-threshold VALUE` | none | Also trigger immediately when one window exceeds this value. |
+| `-h`, `--help` | — | Show command help. |
+
+The current provenance loader accepts both the older combined `provenance`
+array and the newer separate `first_run` / `first_subrun` /
+`first_event_num` arrays, so `--per-run` and `--stream` work with either score
+layout. Without provenance, those analyses are skipped while window-level
+evaluation still runs.
+
+---
+
+## Graphing and diagnostics
+
+[`graphing/`](graphing/README.md) contains seven plotting and diagnostic scripts.
+The subdirectory README documents every callable function, command-line flag,
+editable constant, required array, and output. At the root-workflow level:
+
+| Script | Result | Sweep integration |
+|---|---|---|
+| [`plot_per_channel_scores.py`](graphing/plot_per_channel_scores.py) | Mean good/bad `node_scores` over all windows versus channel. | `--per-channel-plot` |
+| [`plot_per_channel_per_window_scores.py`](graphing/plot_per_channel_per_window_scores.py) | Six per-plane plots for selected good/bad windows; includes training mean/std when `scores_train.npz` exists. | `--per-channel-per-window-plot` |
+| [`plot_debug.py`](graphing/plot_debug.py) | Target-good, other-good, and bad integral distributions. | Standalone; edit constants. |
+| [`plot_event_hist.py`](graphing/plot_event_hist.py) | Between-event-time histogram and window-duration diagnostics. | Standalone; edit constants. |
+| [`plot_mean_median_hist.py`](graphing/plot_mean_median_hist.py) | Per-window/per-channel integral mean and standard-deviation histograms. | Standalone; edit constants. |
+| [`plot_pulse.py`](graphing/plot_pulse.py) | Overlay of ROOT waveform histograms. | Standalone; edit constants; requires PyROOT. |
+| [`plot_time_window_box_whisker.py`](graphing/plot_time_window_box_whisker.py) | Per-run boxplots of event counts in fixed-duration windows. | Standalone; edit constants. |
+
+`goodvsbad.png` is created by `window_score`, not by a script in `graphing/`.
+The sweep's plot-only repair modes coordinate it with the two integrated
+per-channel plotters.
 
 ---
 
@@ -464,12 +580,21 @@ The GraphVAE workflow expects sparse-events `.npz` files. The default sweep
 runner paths assume:
 
 ```text
+data/events_train.npz
 data/good_events_test.npz
 data/bad_events_test.npz
 ```
 
 The training input is set in each generated YAML through the copied base config,
-usually from `data.events_path` in `configs/graph_vae.yaml`.
+usually from `data.events_path` in `configs/graph_vae.yaml`. The sweep's
+`--train-input` is a separate path used only for training-baseline inference.
+
+`dataset_preparation/train_test_from_npz.py` currently writes
+`windows_train.npz`, `good_runs.npz`, and optionally `bad_runs.npz` under its
+configured output directory. Either move/name those files to match the defaults,
+or pass their real paths through the YAML, `--train-input`, `--good-input`, and
+`--bad-input`. Do not assume the dataset-preparation output names and sweep
+defaults are automatically synchronized.
 
 ### Step 2: Edit the base GraphVAE YAML
 
@@ -574,7 +699,7 @@ python run_graph_vae_sweep.py \
   --bad-input data/bad_events_test.npz \
   --channel-map configs/SBNDTPCChannelMap_v2_with_positions.csv \
   --eval-aggregator group_max_mean \
-  --eval-percentile 90 \
+  --eval-percentile 95 \
   --batch \
   --export-summary
 ```
@@ -595,6 +720,12 @@ checkpoints/graph_vae/<run_name>/
     ├── goodvsbad_eval.txt
     └── goodvsbad_eval.json
 ```
+
+With the optional graphing hooks, the inference directory also receives
+`channel_mean_node_scores.png` and six
+`channel_node_scores_selected_windows_plane_<1-6>.png` files. The JSON summary
+is written by the sweep runner from the captured `window_score` log and recorded
+metrics; it is not a direct `window_score` CLI output.
 
 The sweep database is:
 
@@ -633,19 +764,147 @@ python run_graph_vae_sweep.py --missing-evaluate-only
 
 # Train and infer, but skip good-vs-bad evaluation
 python run_graph_vae_sweep.py --skip-eval
+
+# Recreate only plot sets that are missing; do not train or infer
+python run_graph_vae_sweep.py --missing-plot
+
+# Recreate all managed plots from existing scores, even when they exist
+python run_graph_vae_sweep.py --force-replot
 ```
 
-Notes:
+`--missing-infer-only` implies `--infer-only`, and
+`--missing-evaluate-only` implies `--evaluate-only`. Evaluation-only and
+inference-only modes are mutually exclusive; evaluation-only also cannot be
+combined with `--skip-eval`. `--missing-plot` and `--force-replot` are mutually
+exclusive standalone modes and cannot be combined with train/infer/evaluate-only,
+baseline, skip-infer, or database rewrite modes.
 
-- `--missing-infer-only` implies `--infer-only`.
-- `--missing-evaluate-only` implies `--evaluate-only`.
-- `--evaluate-only` cannot be combined with `--infer-only` or `--missing-infer-only`.
-- `--evaluate-only` / `--missing-evaluate-only` cannot be combined with `--skip-eval`.
-- `--eval-threshold` passes an explicit threshold to `window_score` and overrides `--eval-percentile`.
-- `--eval-percentile` passes `--percentile` to `window_score`; the current sweep default is `90.0`.
-- `--batch` sets batch/log-friendly environment variables so progress bars are suppressed.
-- `--monitor-interval 0` disables periodic CPU/RAM usage logging.
-- `--force-rewrite` deletes existing database records for matching run names and reruns them.
-- `--missing-rewrite` reruns a run only when its output directory is missing or incomplete.
+### Sweep-managed training baseline
+
+The sweep can automate the three-step baseline workflow described earlier:
+
+```bash
+python run_graph_vae_sweep.py \
+  --infer-only \
+  --baseline-infer \
+  --train-input data/events_train.npz \
+  --baseline-eval-percentile 90 \
+  --batch
+```
+
+For each trained model, `--baseline-infer` replaces normal good/bad inference
+with this sequence:
+
+1. Infer `--train-input` into `inference_result/scores_train.npz`.
+2. Run `--baseline-cmd` to create `channel_baseline.npz`.
+3. Evaluate the **existing** `scores_good.npz` and `scores_bad.npz` with
+   `zscore_mean`, producing `goodvsbad_zscore.png`,
+   `goodvsbad_zscore_eval.txt`, and `goodvsbad_zscore_eval.json`.
+
+The model must already have ordinary held-out good/bad score files unless
+`--skip-eval` is used. Baseline mode works with `--infer-only` and
+`--missing-infer-only`; it cannot be combined with evaluation-only,
+`--skip-infer`, `--restore-missing-db`, or either per-channel plotting hook.
+The normal evaluation percentile is now **95**. Baseline evaluation has an
+independent `--baseline-eval-percentile` setting whose current code default is
+`90`.
+
+### Complete sweep flag reference
+
+The tables use the canonical hyphenated spellings. Where aliases exist, they are
+shown in the same row.
+
+For completeness, the legacy/mixed-separator aliases accepted by the parser are:
+`--evaluate_only`, `--eval_only`, `--missing_evaluate_only`,
+`--missing_eval_only`, `--infer_only`, `--inference_only`,
+`--missing_infer_only`, `--missing_infer`, `--missing-infer_only`,
+`--missing_infer-only`, `--per_channel_plot`, `--per_channel-plot`,
+`--per-channel_plot`, `--per-channel-plots`, `--per_channel_plots`,
+`--per-channel_plots`, `--per_channel-plots`, `--restore_missing_db`,
+`--restore_missing-db`, `--restore-missing-database`,
+`--restore_missing_database`, `--restore-missing_database`, and
+`--restore_missing-database`. Prefer the canonical spellings shown in the tables
+for new commands.
+
+#### Paths and commands
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--config-dir PATH` | `tuning_configs/graph_vae_sweep` under `PROJECT_DIR` | Directory searched for sweep YAMLs. |
+| `--runs-root PATH` | `checkpoints/graph_vae` under `PROJECT_DIR` | Parent directory for per-config run outputs. |
+| `--db-path PATH` | `graph_vae_sweep.sqlite3` under `PROJECT_DIR` | SQLite experiment database. |
+| `--good-input PATH` (`--good_input`) | `data/good_events_test.npz` | Held-out good sparse-events NPZ for normal inference. |
+| `--bad-input PATH` (`--bad_input`) | `data/bad_events_test.npz` | Bad sparse-events NPZ for normal inference. |
+| `--train-input PATH` (`--train_input`) | `data/events_train.npz` | Training-split good NPZ inferred by `--baseline-infer`; this does not change the YAML's training data. |
+| `--pattern GLOB` | `*.yaml` | Config filename pattern within `--config-dir`. |
+| `--train-cmd COMMAND` | `sbn-train` | Training executable/command string. |
+| `--infer-cmd COMMAND` | `sbn-infer` | Inference executable/command string. |
+| `--baseline-cmd COMMAND` (`--baseline_cmd`) | `python -m sbn_anomaly.infer.channel_baseline` | Converts `scores_train.npz` to `channel_baseline.npz`. |
+| `--eval-cmd COMMAND` | `python -m sbn_anomaly.infer.window_score` | Evaluation command; the sweep appends score paths, labels, aggregator, map, threshold/percentile, and plot arguments. |
+
+#### Evaluation
+
+| Flag | Default | Meaning |
+|---|---:|---|
+| `--eval-aggregator NAME` (`--eval_aggregator`) | `group_max_mean` | Normal good/bad `window_score` aggregator. |
+| `--channel-map PATH` (`--channel_map`) | project SBN channel-map CSV | Map passed to normal `window_score` evaluation. In the sweep this does not override the integrated plotter's own map setting. |
+| `--eval-threshold VALUE` (`--eval_threshold`) | none | Explicit normal-evaluation threshold; overrides `--eval-percentile`. |
+| `--eval-percentile P` (`--eval_percentile`) | `95` | Good-score percentile passed to normal `window_score` when no explicit threshold is supplied. |
+| `--eval-per-run` (`--eval_per_run`) | off | Add `--per-run` to normal or baseline `window_score` evaluation. |
+| `--good-label TEXT` (`--good_label`) | `good` | Primary-sample label. |
+| `--bad-label TEXT` (`--bad_label`) | `bad` | Comparison/positive-sample label. |
+| `--eval-plot-name NAME` (`--eval_plot_name`) | `goodvsbad.png` | Normal evaluation plot filename within `inference_result`. |
+| `--eval-log-name NAME` (`--eval_log_name`) | `goodvsbad_eval.txt` | Normal evaluation log filename. |
+| `--eval-json-name NAME` (`--eval_json_name`) | `goodvsbad_eval.json` | Normal evaluation JSON summary filename. |
+| `--baseline-eval-percentile P` (`--baseline_eval_percentile`) | `90` | Good z-score percentile used only after `--baseline-infer`. |
+| `--baseline-eval-plot-name NAME` (`--baseline_eval_plot_name`) | `goodvsbad_zscore.png` | Baseline evaluation plot filename. |
+| `--baseline-eval-log-name NAME` (`--baseline_eval_log_name`) | `goodvsbad_zscore_eval.txt` | Baseline evaluation log filename. |
+| `--baseline-eval-json-name NAME` (`--baseline_eval_json_name`) | `goodvsbad_zscore_eval.json` | Baseline evaluation JSON filename. |
+
+#### Execution modes
+
+| Flag | Meaning |
+|---|---|
+| `--evaluate-only` (`--eval-only` and underscore forms) | Skip training and inference; reevaluate existing `scores_good.npz` and `scores_bad.npz`. |
+| `--missing-evaluate-only` (`--missing-eval-only` and underscore forms) | Evaluation-only, but only when the configured plot, log, or JSON is missing. |
+| `--skip-eval` (`--skip_eval`) | Run the applicable train/inference stages without good-vs-bad evaluation. |
+| `--skip-infer` | Train only; do not run good/bad inference. |
+| `--infer-only` (`--inference-only` and underscore forms) | Skip training and rerun inference using each run's existing `graph_vae_final.pt`. |
+| `--baseline-infer` (`--baseline_infer`) | Switch inference to training-score baseline creation and z-score evaluation. |
+| `--missing-infer-only` (`--missing-infer` and underscore forms) | Imply inference-only and process only runs missing required outputs. Normal mode checks good/bad scores; baseline mode checks training scores, baseline, and—unless evaluation is skipped—z-score plot/log/JSON. |
+
+#### Integrated graphing and plot repair
+
+| Flag | Default | Meaning |
+|---|---:|---|
+| `--per-channel-plot` (underscore, mixed-separator, and plural aliases) | off | After an actual successful good/bad inference pair, run `graphing/plot_per_channel_scores.py`. It does not run in evaluation-only mode. |
+| `--per-channel-per-window-plot` (`--per_channel_per_window_plot`) | off | After an actual good/bad inference pair, run `graphing/plot_per_channel_per_window_scores.py`. |
+| `--per-channel-window-indices SPEC` (`--per_channel_window_indices`) | plotter default | Zero-based index/range expression such as `1200`, `1,4,8`, or inclusive `1200-1210`. |
+| `--per-channel-window-datasets {good,bad,both}` (`--per_channel_window_datasets`) | `both` | Which held-out score files the selected-window plotter loads. |
+| `--per-channel-per-window-plot-name NAME` (`--per_channel_per_window_plot_name`) | `channel_node_scores_selected_windows.png` | Base name; the plotter inserts `_plane_1` through `_plane_6`. |
+| `--missing-plot` (`--missing_plot`) | off | Standalone repair mode: independently recreate missing all-window channel plot, six selected-window plane plots, and `goodvsbad.png` from existing scores. |
+| `--force-replot` (`--force_replot`) | off | Standalone mode that recreates all three managed plot sets whenever good/bad score files exist. |
+
+The sweep does not forward the selected-window plotter's direct CLI options
+`--channel-map`, `--plot-style`, or `--good-bad-only`. Configure those by running
+the plotter directly. If `scores_train.npz` is present, the integrated
+selected-window plots automatically include its green training mean/std band.
+
+#### Runtime, database, and export controls
+
+| Flag | Default | Meaning |
+|---|---:|---|
+| `--timeout SECONDS` | none | Timeout for each train/infer subprocess. |
+| `--stop-on-error` | off | Stop after the first failed config instead of continuing. |
+| `--monitor-interval N` (`--monitor_interval`) | `30` | Print subprocess CPU/RAM usage every `N` seconds; `0` disables monitoring. |
+| `--batch` | off | Set `SBN_BATCH=1` and `TQDM_DISABLE=1` for log-friendly subprocess output. |
+| `--force-rewrite` (`--force_rewrite`) | off | Delete an existing matching database record and rerun, overwriting that run directory's outputs. |
+| `--missing-rewrite` (`--missing_rewrite`) | off | For an existing database record, rerun only when its run directory is missing or incomplete. |
+| `--restore-missing-db` (database and underscore aliases) | off | Reconstruct missing SQLite rows from completed on-disk run directories, including ignored directories, then reorder experiment IDs by sorted YAML order. Runs no train, inference, evaluation, or plotting. |
+| `--export-summary` (`--export_summary`, `--export-csv-xlsx`, `--export_csv_xlsx`) | off | Export `graph_vae_sweep_summary.csv` and `.xlsx`; SQLite is always maintained. |
+| `-h`, `--help` | — | Show all accepted spellings and command help. |
+
+Model directories listed in the script's `IGNORED` constant are skipped during
+normal sweep activity. Restore mode intentionally still considers them.
 
 ---
