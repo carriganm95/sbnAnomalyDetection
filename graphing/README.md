@@ -480,7 +480,7 @@ The principal functions are `discover_npz_files()`, `load_event_metadata()`,
 - **No plot during `--evaluate-only`**: the integrated graphing hooks run after
   inference, so use a plot-only mode or invoke the plotter directly.
 
-## Experiment records
+## Experiment and graph records
 
 The `graph_records/` contains numerous plots that document the initial data exploration
 we have carried out with the TPC data of the detector, especially investigating the 
