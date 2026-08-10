@@ -482,7 +482,10 @@ The principal functions are `discover_npz_files()`, `load_event_metadata()`,
 
 ## Experiment records
 
-The `graph_records/` subdirectory contains a collection of plots documenting the
+The `graph_records/` contains numerous plots that document the initial data exploration
+we have carried out with the TPC data of the detector, especially investigating the 
+data distribution difference between the good runs and the bad runs.
+This subdirectory also contains a collection of plots documenting the
 experiments conducted throughout this project. These plots preserve important
 observations and insights from the hyperparameter-tuning process, providing a
 useful reference for understanding how different settings affected model
