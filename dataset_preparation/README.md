@@ -388,3 +388,5 @@ python dataset_preparation/filter.py \
 python dataset_preparation/inspect_run.py \
   dataset_preparation/windows_train_ch8800_9000_reindexed_nonempty.npz
 ```
+
+# Important Findings and Notes about the Dataset
