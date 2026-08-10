@@ -9,4 +9,4 @@ settings and stride settings. We found two major things:
   to have higher anomaly scores than bad runs for some windows)
 
 In our later experiment, we also have findings about the window size and per channel anomaly scores.
-Please check the `whole_dataset/` directory for more details.
+Please check the `whole_channels/` directory for more details.
