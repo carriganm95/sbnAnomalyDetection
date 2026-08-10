@@ -21,7 +21,7 @@ Run commands from the repository root unless an absolute path is shown:
 python graphing/<script_name>.py [arguments]
 ```
 
-A scripts require NumPy and Matplotlib. `plot_pulse.py` additionally requires
+All scripts require NumPy and Matplotlib. `plot_pulse.py` additionally requires
 PyROOT and access to the referenced ROOT files.
 
 The score plotters expect GraphVAE score files with:
@@ -30,14 +30,15 @@ The score plotters expect GraphVAE score files with:
 | --- | ---: | --- |
 | `node_scores` | `(W, C)` | Per-window, per-channel reconstruction/anomaly scores. `W` is the number of windows and `C` is the number of channels. Inactive channels may be `NaN`. |
 
-Note: If model training and inference complete successfully, the correctly formatted GraphVAE score files will be generated automatically.
+Note: If model training and inference complete successfully, the correctly
+formatted GraphVAE score files will be generated automatically.
 
 ## Script summary
 
 | Script | Main result | Command-line interface | Sweep integration |
 | --- | --- | --- | --- |
-| `plot_per_channel_scores.py` | Good/bad mean node score versus channel | One optional positional argument to the path that contains the good and bad channel scores.npz files | Yes |
-| `plot_per_channel_per_window_scores.py` | Six per-plane channel-distribution plots (one plot per plane) for selected windows | Positional argument to the path that contains the good and bad channel scores.npz files plus six optional flags | Yes |
+| `plot_per_channel_scores.py` | Good/bad mean node score versus channel | One optional positional argument to the path that contains the good and bad channel `scores.npz` files | Yes |
+| `plot_per_channel_per_window_scores.py` | Six per-plane channel-distribution plots (one plot per plane) for selected windows | Positional argument to the path that contains the good and bad channel `scores.npz` files plus six optional flags | Yes |
 | `plot_debug.py` | Target-good-run versus other-good-run versus bad-run integral distributions. Used for checking dataset shape and distribution | No flags; edit constants | No |
 | `plot_event_hist.py` | Between-event-time histogram and printed window-duration diagnostics | No flags; edit constants | No |
 | `plot_mean_median_hist.py` | Histograms of per-window/per-channel integral mean and standard deviation | No flags; edit constants | No |
@@ -309,9 +310,9 @@ python run_graph_vae_sweep.py --force-replot
 
 Compares hit-level `integrals_flat` distributions for three groups:
 
-1. one selected `TARGET_RUN` taken from the good-run NPZ;
-2. every other run in the same good-run NPZ;
-3. every entry in the bad-run NPZ.
+1. One selected `TARGET_RUN` taken from the good-run NPZ.
+2. Every other run in the same good-run NPZ.
+3. Every entry in the bad-run NPZ.
 
 It expands event-level `evt_run` values through the CSR `offsets` so every flat
 integral receives its event's run label. The three density-normalized step
@@ -340,14 +341,14 @@ inside `main()`, so importing it also executes the plot.
 
 Treats `evt_time` as nanoseconds and:
 
-- prints counts and statistics for negative, zero, and positive differences
-  between consecutive stored events;
-- constructs event-count windows for every `(window_size, stride)` pair in
-  `WINDOW_SETTINGS` and prints their elapsed-time statistics;
-- identifies windows longer than `LONG_WINDOW_THRESHOLD_DAYS`, checks whether
+- Prints counts and statistics for negative, zero, and positive differences
+  between consecutive stored events.
+- Constructs event-count windows for every `(window_size, stride)` pair in
+  `WINDOW_SETTINGS` and prints their elapsed-time statistics.
+- Identifies windows longer than `LONG_WINDOW_THRESHOLD_DAYS`, checks whether
   they cross run numbers, and prints a second duration summary excluding only
-  long multi-run windows;
-- plots the positive between-event intervals in minutes with a logarithmic
+  long multi-run windows.
+- Plots the positive between-event intervals in minutes with a logarithmic
   y-axis and percentile-limited x-axis.
 
 The long-window exclusion affects the printed filtered summary, not the
@@ -386,8 +387,8 @@ two outputs are:
 
 ### Inputs, output, and settings
 
-- Required arrays: `channels_flat`, `integrals_flat`, `offsets`, and
-  scalar `n_channels`.
+- Required arrays: `channels_flat`, `integrals_flat`, `offsets`, and scalar
+  `n_channels`.
 - Every histogram contains `number_of_windows * n_channels` entries.
 - `OUTPUT_DIR` is currently relative to the process's working directory.
 - No command-line flags are defined. Edit `NPZ_PATH`, `WINDOW_SIZE`, `STRIDE`,
@@ -452,7 +453,7 @@ line is drawn when `EVENT_NUM_TARGET` is not `None`.
   `DPI`.
 - `POINT_SIZE`, `POINT_ALPHA`, `USE_HORIZONTAL_JITTER`, `JITTER_WIDTH`, and
   `RANDOM_SEED` are defined but are not currently used by the plotting function.
- 
+
 ```bash
 python graphing/plot_time_window_box_whisker.py
 ```
@@ -478,3 +479,11 @@ The principal functions are `discover_npz_files()`, `load_event_metadata()`,
   plotting outputs. Use `--missing-plot`.
 - **No plot during `--evaluate-only`**: the integrated graphing hooks run after
   inference, so use a plot-only mode or invoke the plotter directly.
+
+## Experiment records
+
+The `graph_records/` subdirectory contains a collection of plots documenting the
+experiments conducted throughout this project. These plots preserve important
+observations and insights from the hyperparameter-tuning process, providing a
+useful reference for understanding how different settings affected model
+performance.
