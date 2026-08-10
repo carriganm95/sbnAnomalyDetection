@@ -19,3 +19,7 @@ Our major findings about the timed window are:
   scores would reseparate. However, the new separation no longer has peaks around the center of the induction planes, but
   at the junctions of the planes. We believe such timed window size is already too large and the model already starts to
   overfit. Therefore, we believe our timed window size shouldn't be too long, and should probably be around 2000 seconds.
+
+Note: The channel_mode_scores plots are the magnifications of the All_channel_2000timewindow_200stride.png. The lines show the average
+      per channel anomaly scores, and the shaded region shows a +- 1 standard deviation region. The green line shows a baseline of the
+      per channel anomaly scores using the training dataset on the model.
