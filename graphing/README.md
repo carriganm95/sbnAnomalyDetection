@@ -21,8 +21,18 @@ Run commands from the repository root unless an absolute path is shown:
 python graphing/<script_name>.py [arguments]
 ```
 
-All scripts require NumPy and Matplotlib. `plot_pulse.py` additionally requires
-PyROOT and access to the referenced ROOT files.
+Run the ROOT macros from the `graphing/` directory so their output files are
+written there:
+
+```bash
+cd graphing
+root -l -q -b plot_channelhist.C
+root -l -q -b plot_wrapper.C
+```
+
+The Python scripts require NumPy and Matplotlib. `plot_pulse.py` additionally
+requires PyROOT, while `plot_channelhist.C` and `plot_wrapper.C` require ROOT.
+All three also require access to the referenced ROOT files.
 
 The score plotters expect GraphVAE score files with:
 
@@ -44,6 +54,130 @@ formatted GraphVAE score files will be generated automatically.
 | `plot_mean_median_hist.py` | Histograms of per-window/per-channel integral mean and standard deviation | No flags; edit constants | No |
 | `plot_pulse.py` | Overlay of four ROOT waveform histograms | No flags; edit constants | No |
 | `plot_time_window_box_whisker.py` | Per-run boxplots of event counts in fixed-duration windows | No flags; edit constants | No |
+| `plot_channelhist.C` | Overlaid channel-by-channel hit counts for good and bad runs | No flags; edit constants or call `plot_channel(min, max)` | No |
+| `plot_wrapper.C` | Hit-integral comparisons with uncertainty bands, reduced chi-square values, and fractional differences | No flags; edit constants or call `plot_integral(min, max)` | No |
+
+## `plot_channelhist.C`
+
+### What it does
+
+Reads `hits2.h.channel` from the `caloskim/TrackCaloSkim` tree and overlays one
+channel histogram for every configured run. Each bin represents one detector
+channel and its content is the number of hits recorded by that channel. This is
+useful for identifying channel-by-channel occupancy patterns and comparing those
+patterns between good and bad runs.
+
+The first directory in `run_dirs` is the reference run. Every other histogram
+is scaled to the reference histogram's total number of hits before plotting.
+Runs remain separate curves: `color_by_good_bad=true` assigns cold colors to
+good runs and warm colors to bad runs; it does not merge either category.
+
+Unlike `plot_wrapper.C`, this macro produces only the overlaid histograms. It
+does not draw error bars, calculate chi-square values, or create a lower
+comparison panel.
+
+### Inputs, outputs, and settings
+
+- Input files are discovered as `DQMValidationTrees_*.root` under each directory
+  in `run_dirs`.
+- A file is skipped if it cannot be opened or does not contain
+  `caloskim/TrackCaloSkim`.
+- `channel_ranges` contains half-open intervals `[channel_min, channel_max)`.
+- `use_channel_cut` controls whether the explicit channel selection is applied.
+- `good_runs` and `bad_runs` determine the status labels and color palettes.
+- One bin is used for every channel in the requested interval.
+- Each range produces one PNG and one PDF named
+  `channel_comparison_nochi2_nobottom_noerrors_<mode>_ch_<min>_<max>_<runs>`.
+
+### Commands and callable functions
+
+Run all intervals listed in `channel_ranges`:
+
+```bash
+cd graphing
+root -l -q -b plot_channelhist.C
+```
+
+Run one custom interval:
+
+```text
+$ cd graphing
+$ root -l
+root [0] .L plot_channelhist.C
+root [1] plot_channel(3900, 5700)
+root [2] .q
+```
+
+| Function | Purpose |
+| --- | --- |
+| `plot_channel(channel_min, channel_max)` | Plot hit count versus channel for one half-open channel range. |
+| `plot_all_channel_ranges()` | Call `plot_channel()` for every configured range. |
+| `plot_channelhist()` | File-level entry point used when ROOT executes `plot_channelhist.C`. |
+| `add_good_files_to_chain(...)` | Add readable ROOT files containing the requested tree to a run's `TChain`. |
+| `extract_run_number(...)` / `get_run_status(...)` / `get_run_color(...)` | Extract run IDs and assign their labels and colors. |
+
+## `plot_wrapper.C`
+
+### What it does
+
+Selects hits by `hits2.h.channel` and plots the distribution of
+`hits2.h.integral` for each configured run. Therefore, the channel range is a
+selection criterion, while the x-axis represents the integrated hit signal
+rather than channel number. The integral histograms use 100 bins from 0 to
+4000.
+
+As in `plot_channelhist.C`, the first configured run is the reference and every
+other run is normalized to its total number of entries. The macro then compares
+each normalized distribution with the reference by calculating chi-square,
+degrees of freedom, and reduced chi-square.
+
+The canvas contains:
+
+- a top panel with the normalized integral distributions, statistical error
+  bars, shaded uncertainty bands, and reduced chi-square annotations;
+- a bottom panel showing the bin-by-bin fractional difference
+  `(reference - other run) / reference` with propagated uncertainties.
+
+### Inputs, outputs, and settings
+
+- Input files, tree validation, run labels, and color behavior follow the same
+  conventions as `plot_channelhist.C`.
+- `channel_ranges` contains the half-open channel intervals processed by the
+  wrapper.
+- `use_channel_cut=false` makes the integral distribution use hits from all
+  channels, regardless of the interval shown in the output name.
+- Each range produces one PNG and one PDF named
+  `integral_comparison_many_runs_<mode>_ch_<min>_<max>_<runs>`.
+- Each range also produces `chi2_table_ch_<min>_<max>.txt`, and the same table
+  is printed in the terminal.
+
+### Commands and callable functions
+
+Run all intervals listed in `channel_ranges`:
+
+```bash
+cd graphing
+root -l -q -b plot_wrapper.C
+```
+
+Run one custom interval:
+
+```text
+$ cd graphing
+$ root -l
+root [0] .L plot_wrapper.C
+root [1] plot_integral(9500, 10000)
+root [2] .q
+```
+
+| Function | Purpose |
+| --- | --- |
+| `plot_integral(channel_min, channel_max)` | Plot and compare hit-integral distributions for one half-open channel range. |
+| `plot_all_channel_ranges()` | Call `plot_integral()` for every configured range. |
+| `plot_wrapper()` | File-level entry point used when ROOT executes `plot_wrapper.C`. |
+| `print_chi2_table_for_channel_range(...)` | Print and save the chi-square comparison table. |
+| `add_good_files_to_chain(...)` | Add readable ROOT files containing the requested tree to a run's `TChain`. |
+| `extract_run_number(...)` / `get_run_status(...)` / `get_run_color(...)` | Extract run IDs and assign their labels and colors. |
 
 ## `plot_per_channel_scores.py`
 

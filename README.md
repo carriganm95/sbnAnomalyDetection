@@ -908,3 +908,12 @@ Model directories listed in the script's `IGNORED` constant are skipped during
 normal sweep activity. Restore mode intentionally still considers them.
 
 ---
+
+# Important updates that are yet to be done
+- Check the pulse finding script and maybe try to make our own pulse finding script to better collection data
+in the way we want. For example, increase pulse data in the collection plane.
+- Test the M out of N consecutive windows anomaly flagging.
+- Include more runs and run types to the training and testing dataset, and see if the abnormal spikes in the good run
+anomaly scores will disappear.
+- Do more tuning and experiment with the timed window size and timed stride, see if we can further improve the model
+performance.
