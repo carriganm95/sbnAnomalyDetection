@@ -390,3 +390,25 @@ python dataset_preparation/inspect_run.py \
 ```
 
 # Important Findings and Notes about the Dataset
+
+We have three important findings about the dataset we use to train the model.
+- First, the dataset MUST be THOROUGH and COMPLETE. Specifically, the dataset, no matter
+training or testing, must contain many runs, the more the better. The runs should be different
+types of runs (e.g., high detector trigger and low detector trigger). We MUST prevent the dataset
+to be dominated by a single run or a few runs. Otherwise, the model will fit to only these runs and 
+will not be inclusive enough to cover all types of runs. Currently, the model gives a super high anomaly score
+to the good runs when there is a large hit integral value, and we suspect that this is because we do not have
+a representative run that has large integral values in the training dataset.
+- Secondly, take extra care to the evt_time when concatenating runs to make the dataset. Currently, we make the 
+datasets by concatenating different runs, but these different runs all have different run time, and some of them may even be 
+a few months apart. As a result, at the junctions of runs, the time interval is going to be problematic. We expect that
+using new data will help mitigate this issue (as currently we do not have new data and can only work on past data, which
+we cannot control the time interval between).
+- Thirdly, pay attention to the detector trigger level in the different runs. As mentioned above, the detector can have high trigger
+or low trigger, and different triggers are going to significantly affect the number of events in a run. Our experiments showed that
+high trigger runs can only train the model to infer high trigger runs but not low trigger runs (and vice versa). Therefore, the dataset
+must be inclusive, or, if the dataset has only high trigger runs or low trigger runs, do not expect the model to perform well on the
+other kind of runs.
+- Fourth, collection plane data vs non collection plane data. We found that the induction planes usually have more events than the collection planes, and, probably as a result of this, it is more difficult to separate the good and bad runs in the collection planes. 
+Maybe our next step should be taking a look to the pulse finding script and try to make our own pulse finding script to better assist
+solving this issue.
